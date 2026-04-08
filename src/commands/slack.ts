@@ -62,6 +62,22 @@ let running = true;
 let slackDebug = false;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
+// Dedup: track recently processed message timestamps to avoid handling both message + app_mention
+const recentlyProcessed = new Map<string, number>();
+const DEDUP_TTL_MS = 10_000;
+
+function isDuplicate(channelId: string, ts: string): boolean {
+  const key = `${channelId}:${ts}`;
+  const now = Date.now();
+  // Clean old entries
+  for (const [k, t] of recentlyProcessed) {
+    if (now - t > DEDUP_TTL_MS) recentlyProcessed.delete(k);
+  }
+  if (recentlyProcessed.has(key)) return true;
+  recentlyProcessed.set(key, now);
+  return false;
+}
+
 // Bot identity (populated from auth.test)
 let botUserId: string | null = null;
 let botUsername: string | null = null;
@@ -100,6 +116,55 @@ async function slackApi<T = Record<string, unknown>>(
   }
   return data;
 }
+
+// --- Assistant API helpers ---
+
+async function setAssistantStatus(
+  token: string,
+  channelId: string,
+  threadTs: string,
+  status: string,
+): Promise<void> {
+  await slackApi(token, "assistant.threads.setStatus", {
+    channel_id: channelId,
+    thread_ts: threadTs,
+    status,
+  }).catch((err) => {
+    debugLog(`assistant.threads.setStatus failed: ${err instanceof Error ? err.message : err}`);
+  });
+}
+
+async function clearAssistantStatus(
+  token: string,
+  channelId: string,
+  threadTs: string,
+): Promise<void> {
+  await slackApi(token, "assistant.threads.setStatus", {
+    channel_id: channelId,
+    thread_ts: threadTs,
+    status: "",
+  }).catch((err) => {
+    debugLog(`assistant.threads.clearStatus failed: ${err instanceof Error ? err.message : err}`);
+  });
+}
+
+async function setAssistantSuggestedPrompts(
+  token: string,
+  channelId: string,
+  threadTs: string,
+  prompts: { title: string; message: string }[],
+): Promise<void> {
+  await slackApi(token, "assistant.threads.setSuggestedPrompts", {
+    channel_id: channelId,
+    thread_ts: threadTs,
+    prompts,
+  }).catch((err) => {
+    debugLog(`assistant.threads.setSuggestedPrompts failed: ${err instanceof Error ? err.message : err}`);
+  });
+}
+
+// Track channels that are assistant threads (no @mention needed)
+const assistantThreadChannels = new Set<string>();
 
 // --- Message sending ---
 
@@ -229,6 +294,12 @@ async function handleMessage(event: SlackMessage): Promise<void> {
   // Skip subtype messages (edits, joins, etc.) unless they are file_share
   if (event.subtype && event.subtype !== "file_share") return;
 
+  // Deduplicate: Slack sends both message + app_mention for @mentions
+  if (isDuplicate(event.channel, event.ts)) {
+    debugLog(`Skipping duplicate: channel=${event.channel} ts=${event.ts}`);
+    return;
+  }
+
   const userId = event.user;
   const channelId = event.channel;
   const isDirectMessage = isDM(event);
@@ -236,7 +307,8 @@ async function handleMessage(event: SlackMessage): Promise<void> {
   const mentioned = isBotMentioned(event.text);
 
   // Determine if we should respond
-  if (!isDirectMessage && !mentioned && !isListenChannel) {
+  const isAssistantThread = assistantThreadChannels.has(channelId);
+  if (!isDirectMessage && !mentioned && !isListenChannel && !isAssistantThread) {
     debugLog(`Skip channel=${channelId} user=${userId} text="${event.text.slice(0, 40)}"`);
     return;
   }
@@ -353,7 +425,14 @@ async function handleMessage(event: SlackMessage): Promise<void> {
     }
 
     const prefixedPrompt = promptParts.join("\n");
+
+    // Show "thinking" status via Assistant API
+    await setAssistantStatus(config.botToken, channelId, replyThreadTs, "正在思考中...");
+
     const result = await runUserMessage("slack", prefixedPrompt, sessionThreadId);
+
+    // Clear assistant status
+    await clearAssistantStatus(config.botToken, channelId, replyThreadTs);
 
     if (result.exitCode !== 0) {
       await sendMessage(
@@ -372,6 +451,8 @@ async function handleMessage(event: SlackMessage): Promise<void> {
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
     console.error(`[Slack] Error for ${label}: ${errMsg}`);
+    // Clear status on error too
+    await clearAssistantStatus(config.botToken, event.channel, event.thread_ts ?? event.ts);
     await sendMessage(
       config.botToken,
       event.channel,
@@ -486,6 +567,36 @@ async function handleSocketPayload(
 
   if (type === "events_api" && data.payload?.event) {
     const event = data.payload.event;
+
+    // Handle Assistant thread started — user opened the assistant panel
+    if (event.type === "assistant_thread_started") {
+      const threadChannel = (event as any).assistant_thread?.channel_id;
+      const threadTs = (event as any).assistant_thread?.thread_ts;
+      if (threadChannel) {
+        assistantThreadChannels.add(threadChannel);
+        debugLog(`Assistant thread started: channel=${threadChannel} ts=${threadTs}`);
+        const config = getSettings().slack;
+        // Set suggested prompts for the new thread
+        if (threadChannel && threadTs) {
+          await setAssistantSuggestedPrompts(config.botToken, threadChannel, threadTs, [
+            { title: "專案狀態", message: "目前專案的狀態如何？" },
+            { title: "幫我分析", message: "請幫我分析一下..." },
+          ]);
+        }
+      }
+      return;
+    }
+
+    // Handle Assistant thread context changed
+    if (event.type === "assistant_thread_context_changed") {
+      const threadChannel = (event as any).assistant_thread?.channel_id;
+      if (threadChannel) {
+        assistantThreadChannels.add(threadChannel);
+        debugLog(`Assistant thread context changed: channel=${threadChannel}`);
+      }
+      return;
+    }
+
     if (event.type === "message" || event.type === "app_mention") {
       await handleMessage(event).catch((err) => {
         console.error(`[Slack] handleMessage error: ${err instanceof Error ? err.message : err}`);
