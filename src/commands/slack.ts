@@ -1,4 +1,4 @@
-import { ensureProjectClaudeMd, runUserMessage, compactCurrentSession } from "../runner";
+import { ensureProjectClaudeMd, runUserMessage, streamUserMessage, compactCurrentSession } from "../runner";
 import { getSettings, loadSettings } from "../config";
 import { resetSession, peekSession } from "../sessions";
 import { listThreadSessions, peekThreadSession } from "../sessionManager";
@@ -65,6 +65,16 @@ let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 // Dedup: track recently processed message timestamps to avoid handling both message + app_mention
 const recentlyProcessed = new Map<string, number>();
 const DEDUP_TTL_MS = 10_000;
+
+// #4: Track the bot's last message ts per channel+thread for edit/delete directives
+const lastBotMessageTs = new Map<string, string>();
+
+function botMessageKey(channelId: string, threadTs?: string): string {
+  return threadTs ? `${channelId}:${threadTs}` : channelId;
+}
+
+// #5: Track threads where history has already been loaded
+const threadHistoryLoaded = new Set<string>();
 
 function isDuplicate(channelId: string, ts: string): boolean {
   const key = `${channelId}:${ts}`;
@@ -208,6 +218,73 @@ async function sendReaction(
   });
 }
 
+async function removeReaction(
+  token: string,
+  channelId: string,
+  ts: string,
+  emoji: string,
+): Promise<void> {
+  const name = emoji.replace(/:/g, "").toLowerCase();
+  await slackApi(token, "reactions.remove", {
+    channel: channelId,
+    timestamp: ts,
+    name,
+  }).catch((err) => {
+    debugLog(`Remove reaction failed (${name}): ${err instanceof Error ? err.message : err}`);
+  });
+}
+
+// --- Message update (for streaming) ---
+
+async function updateMessage(
+  token: string,
+  channelId: string,
+  messageTs: string,
+  text: string,
+): Promise<void> {
+  await slackApi(token, "chat.update", {
+    channel: channelId,
+    ts: messageTs,
+    text,
+  }).catch((err) => {
+    debugLog(`chat.update failed: ${err instanceof Error ? err.message : err}`);
+  });
+}
+
+async function deleteMessage(
+  token: string,
+  channelId: string,
+  messageTs: string,
+): Promise<void> {
+  await slackApi(token, "chat.delete", {
+    channel: channelId,
+    ts: messageTs,
+  }).catch((err) => {
+    debugLog(`chat.delete failed: ${err instanceof Error ? err.message : err}`);
+  });
+}
+
+async function postMessage(
+  token: string,
+  channelId: string,
+  text: string,
+  threadTs?: string,
+): Promise<string | null> {
+  const params: Record<string, unknown> = {
+    channel: channelId,
+    text,
+  };
+  if (threadTs) params.thread_ts = threadTs;
+  const data = await slackApi<{ ts: string }>(token, "chat.postMessage", params).catch((err) => {
+    debugLog(`chat.postMessage failed: ${err instanceof Error ? err.message : err}`);
+    return null;
+  });
+  return data?.ts ?? null;
+}
+
+// Streaming: send initial message then update it as chunks arrive
+const STREAM_UPDATE_INTERVAL_MS = 1200; // throttle updates to ~1/sec
+
 // --- Reaction directive extraction ---
 
 function extractReactionDirective(text: string): { cleanedText: string; reactionEmoji: string | null } {
@@ -222,6 +299,251 @@ function extractReactionDirective(text: string): { cleanedText: string; reaction
     .replace(/\n{3,}/g, "\n\n")
     .trim();
   return { cleanedText, reactionEmoji };
+}
+
+// --- #3: Block Kit directive extraction ---
+
+interface BlockKitButton {
+  label: string;
+  value: string;
+  style?: "primary" | "danger";
+}
+
+interface BlockKitSelect {
+  placeholder: string;
+  options: { label: string; value: string }[];
+}
+
+function extractBlockKitDirectives(text: string): {
+  cleanedText: string;
+  buttons: BlockKitButton[] | null;
+  select: BlockKitSelect | null;
+} {
+  let buttons: BlockKitButton[] | null = null;
+  let select: BlockKitSelect | null = null;
+
+  let cleaned = text
+    // Parse [[slack_buttons: Label1:value1, Label2:value2]]
+    .replace(/\[\[slack_buttons:\s*(.+?)\]\]/gi, (_match, raw) => {
+      buttons = String(raw).split(",").map((pair) => {
+        const trimmed = pair.trim();
+        const colonIdx = trimmed.lastIndexOf(":");
+        if (colonIdx === -1) return { label: trimmed, value: trimmed.toLowerCase().replace(/\s+/g, "_") };
+        const label = trimmed.slice(0, colonIdx).trim();
+        const value = trimmed.slice(colonIdx + 1).trim();
+        return { label, value };
+      }).filter((b) => b.label);
+      return "";
+    })
+    // Parse [[slack_select: Placeholder | Option1:opt1, Option2:opt2]]
+    .replace(/\[\[slack_select:\s*(.+?)\]\]/gi, (_match, raw) => {
+      const parts = String(raw).split("|");
+      const placeholder = parts.length > 1 ? parts[0].trim() : "請選擇";
+      const optionsStr = parts.length > 1 ? parts.slice(1).join("|").trim() : parts[0].trim();
+      const options = optionsStr.split(",").map((pair) => {
+        const trimmed = pair.trim();
+        const colonIdx = trimmed.lastIndexOf(":");
+        if (colonIdx === -1) return { label: trimmed, value: trimmed.toLowerCase().replace(/\s+/g, "_") };
+        return { label: trimmed.slice(0, colonIdx).trim(), value: trimmed.slice(colonIdx + 1).trim() };
+      }).filter((o) => o.label);
+      if (options.length > 0) select = { placeholder, options };
+      return "";
+    })
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+
+  return { cleanedText: cleaned, buttons: buttons && buttons.length > 0 ? buttons : null, select };
+}
+
+async function sendBlockKitMessage(
+  token: string,
+  channelId: string,
+  text: string,
+  buttons: BlockKitButton[] | null,
+  select: BlockKitSelect | null,
+  threadTs?: string,
+): Promise<string | null> {
+  const blocks: Record<string, unknown>[] = [];
+
+  if (text) {
+    blocks.push({
+      type: "section",
+      text: { type: "mrkdwn", text },
+    });
+  }
+
+  const actionElements: Record<string, unknown>[] = [];
+
+  if (buttons) {
+    for (const btn of buttons) {
+      const element: Record<string, unknown> = {
+        type: "button",
+        text: { type: "plain_text", text: btn.label },
+        action_id: `btn_${btn.value}`,
+        value: btn.value,
+      };
+      if (btn.style) element.style = btn.style;
+      actionElements.push(element);
+    }
+  }
+
+  if (select) {
+    actionElements.push({
+      type: "static_select",
+      placeholder: { type: "plain_text", text: select.placeholder },
+      action_id: "select_action",
+      options: select.options.map((o) => ({
+        text: { type: "plain_text", text: o.label },
+        value: o.value,
+      })),
+    });
+  }
+
+  if (actionElements.length > 0) {
+    blocks.push({
+      type: "actions",
+      elements: actionElements,
+    });
+  }
+
+  const params: Record<string, unknown> = {
+    channel: channelId,
+    text: text || "Interactive message",
+    blocks,
+  };
+  if (threadTs) params.thread_ts = threadTs;
+
+  const data = await slackApi<{ ts: string }>(token, "chat.postMessage", params).catch((err) => {
+    debugLog(`sendBlockKitMessage failed: ${err instanceof Error ? err.message : err}`);
+    return null;
+  });
+  return data?.ts ?? null;
+}
+
+// --- #4: Edit/Delete directive extraction ---
+
+function extractEditDirective(text: string): {
+  cleanedText: string;
+  editContent: string | null;
+  deleteCount: number; // 0 = no delete, -1 = delete all, N = delete last N
+  deleteMatches: string[]; // content patterns to match for targeted deletion
+} {
+  let editContent: string | null = null;
+  let deleteCount = 0;
+  const deleteMatches: string[] = [];
+
+  const cleaned = text
+    .replace(/\[edit_last\]([\s\S]*?)\[\/edit_last\]/gi, (_match, content) => {
+      editContent = String(content).trim();
+      return "";
+    })
+    .replace(/\[delete_all\]/gi, () => {
+      deleteCount = -1;
+      return "";
+    })
+    .replace(/\[delete_last(?::(\d+))?\]/gi, (_match, n) => {
+      deleteCount = n ? parseInt(n, 10) : 1;
+      return "";
+    })
+    .replace(/\[delete_match:([^\]]+)\]/gi, (_match, pattern) => {
+      deleteMatches.push(String(pattern).trim());
+      return "";
+    })
+    .trim();
+
+  return { cleanedText: cleaned, editContent, deleteCount, deleteMatches };
+}
+
+// Fetch bot's own messages from channel/thread history for edit/delete
+async function fetchBotMessages(
+  token: string,
+  channelId: string,
+  threadTs?: string,
+  limit: number = 50,
+): Promise<{ ts: string; text: string }[]> {
+  if (threadTs) {
+    // Thread: use conversations.replies
+    const params = new URLSearchParams({
+      channel: channelId,
+      ts: threadTs,
+      limit: String(limit),
+      inclusive: "true",
+    });
+    const res = await fetch(`${SLACK_API}/conversations.replies?${params}`, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const data = await res.json() as { ok: boolean; messages?: Array<{ ts: string; text: string; bot_id?: string; user?: string }> };
+    if (!data.ok || !data.messages) return [];
+    return data.messages
+      .filter((m) => m.user === botUserId || m.bot_id)
+      .map((m) => ({ ts: m.ts, text: m.text }));
+  } else {
+    // DM/channel: use conversations.history
+    const data = await slackApi<{ messages: Array<{ ts: string; text: string; bot_id?: string; user?: string }> }>(
+      token, "conversations.history", { channel: channelId, limit },
+    );
+    return (data.messages ?? [])
+      .filter((m) => m.user === botUserId || m.bot_id)
+      .map((m) => ({ ts: m.ts, text: m.text }));
+  }
+}
+
+// --- #5: Thread history loading ---
+
+async function fetchThreadHistory(
+  token: string,
+  channelId: string,
+  threadTs: string,
+  limit: number = 20,
+): Promise<{ role: string; text: string; user?: string; ts: string }[]> {
+  // conversations.replies uses GET-style params — pass as query string via fetch
+  const params = new URLSearchParams({
+    channel: channelId,
+    ts: threadTs,
+    limit: String(limit),
+    inclusive: "true",
+  });
+  const res = await fetch(`${SLACK_API}/conversations.replies?${params}`, {
+    method: "GET",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  const data = await res.json() as {
+    ok: boolean;
+    error?: string;
+    messages?: Array<{
+      text: string;
+      user?: string;
+      bot_id?: string;
+      ts: string;
+    }>;
+  };
+  if (!data.ok) {
+    throw new Error(`conversations.replies error: ${data.error ?? "unknown"}`);
+  }
+
+  return (data.messages ?? []).map((msg) => ({
+    role: msg.bot_id ? "assistant" : "user",
+    text: msg.text,
+    user: msg.user,
+    ts: msg.ts,
+  }));
+}
+
+function formatThreadHistoryAsContext(
+  messages: { role: string; text: string; user?: string; ts: string }[],
+): string {
+  if (messages.length === 0) return "";
+
+  const lines = ["--- Thread History (previous messages) ---"];
+  for (const msg of messages) {
+    const sender = msg.role === "assistant" ? "Bot" : `User ${msg.user ?? "unknown"}`;
+    lines.push(`[${sender}]: ${msg.text}`);
+  }
+  lines.push("--- End of Thread History ---");
+  lines.push("");
+  return lines.join("\n");
 }
 
 // --- Thread session key ---
@@ -359,6 +681,25 @@ async function handleMessage(event: SlackMessage): Promise<void> {
       }
     }
 
+    // #5: Load thread history for new thread sessions
+    let threadHistoryContext = "";
+    if (inThread && sessionThreadId && !threadHistoryLoaded.has(sessionThreadId)) {
+      const existingSession = await peekThreadSession(sessionThreadId);
+      if (!existingSession) {
+        try {
+          const history = await fetchThreadHistory(config.botToken, channelId, event.thread_ts!, 20);
+          const pastMessages = history.filter((m) => m.ts !== event.ts);
+          if (pastMessages.length > 0) {
+            threadHistoryContext = formatThreadHistoryAsContext(pastMessages);
+            debugLog(`Loaded ${pastMessages.length} thread history messages for ${sessionThreadId}`);
+          }
+        } catch (err) {
+          debugLog(`Failed to load thread history: ${err instanceof Error ? err.message : err}`);
+        }
+      }
+      threadHistoryLoaded.add(sessionThreadId);
+    }
+
     let imagePath: string | null = null;
     let voicePath: string | null = null;
     let voiceTranscript: string | null = null;
@@ -403,6 +744,10 @@ async function handleMessage(event: SlackMessage): Promise<void> {
 
     // Build prompt
     const promptParts = [`[Slack from ${label}]`];
+    // #5: Prepend thread history context
+    if (threadHistoryContext) {
+      promptParts.push(threadHistoryContext);
+    }
     if (skillContext) {
       const args = cleanText.trim().slice(command!.length).trim();
       promptParts.push(`<command-name>${command}</command-name>`);
@@ -429,7 +774,13 @@ async function handleMessage(event: SlackMessage): Promise<void> {
     // Show "thinking" status via Assistant API
     await setAssistantStatus(config.botToken, channelId, replyThreadTs, "正在思考中...");
 
+    // Add thinking reaction
+    await sendReaction(config.botToken, channelId, event.ts, "hourglass_flowing_sand");
+
     const result = await runUserMessage("slack", prefixedPrompt, sessionThreadId);
+
+    // Remove thinking reaction
+    await removeReaction(config.botToken, channelId, event.ts, "hourglass_flowing_sand");
 
     // Clear assistant status
     await clearAssistantStatus(config.botToken, channelId, replyThreadTs);
@@ -442,16 +793,98 @@ async function handleMessage(event: SlackMessage): Promise<void> {
         replyThreadTs,
       );
     } else {
-      const { cleanedText, reactionEmoji } = extractReactionDirective(result.stdout || "");
+      // Extract all directives
+      const { cleanedText: afterReact, reactionEmoji } = extractReactionDirective(result.stdout || "");
+      const { cleanedText: afterEdit, editContent, deleteCount, deleteMatches } = extractEditDirective(afterReact);
+      const { cleanedText: finalText, buttons, select } = extractBlockKitDirectives(afterEdit);
+
       if (reactionEmoji) {
         await sendReaction(config.botToken, channelId, event.ts, reactionEmoji);
       }
-      await sendMessage(config.botToken, channelId, cleanedText || "(empty response)", replyThreadTs);
+
+      // #4: Handle edit/delete of bot messages via API history lookup
+      const msgKey = botMessageKey(channelId, replyThreadTs);
+
+      if (deleteCount !== 0 || deleteMatches.length > 0) {
+        try {
+          const botMessages = await fetchBotMessages(config.botToken, channelId, replyThreadTs);
+          let toDelete: { ts: string; text: string }[] = [];
+
+          if (deleteCount === -1) {
+            toDelete = botMessages;
+          } else if (deleteCount > 0) {
+            toDelete = botMessages.slice(0, deleteCount);
+          }
+
+          // Match specific messages by content
+          if (deleteMatches.length > 0) {
+            for (const pattern of deleteMatches) {
+              const lowerPattern = pattern.toLowerCase();
+              const matched = botMessages.filter((m) =>
+                m.text.toLowerCase().includes(lowerPattern) && !toDelete.some((d) => d.ts === m.ts)
+              );
+              toDelete.push(...matched);
+            }
+          }
+
+          for (const msg of toDelete) {
+            await deleteMessage(config.botToken, channelId, msg.ts);
+          }
+          debugLog(`Deleted ${toDelete.length} bot messages`);
+          lastBotMessageTs.delete(msgKey);
+        } catch (err) {
+          debugLog(`Failed to delete bot messages: ${err instanceof Error ? err.message : err}`);
+        }
+      }
+
+      if (editContent) {
+        try {
+          const lastTs = lastBotMessageTs.get(msgKey);
+          if (lastTs) {
+            await updateMessage(config.botToken, channelId, lastTs, editContent);
+            debugLog(`Edited last bot message: ${lastTs}`);
+          } else {
+            // Fallback: fetch from API
+            const botMessages = await fetchBotMessages(config.botToken, channelId, replyThreadTs);
+            if (botMessages.length > 0) {
+              await updateMessage(config.botToken, channelId, botMessages[0].ts, editContent);
+              debugLog(`Edited bot message (from history): ${botMessages[0].ts}`);
+            }
+          }
+        } catch (err) {
+          debugLog(`Failed to edit bot message: ${err instanceof Error ? err.message : err}`);
+        }
+      }
+
+      // Send new response (if any text remains after directives)
+      if (finalText) {
+        let sentTs: string | null = null;
+        if (buttons || select) {
+          // #3: Send as Block Kit message
+          sentTs = await sendBlockKitMessage(config.botToken, channelId, finalText, buttons, select, replyThreadTs);
+        } else {
+          sentTs = await postMessage(config.botToken, channelId, finalText, replyThreadTs);
+          // Handle long messages that need chunking
+          if (sentTs && finalText.length > 3800) {
+            // First chunk already sent via postMessage, send remaining
+            for (let i = 3800; i < finalText.length; i += 3800) {
+              const chunkTs = await postMessage(config.botToken, channelId, finalText.slice(i, i + 3800), replyThreadTs);
+              if (chunkTs) sentTs = chunkTs;
+            }
+          }
+        }
+        if (sentTs) lastBotMessageTs.set(msgKey, sentTs);
+      } else if (!editContent && deleteCount === 0) {
+        // No text, no edit, no delete — send empty response
+        const sentTs = await postMessage(config.botToken, channelId, "(empty response)", replyThreadTs);
+        if (sentTs) lastBotMessageTs.set(msgKey, sentTs);
+      }
     }
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
     console.error(`[Slack] Error for ${label}: ${errMsg}`);
-    // Clear status on error too
+    // Clear thinking reaction and status on error
+    await removeReaction(config.botToken, channelId, event.ts, "hourglass_flowing_sand");
     await clearAssistantStatus(config.botToken, event.channel, event.thread_ts ?? event.ts);
     await sendMessage(
       config.botToken,
@@ -459,6 +892,75 @@ async function handleMessage(event: SlackMessage): Promise<void> {
       `Error: ${errMsg}`,
       event.thread_ts ?? event.ts,
     );
+  }
+}
+
+// --- #3: Block action handler ---
+
+async function handleBlockAction(payload: any): Promise<void> {
+  const config = getSettings().slack;
+  const actions = payload.actions as Array<{
+    action_id: string;
+    value?: string;
+    type: string;
+    selected_option?: { value: string; text: { text: string } };
+  }>;
+  const user = payload.user as { id: string; username?: string };
+  const channelId = (payload.channel as { id: string })?.id;
+  const message = payload.message as { ts: string; thread_ts?: string } | undefined;
+
+  if (!actions?.length || !channelId || !user?.id) return;
+
+  // Authorization check
+  if (config.allowedUserIds.length > 0 && !config.allowedUserIds.includes(user.id)) {
+    return;
+  }
+
+  const action = actions[0];
+  const actionId = action.action_id;
+  const value = action.type === "static_select"
+    ? action.selected_option?.value ?? ""
+    : action.value ?? actionId;
+  const label = action.type === "static_select"
+    ? action.selected_option?.text?.text ?? value
+    : value;
+
+  const threadTs = message?.thread_ts ?? message?.ts;
+  const replyThreadTs = threadTs ?? message?.ts;
+  const sessionThreadId = threadTs ? slackThreadId(channelId, threadTs) : undefined;
+
+  console.log(
+    `[${new Date().toLocaleTimeString()}] Slack ${user.id} [interactive]: "${actionId}" = "${value}"`,
+  );
+
+  // Show thinking
+  if (replyThreadTs) {
+    await setAssistantStatus(config.botToken, channelId, replyThreadTs, "正在處理中...");
+  }
+
+  const prompt = `[Slack interactive from ${user.id}]\nUser clicked: "${label}" (action: ${actionId}, value: ${value})`;
+  const result = await runUserMessage("slack", prompt, sessionThreadId);
+
+  if (replyThreadTs) {
+    await clearAssistantStatus(config.botToken, channelId, replyThreadTs);
+  }
+
+  if (result.exitCode === 0 && result.stdout) {
+    const { cleanedText } = extractReactionDirective(result.stdout);
+    const { cleanedText: finalText, buttons, select } = extractBlockKitDirectives(cleanedText);
+
+    if (finalText) {
+      const msgKey = botMessageKey(channelId, replyThreadTs);
+      let sentTs: string | null = null;
+      if (buttons || select) {
+        sentTs = await sendBlockKitMessage(config.botToken, channelId, finalText, buttons, select, replyThreadTs);
+      } else {
+        sentTs = await postMessage(config.botToken, channelId, finalText, replyThreadTs);
+      }
+      if (sentTs) lastBotMessageTs.set(msgKey, sentTs);
+    }
+  } else if (result.exitCode !== 0) {
+    await sendMessage(config.botToken, channelId, `Error: ${result.stderr || "Unknown"}`, replyThreadTs);
   }
 }
 
@@ -627,6 +1129,20 @@ async function handleSocketPayload(
     return;
   }
 
+  // #3: Handle interactive events (button clicks, select menus)
+  if (type === "interactive" && data.payload) {
+    const interactivePayload = data.payload as any;
+    if (data.accepts_response_payload) {
+      sendAck(data.envelope_id!);
+    }
+    if (interactivePayload.type === "block_actions") {
+      await handleBlockAction(interactivePayload).catch((err) => {
+        console.error(`[Slack] handleBlockAction error: ${err instanceof Error ? err.message : err}`);
+      });
+    }
+    return;
+  }
+
   debugLog(`Unhandled socket event type: ${type}`);
 }
 
@@ -785,6 +1301,7 @@ process.on("SIGINT", () => stopSlack());
 
 /** Standalone entry point (bun run src/index.ts slack) */
 export async function slack(): Promise<void> {
+  slackDebug = true; // Enable debug for standalone mode
   await loadSettings();
   await ensureProjectClaudeMd();
   const config = getSettings().slack;
