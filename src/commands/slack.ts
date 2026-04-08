@@ -6,6 +6,25 @@ import { transcribeAudioToText } from "../whisper";
 import { resolveSkillPrompt } from "../skills";
 import { mkdir } from "node:fs/promises";
 import { extname, join } from "node:path";
+import { existsSync } from "node:fs";
+
+// Slack-specific directives prompt (loaded once)
+const SLACK_DIRECTIVES_PATH = join(import.meta.dir, "..", "prompts", "slack", "DIRECTIVES.md");
+let slackDirectivesPrompt: string | null = null;
+
+async function loadSlackDirectives(): Promise<string> {
+  if (slackDirectivesPrompt !== null) return slackDirectivesPrompt;
+  try {
+    if (existsSync(SLACK_DIRECTIVES_PATH)) {
+      slackDirectivesPrompt = await Bun.file(SLACK_DIRECTIVES_PATH).text();
+    } else {
+      slackDirectivesPrompt = "";
+    }
+  } catch {
+    slackDirectivesPrompt = "";
+  }
+  return slackDirectivesPrompt;
+}
 
 // --- Slack API constants ---
 
@@ -743,7 +762,11 @@ async function handleMessage(event: SlackMessage): Promise<void> {
     }
 
     // Build prompt
+    const slackDirectives = await loadSlackDirectives();
     const promptParts = [`[Slack from ${label}]`];
+    if (slackDirectives) {
+      promptParts.push(slackDirectives);
+    }
     // #5: Prepend thread history context
     if (threadHistoryContext) {
       promptParts.push(threadHistoryContext);
