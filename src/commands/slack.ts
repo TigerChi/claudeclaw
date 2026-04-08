@@ -921,7 +921,8 @@ async function handleMessage(event: SlackMessage): Promise<void> {
 
     // Build prompt
     const slackDirectives = await loadSlackDirectives();
-    const promptParts = [`[Slack from ${label}]`];
+    const channelType = isDirectMessage ? "DM" : inThread ? "thread" : "channel";
+    const promptParts = [`[Slack from ${label} in ${channelType} ${channelId}${inThread ? ` thread ${event.thread_ts}` : ""}]`];
     if (slackDirectives) {
       promptParts.push(slackDirectives);
     }
@@ -1059,6 +1060,8 @@ async function handleMessage(event: SlackMessage): Promise<void> {
         }
       }
 
+
+
       // #12: Handle channel read directives — fetch and send as follow-up message to agent
       for (const read of channelReads) {
         try {
@@ -1093,8 +1096,8 @@ async function handleMessage(event: SlackMessage): Promise<void> {
           }
         }
         if (sentTs) lastBotMessageTs.set(msgKey, sentTs);
-      } else if (!editContent && deleteCount === 0) {
-        // No text, no edit, no delete — send empty response
+      } else if (!editContent && deleteCount === 0 && uploads.length === 0 && channelReads.length === 0) {
+        // No text, no directives at all — send empty response
         const sentTs = await postMessage(config.botToken, channelId, "(empty response)", replyThreadTs);
         if (sentTs) lastBotMessageTs.set(msgKey, sentTs);
       }
