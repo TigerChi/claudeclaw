@@ -9,7 +9,7 @@ import { extname, join } from "node:path";
 import { existsSync } from "node:fs";
 
 // Slack-specific directives prompt (loaded once)
-const SLACK_DIRECTIVES_PATH = join(import.meta.dir, "..", "prompts", "slack", "DIRECTIVES.md");
+const SLACK_DIRECTIVES_PATH = join(import.meta.dir, "..", "..", "prompts", "slack", "DIRECTIVES.md");
 let slackDirectivesPrompt: string | null = null;
 
 async function loadSlackDirectives(): Promise<string> {
@@ -573,12 +573,12 @@ function slackThreadId(channelId: string, threadTs: string): string {
   return `slk:${channelId}:${threadTs}`;
 }
 
-// --- File download ---
+// --- #6: File download (all types) ---
 
 async function downloadSlackFile(
   token: string,
   file: SlackFile,
-  type: "image" | "voice",
+  type: "image" | "voice" | "document",
 ): Promise<string | null> {
   const url = file.url_private_download ?? file.url_private;
   if (!url) return null;
@@ -593,13 +593,150 @@ async function downloadSlackFile(
     throw new Error(`Slack file download failed: ${res.status}`);
   }
 
-  const ext = extname(file.name ?? "") || (type === "voice" ? ".webm" : ".jpg");
+  const defaultExt = type === "voice" ? ".webm" : type === "image" ? ".jpg" : "";
+  const ext = extname(file.name ?? "") || defaultExt;
   const filename = `${file.id}-${Date.now()}${ext}`;
   const localPath = join(dir, filename);
   const bytes = new Uint8Array(await res.arrayBuffer());
   await Bun.write(localPath, bytes);
   debugLog(`File downloaded: ${localPath} (${bytes.length} bytes)`);
   return localPath;
+}
+
+// --- #6: File upload ---
+
+async function uploadFile(
+  token: string,
+  channelId: string,
+  filePath: string,
+  threadTs?: string,
+  title?: string,
+): Promise<void> {
+  const file = Bun.file(filePath);
+  if (!(await file.exists())) {
+    debugLog(`Upload failed: file not found: ${filePath}`);
+    return;
+  }
+
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  const filename = filePath.split("/").pop() ?? "file";
+
+  // Step 1: Get upload URL (uses GET-style params)
+  const params = new URLSearchParams({
+    filename,
+    length: String(bytes.byteLength),
+  });
+  const step1Res = await fetch(`${SLACK_API}/files.getUploadURLExternal?${params}`, {
+    method: "GET",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  const step1Data = await step1Res.json() as { ok: boolean; error?: string; upload_url?: string; file_id?: string };
+  if (!step1Data.ok || !step1Data.upload_url || !step1Data.file_id) {
+    throw new Error(`files.getUploadURLExternal error: ${step1Data.error ?? "missing upload_url"}`);
+  }
+
+  // Step 2: Upload file content to the URL
+  const uploadRes = await fetch(step1Data.upload_url, {
+    method: "POST",
+    headers: { "Content-Type": "application/octet-stream" },
+    body: bytes,
+  });
+  if (!uploadRes.ok) {
+    throw new Error(`File upload failed: ${uploadRes.status}`);
+  }
+
+  // Step 3: Complete upload and share to channel
+  const fileObj: Record<string, unknown> = { id: step1Data.file_id };
+  if (title) fileObj.title = title;
+  await slackApi(token, "files.completeUploadExternal", {
+    files: [fileObj],
+    channel_id: channelId,
+    ...(threadTs ? { thread_ts: threadTs } : {}),
+  });
+
+  console.log(`[Slack] File uploaded: ${filename} to ${channelId}`);
+}
+
+// --- #6: Upload directive extraction ---
+
+function extractUploadDirectives(text: string): {
+  cleanedText: string;
+  uploads: { path: string; title?: string }[];
+} {
+  const uploads: { path: string; title?: string }[] = [];
+  const cleaned = text
+    .replace(/\[upload_file:([^\]]+)\]/gi, (_match, raw) => {
+      const parts = String(raw).split("|");
+      const path = parts[0].trim();
+      const title = parts.length > 1 ? parts[1].trim() : undefined;
+      if (path) uploads.push({ path, title });
+      return "";
+    })
+    .trim();
+  return { cleanedText: cleaned, uploads };
+}
+
+// --- #12: Read channel history directive ---
+
+function extractChannelReadDirectives(text: string): {
+  cleanedText: string;
+  channelReads: { channelId: string; limit: number }[];
+} {
+  const channelReads: { channelId: string; limit: number }[] = [];
+  const cleaned = text
+    .replace(/\[read_channel:([A-Z0-9]+)(?::(\d+))?\]/gi, (_match, chId, lim) => {
+      channelReads.push({ channelId: chId, limit: lim ? parseInt(lim, 10) : 20 });
+      return "";
+    })
+    .trim();
+  return { cleanedText: cleaned, channelReads };
+}
+
+async function fetchChannelHistory(
+  token: string,
+  channelId: string,
+  limit: number = 20,
+): Promise<string> {
+  const params = new URLSearchParams({
+    channel: channelId,
+    limit: String(limit),
+  });
+  const res = await fetch(`${SLACK_API}/conversations.history?${params}`, {
+    method: "GET",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  const data = await res.json() as {
+    ok: boolean;
+    error?: string;
+    messages?: Array<{ text: string; user?: string; bot_id?: string; ts: string }>;
+  };
+  if (!data.ok) {
+    return `Error reading channel ${channelId}: ${data.error ?? "unknown"}`;
+  }
+  const msgs = (data.messages ?? []).reverse();
+  const lines = [`--- Channel ${channelId} History (${msgs.length} messages) ---`];
+  for (const msg of msgs) {
+    const sender = msg.bot_id ? "Bot" : `User ${msg.user ?? "unknown"}`;
+    lines.push(`[${sender}]: ${msg.text}`);
+  }
+  lines.push("--- End ---");
+  return lines.join("\n");
+}
+
+// --- #11: Message content sanitization ---
+
+function sanitizeUserInput(text: string): string {
+  // Strip any directive-like patterns from user input to prevent injection
+  return text
+    .replace(/\[react:[^\]]*\]/gi, "[react removed]")
+    .replace(/\[edit_last\][\s\S]*?\[\/edit_last\]/gi, "[edit removed]")
+    .replace(/\[delete_last(?::\d+)?\]/gi, "[delete removed]")
+    .replace(/\[delete_all\]/gi, "[delete removed]")
+    .replace(/\[delete_match:[^\]]*\]/gi, "[delete removed]")
+    .replace(/\[upload_file:[^\]]*\]/gi, "[upload removed]")
+    .replace(/\[read_channel:[^\]]*\]/gi, "[read removed]")
+    .replace(/\[\[slack_buttons:[^\]]*\]\]/gi, "[buttons removed]")
+    .replace(/\[\[slack_select:[^\]]*\]\]/gi, "[select removed]");
 }
 
 // --- Trigger check ---
@@ -614,6 +751,10 @@ function isVoiceFile(f: SlackFile): boolean {
     f.filetype === "webm" ||
     f.filetype === "mp4",
   );
+}
+
+function isDocumentFile(f: SlackFile): boolean {
+  return !isImageFile(f) && !isVoiceFile(f) && Boolean(f.url_private);
 }
 
 function isBotMentioned(text: string): boolean {
@@ -671,10 +812,12 @@ async function handleMessage(event: SlackMessage): Promise<void> {
   const files = event.files ?? [];
   const imageFiles = files.filter(isImageFile);
   const voiceFiles = files.filter(isVoiceFile);
+  const docFiles = files.filter(isDocumentFile);
   const hasImage = imageFiles.length > 0;
   const hasVoice = voiceFiles.length > 0;
+  const hasDoc = docFiles.length > 0;
 
-  if (!cleanText.trim() && !hasImage && !hasVoice) return;
+  if (!cleanText.trim() && !hasImage && !hasVoice && !hasDoc) return;
 
   const label = userId;
   const mediaParts = [hasImage ? "image" : "", hasVoice ? "voice" : ""].filter(Boolean);
@@ -722,6 +865,7 @@ async function handleMessage(event: SlackMessage): Promise<void> {
     let imagePath: string | null = null;
     let voicePath: string | null = null;
     let voiceTranscript: string | null = null;
+    const docPaths: { path: string; name: string }[] = [];
 
     if (hasImage) {
       try {
@@ -746,6 +890,20 @@ async function handleMessage(event: SlackMessage): Promise<void> {
           });
         } catch (err) {
           console.error(`[Slack] Failed to transcribe voice: ${err instanceof Error ? err.message : err}`);
+        }
+      }
+    }
+
+    // #6: Download document files
+    if (hasDoc) {
+      for (const docFile of docFiles) {
+        try {
+          const docPath = await downloadSlackFile(config.botToken, docFile, "document");
+          if (docPath) {
+            docPaths.push({ path: docPath, name: docFile.name ?? "unknown" });
+          }
+        } catch (err) {
+          console.error(`[Slack] Failed to download doc: ${err instanceof Error ? err.message : err}`);
         }
       }
     }
@@ -791,6 +949,15 @@ async function handleMessage(event: SlackMessage): Promise<void> {
     } else if (hasVoice) {
       promptParts.push("The user attached voice audio, but it could not be transcribed. Ask them to resend a clearer clip.");
     }
+    // #6: Document files
+    if (docPaths.length > 0) {
+      for (const doc of docPaths) {
+        promptParts.push(`Attached file "${doc.name}": ${doc.path}`);
+      }
+      promptParts.push("The user attached file(s). Read and analyze them as needed.");
+    } else if (hasDoc) {
+      promptParts.push("The user attached file(s), but downloading failed. Ask them to resend.");
+    }
 
     const prefixedPrompt = promptParts.join("\n");
 
@@ -819,7 +986,9 @@ async function handleMessage(event: SlackMessage): Promise<void> {
       // Extract all directives
       const { cleanedText: afterReact, reactionEmoji } = extractReactionDirective(result.stdout || "");
       const { cleanedText: afterEdit, editContent, deleteCount, deleteMatches } = extractEditDirective(afterReact);
-      const { cleanedText: finalText, buttons, select } = extractBlockKitDirectives(afterEdit);
+      const { cleanedText: afterUpload, uploads } = extractUploadDirectives(afterEdit);
+      const { cleanedText: afterChannelRead, channelReads } = extractChannelReadDirectives(afterUpload);
+      const { cleanedText: finalText, buttons, select } = extractBlockKitDirectives(afterChannelRead);
 
       if (reactionEmoji) {
         await sendReaction(config.botToken, channelId, event.ts, reactionEmoji);
@@ -876,6 +1045,33 @@ async function handleMessage(event: SlackMessage): Promise<void> {
           }
         } catch (err) {
           debugLog(`Failed to edit bot message: ${err instanceof Error ? err.message : err}`);
+        }
+      }
+
+      // #6: Handle file uploads
+      for (const upload of uploads) {
+        try {
+          console.log(`[Slack] Uploading file: ${upload.path}`);
+          await uploadFile(config.botToken, channelId, upload.path, replyThreadTs, upload.title);
+          console.log(`[Slack] File uploaded: ${upload.path}`);
+        } catch (err) {
+          console.error(`[Slack] Failed to upload file: ${err instanceof Error ? err.message : err}`);
+        }
+      }
+
+      // #12: Handle channel read directives — fetch and send as follow-up message to agent
+      for (const read of channelReads) {
+        try {
+          const history = await fetchChannelHistory(config.botToken, read.channelId, read.limit);
+          const historyPath = join(process.cwd(), ".claude", "claudeclaw", "inbox", "slack", `channel-${read.channelId}-${Date.now()}.txt`);
+          await mkdir(join(process.cwd(), ".claude", "claudeclaw", "inbox", "slack"), { recursive: true });
+          await Bun.write(historyPath, history);
+          // Send follow-up to agent with channel history
+          const followUp = `[System] Channel history for ${read.channelId} saved to: ${historyPath}\nPlease read this file and summarize or respond based on the user's request.`;
+          await runUserMessage("slack", followUp, sessionThreadId);
+          debugLog(`Channel history fetched: ${read.channelId} → ${historyPath}`);
+        } catch (err) {
+          debugLog(`Failed to fetch channel history: ${err instanceof Error ? err.message : err}`);
         }
       }
 
