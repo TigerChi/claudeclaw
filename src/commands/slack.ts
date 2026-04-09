@@ -968,15 +968,20 @@ async function handleMessage(event: SlackMessage): Promise<void> {
     // Add thinking reaction
     await sendReaction(config.botToken, channelId, event.ts, "hourglass_flowing_sand");
 
+    // Periodically refresh assistant status to prevent Slack auto-expiry
+    const statusRefreshInterval = setInterval(async () => {
+      await setAssistantStatus(config.botToken, channelId, replyThreadTs, "正在思考中...").catch(() => {});
+    }, 20_000);
+
     const result = await runUserMessage("slack", prefixedPrompt, sessionThreadId);
 
-    // Remove thinking reaction
-    await removeReaction(config.botToken, channelId, event.ts, "hourglass_flowing_sand");
-
-    // Clear assistant status
-    await clearAssistantStatus(config.botToken, channelId, replyThreadTs);
+    // Stop refreshing status
+    clearInterval(statusRefreshInterval);
 
     if (result.exitCode !== 0) {
+      // Remove thinking reaction and status on error, before sending error message
+      await removeReaction(config.botToken, channelId, event.ts, "hourglass_flowing_sand");
+      await clearAssistantStatus(config.botToken, channelId, replyThreadTs);
       await sendMessage(
         config.botToken,
         channelId,
@@ -1101,6 +1106,10 @@ async function handleMessage(event: SlackMessage): Promise<void> {
         const sentTs = await postMessage(config.botToken, channelId, "(empty response)", replyThreadTs);
         if (sentTs) lastBotMessageTs.set(msgKey, sentTs);
       }
+
+      // Remove thinking reaction and status AFTER reply is sent
+      await removeReaction(config.botToken, channelId, event.ts, "hourglass_flowing_sand");
+      await clearAssistantStatus(config.botToken, channelId, replyThreadTs);
     }
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
@@ -1155,17 +1164,27 @@ async function handleBlockAction(payload: any): Promise<void> {
     `[${new Date().toLocaleTimeString()}] Slack ${user.id} [interactive]: "${actionId}" = "${value}"`,
   );
 
-  // Show thinking
+  // Show thinking status and reaction
+  const messageTs = message?.ts;
   if (replyThreadTs) {
     await setAssistantStatus(config.botToken, channelId, replyThreadTs, "正在處理中...");
   }
+  if (messageTs) {
+    await sendReaction(config.botToken, channelId, messageTs, "hourglass_flowing_sand");
+  }
+
+  // Periodically refresh assistant status to prevent Slack auto-expiry
+  const statusRefreshInterval = replyThreadTs
+    ? setInterval(async () => {
+        await setAssistantStatus(config.botToken, channelId, replyThreadTs, "正在處理中...").catch(() => {});
+      }, 20_000)
+    : null;
 
   const prompt = `[Slack interactive from ${user.id}]\nUser clicked: "${label}" (action: ${actionId}, value: ${value})`;
   const result = await runUserMessage("slack", prompt, sessionThreadId);
 
-  if (replyThreadTs) {
-    await clearAssistantStatus(config.botToken, channelId, replyThreadTs);
-  }
+  // Stop refreshing status
+  if (statusRefreshInterval) clearInterval(statusRefreshInterval);
 
   if (result.exitCode === 0 && result.stdout) {
     const { cleanedText } = extractReactionDirective(result.stdout);
@@ -1183,6 +1202,14 @@ async function handleBlockAction(payload: any): Promise<void> {
     }
   } else if (result.exitCode !== 0) {
     await sendMessage(config.botToken, channelId, `Error: ${result.stderr || "Unknown"}`, replyThreadTs);
+  }
+
+  // Remove thinking reaction and status AFTER reply is sent
+  if (messageTs) {
+    await removeReaction(config.botToken, channelId, messageTs, "hourglass_flowing_sand");
+  }
+  if (replyThreadTs) {
+    await clearAssistantStatus(config.botToken, channelId, replyThreadTs);
   }
 }
 
