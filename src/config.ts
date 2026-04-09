@@ -59,7 +59,7 @@ const DEFAULT_SETTINGS: Settings = {
   telegram: { token: "", allowedUserIds: [] },
   discord: { token: "", allowedUserIds: [], listenChannels: [] },
   slack: { botToken: "", appToken: "", allowedUserIds: [], listenChannels: [] },
-  line: { channelAccessToken: "", channelSecret: "", allowedUserIds: [], webhookPort: 3100, webhookPath: "/webhook" },
+  line: { channelAccessToken: "", channelSecret: "", allowedUserIds: [], requireMention: true, groups: {}, webhookPort: 3100, webhookPath: "/webhook" },
   security: { level: "moderate", allowedTools: [], disallowedTools: [] },
   web: { enabled: false, host: "127.0.0.1", port: 4632 },
   stt: { baseUrl: "", model: "" },
@@ -102,6 +102,13 @@ export interface SlackConfig {
   listenChannels: string[];
 }
 
+/** Per-group configuration overrides for LINE groups/rooms.
+ *  Keyed by group/room ID in LineConfig.groups. */
+export interface LineGroupConfig {
+  /** Override the global requireMention setting for this specific group. */
+  requireMention?: boolean;
+}
+
 export interface LineConfig {
   /** LINE channel access token (from LINE Developers console) */
   channelAccessToken: string;
@@ -110,6 +117,11 @@ export interface LineConfig {
   /** LINE user IDs (U + 32 hex chars) allowed to interact with the bot.
    *  Empty array means all users are allowed. */
   allowedUserIds: string[];
+  /** Whether the bot requires @mention to respond in groups/rooms (default: true).
+   *  Can be overridden per-group via the `groups` map. */
+  requireMention: boolean;
+  /** Per-group config overrides, keyed by group/room ID (group IDs start with "C", room IDs with "R"). */
+  groups: Record<string, LineGroupConfig>;
   /** Local port for the webhook HTTP server (default: 3100) */
   webhookPort: number;
   /** Webhook URL path (default: "/webhook"). Set to agent name for multi-agent setups, e.g. "/beo" */
@@ -302,6 +314,21 @@ function parseSettings(raw: Record<string, any>): Settings {
       allowedUserIds: Array.isArray(raw.line?.allowedUserIds)
         ? raw.line.allowedUserIds.map(String)
         : [],
+      requireMention: typeof raw.line?.requireMention === "boolean" ? raw.line.requireMention : true,
+      groups: (() => {
+        const result: Record<string, LineGroupConfig> = {};
+        if (raw.line?.groups && typeof raw.line.groups === "object" && !Array.isArray(raw.line.groups)) {
+          for (const [groupId, cfg] of Object.entries(raw.line.groups)) {
+            if (cfg && typeof cfg === "object") {
+              const c = cfg as Record<string, unknown>;
+              result[groupId] = {
+                requireMention: typeof c.requireMention === "boolean" ? c.requireMention : undefined,
+              };
+            }
+          }
+        }
+        return result;
+      })(),
       webhookPort: Number.isFinite(raw.line?.webhookPort) ? Number(raw.line.webhookPort) : 3100,
       webhookPath: typeof raw.line?.webhookPath === "string" && raw.line.webhookPath.trim()
         ? (raw.line.webhookPath.trim().startsWith("/") ? raw.line.webhookPath.trim() : `/${raw.line.webhookPath.trim()}`)

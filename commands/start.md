@@ -121,10 +121,11 @@ Start the heartbeat daemon for this project. Follow these steps exactly:
      - LINE Channel Access Token (hint: create a Messaging API channel at https://developers.line.biz → Messaging API → Channel access token (long-lived), click "Issue")
      - LINE Channel Secret (hint: same page → Basic settings → Channel secret)
      - Allowed LINE user IDs (optional — LINE user IDs start with `U` followed by 32 hex characters). Empty means all users can interact.
-     - Webhook port (default: 3100 — the local port the webhook HTTP server listens on)
-     - Webhook path (default: `/webhook` — set to agent name for multi-agent setups, e.g. `/line/beo`)
+     - Webhook port (default: 18789 — the local port the webhook HTTP server listens on)
+     - Webhook path (default: `/line/webhook` — set to agent name for multi-agent setups, e.g. `/line/AgentName`)
      - Set `line.channelAccessToken`, `line.channelSecret`, `line.allowedUserIds` (as array of strings), `line.webhookPort` (as number), and `line.webhookPath` (as string) accordingly.
-     - The user needs to set the Webhook URL in LINE Developers Console to point to their public URL + webhookPath (e.g. `https://example.ngrok-free.dev/line/beo`). Remind them to use ngrok or a similar tunnel for local development: `ngrok http <webhookPort>`.
+     - Group mention policy is `requireMention: true` by default (groups must @mention the bot). Edit `line.requireMention` or per-group `line.groups[<groupId>].requireMention` after setup if needed.
+     - The user needs to set the Webhook URL in LINE Developers Console to point to their public URL + webhookPath (e.g. `https://example.ngrok-free.dev/line/webhook`). Remind them to use ngrok or a similar tunnel for local development: `ngrok http <webhookPort>`.
      - Note: LINE bot runs a local HTTP webhook server in-process with the daemon. It supports DMs, group chats (with @mention gating), text/image/video/audio/file/sticker/location messages, loading animations, and reply/push messaging.
 
    - **Security level mapping** — set `security.level` in settings based on their choice:
@@ -257,8 +258,12 @@ Defaults: `WEB_HOST=127.0.0.1`, `WEB_PORT=4632` unless changed via settings or `
     "channelAccessToken": "long-lived-token...",
     "channelSecret": "hex-secret...",
     "allowedUserIds": ["U0123456789abcdef0123456789abcdef"],
-    "webhookPort": 3100,
-    "webhookPath": "/webhook"
+    "requireMention": true,
+    "groups": {
+      "C0123456789abcdef0123456789abcdef": { "requireMention": false }
+    },
+    "webhookPort": 18789,
+    "webhookPath": "/line/webhook"
   },
   "security": {
     "level": "moderate",
@@ -291,8 +296,10 @@ Defaults: `WEB_HOST=127.0.0.1`, `WEB_PORT=4632` unless changed via settings or `
 - `line.channelAccessToken` — LINE channel access token (long-lived, from LINE Developers Console)
 - `line.channelSecret` — LINE channel secret (for webhook signature verification)
 - `line.allowedUserIds` — array of string LINE user IDs allowed to interact (empty = all)
-- `line.webhookPort` — local port for the webhook HTTP server (default: 3100)
-- `line.webhookPath` — webhook URL path (default: `/webhook`). Set to agent name for multi-agent setups (e.g. `/line/beo`)
+- `line.requireMention` — global default for whether bot requires @mention to respond in groups/rooms (default: `true`)
+- `line.groups` — per-group config overrides, keyed by group/room ID. Each entry can override `requireMention` for that specific group. Group IDs start with `C`, room IDs with `R`.
+- `line.webhookPort` — local port for the webhook HTTP server (default: 18789)
+- `line.webhookPath` — webhook URL path (default: `/line/webhook`). Set to agent name for multi-agent setups (e.g. `/line/AgentName`)
 - `security.level` — one of: `locked`, `strict`, `moderate`, `unrestricted`
 - `security.allowedTools` — extra tools to allow on top of the level (e.g. `["Bash(git:*)"]`)
 - `security.disallowedTools` — tools to block on top of the level

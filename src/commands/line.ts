@@ -392,10 +392,12 @@ async function handleMessageEvent(event: LineMessageEvent): Promise<void> {
   const chatId = getChatId(event.source);
   const sessionThreadId = lineSessionId(event.source);
 
-  // In groups, only respond when mentioned
+  // In groups, check requireMention policy (per-group override falls back to global default)
   if (isGroup && event.message.type === "text") {
-    if (!isBotMentioned(event.message.text ?? "")) {
-      debugLog(`Skip group message (not mentioned): ${chatId}`);
+    const groupOverride = config.groups[chatId]?.requireMention;
+    const requireMention = groupOverride !== undefined ? groupOverride : config.requireMention;
+    if (requireMention && !isBotMentioned(event.message.text ?? "")) {
+      debugLog(`Skip group message (mention required): ${chatId}`);
       return;
     }
   }
