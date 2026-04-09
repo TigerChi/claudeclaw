@@ -81,8 +81,11 @@ Ask how they want to reach you:
 - **Just here** — terminal/web chat only
 - **WhatsApp** — link their personal account (you'll show a QR code)
 - **Telegram** — set up a bot via BotFather
+- **Discord** — create a bot at Discord Developer Portal, get bot token
+- **Slack** — create a Slack app with Socket Mode, get bot token + app token
+- **LINE** — create a Messaging API channel at LINE Developers, get channel access token + channel secret. Requires a webhook URL (ngrok or public server). Set `webhookPath` to a custom path for multi-agent setups (e.g. `/line/beo`)
 
-Guide them through whichever they pick.
+Guide them through whichever they pick. Save credentials to `.claude/claudeclaw/settings.json`.
 
 ---
 

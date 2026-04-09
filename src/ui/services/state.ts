@@ -21,6 +21,10 @@ export function sanitizeSettings(snapshot: WebSnapshot["settings"]) {
       configured: Boolean(snapshot.slack?.botToken),
       allowedUserCount: snapshot.slack?.allowedUserIds?.length ?? 0,
     },
+    line: {
+      configured: Boolean(snapshot.line?.channelAccessToken),
+      allowedUserCount: snapshot.line?.allowedUserIds?.length ?? 0,
+    },
     web: snapshot.web,
   };
 }
@@ -58,6 +62,10 @@ export async function buildState(snapshot: WebSnapshot) {
     slack: {
       configured: Boolean(snapshot.settings.slack?.botToken),
       allowedUserCount: snapshot.settings.slack?.allowedUserIds?.length ?? 0,
+    },
+    line: {
+      configured: Boolean(snapshot.settings.line?.channelAccessToken),
+      allowedUserCount: snapshot.settings.line?.allowedUserIds?.length ?? 0,
     },
     session: session
       ? {

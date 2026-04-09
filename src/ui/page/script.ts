@@ -225,6 +225,17 @@ export const pageScript = String.raw`    const $ = (id) => document.getElementBy
           : "Not configured",
       });
 
+      pills.push({
+        cls: state.line && state.line.configured ? "ok" : "warn",
+        icon: "🟢",
+        label: "LINE",
+        value: state.line && state.line.configured
+          ? (state.line.allowedUserCount > 0
+              ? (state.line.allowedUserCount + " user" + (state.line.allowedUserCount !== 1 ? "s" : ""))
+              : "All users")
+          : "Not configured",
+      });
+
       return pills;
     }
 

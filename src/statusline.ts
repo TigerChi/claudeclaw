@@ -10,6 +10,7 @@ export interface StateData {
   telegram: boolean;
   discord: boolean;
   slack: boolean;
+  line: boolean;
   startedAt: number;
   web?: { enabled: boolean; host: string; port: number };
 }

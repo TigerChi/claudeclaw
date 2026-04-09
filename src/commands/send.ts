@@ -5,10 +5,11 @@ import { loadSettings, initConfig } from "../config";
 export async function send(args: string[]) {
   const telegramFlag = args.includes("--telegram");
   const discordFlag = args.includes("--discord");
-  const message = args.filter((a) => a !== "--telegram" && a !== "--discord").join(" ");
+  const lineFlag = args.includes("--line");
+  const message = args.filter((a) => a !== "--telegram" && a !== "--discord" && a !== "--line").join(" ");
 
   if (!message) {
-    console.error("Usage: claudeclaw send <message> [--telegram] [--discord]");
+    console.error("Usage: claudeclaw send <message> [--telegram] [--discord] [--line]");
     process.exit(1);
   }
 
@@ -96,6 +97,39 @@ export async function send(args: string[]) {
       }
     }
     console.log("Sent to Discord.");
+  }
+
+  if (lineFlag) {
+    const settings = await loadSettings();
+    const lToken = settings.line.channelAccessToken;
+    const lUserIds = settings.line.allowedUserIds;
+
+    if (!lToken || lUserIds.length === 0) {
+      console.error("LINE is not configured in settings.");
+      process.exit(1);
+    }
+
+    const lText = result.exitCode === 0
+      ? result.stdout || "(empty)"
+      : `error (exit ${result.exitCode}): ${result.stderr || "Unknown"}`;
+
+    for (const userId of lUserIds) {
+      const res = await fetch("https://api.line.me/v2/bot/message/push", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${lToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          to: userId,
+          messages: [{ type: "text", text: lText.slice(0, 5000) }],
+        }),
+      });
+      if (!res.ok) {
+        console.error(`Failed to send to LINE user ${userId}: ${res.statusText}`);
+      }
+    }
+    console.log("Sent to LINE.");
   }
 
   if (result.exitCode !== 0) process.exit(result.exitCode);

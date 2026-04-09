@@ -38,11 +38,12 @@ Start the heartbeat daemon for this project. Follow these steps exactly:
    - **Telegram configured** = `telegram.token` is non-empty
    - **Discord configured** = `discord.token` is non-empty
    - **Slack configured** = `slack.botToken` is non-empty
+   - **LINE configured** = `line.channelAccessToken` is non-empty
    - **Security configured** = `security.level` exists and is not `"moderate"` (the default), OR `security.allowedTools`/`security.disallowedTools` are non-empty
 
 4. **Interactive setup — smart mode** (BEFORE launching the daemon):
 
-   **If ALL three sections are already configured**, show a summary of the current config and ask ONE question:
+   **If ALL sections are already configured**, show a summary of the current config and ask ONE question:
 
    Use AskUserQuestion:
    - "Your settings are already configured. Want to change anything?" (header: "Settings", options: "Keep current settings", "Reconfigure")
@@ -52,17 +53,21 @@ Start the heartbeat daemon for this project. Follow these steps exactly:
 
    **If SOME sections are configured and others are not**, show the already-configured sections as a summary, then only ask about the unconfigured sections in step 5.
 
-   **If NOTHING is configured** (fresh install), ask about all three sections in step 5.
+   **If NOTHING is configured** (fresh install), ask about all sections in step 5.
 
 5. **Ask setup questions**:
 
-   Use **AskUserQuestion** to ask all unconfigured sections at once (up to 3 questions in one call):
+   Use **AskUserQuestion** to ask unconfigured sections. Ask in TWO batches if needed (AskUserQuestion supports up to 4 questions per call):
 
+   **Batch 1** — Model + Heartbeat + messaging platforms:
    - **Model** (always ask if `model` is empty/unset): "Which Claude model should ClaudeClaw use?" (header: "Model", options: "opus (default)", "sonnet", "haiku", "glm")
    - **If heartbeat is NOT configured**: "Enable heartbeat? Example: I can remind you to drink water every 30 minutes, or you can fully customize what runs." (header: "Heartbeat", options: "Yes" / "No")
    - **If Telegram is NOT configured**: "Configure Telegram? Recommended if you want it 24/7 live." (header: "Telegram", options: "Yes" / "No")
    - **If Discord is NOT configured**: "Configure Discord? Connect your bot to Discord servers." (header: "Discord", options: "Yes" / "No")
+
+   **Batch 2** — remaining messaging platforms + security (ask immediately after batch 1):
    - **If Slack is NOT configured**: "Configure Slack? Connect your bot to a Slack workspace." (header: "Slack", options: "Yes" / "No")
+   - **If LINE is NOT configured**: "Configure LINE? Connect your bot to LINE Messaging API." (header: "LINE", options: "Yes" / "No")
    - **If security is NOT configured**: "What security level for Claude?" (header: "Security", options:
      - "Moderate (Recommended)" (description: "Full access scoped to project directory")
      - "Locked" (description: "Read-only — can only search and read files, no edits, bash, or web")
@@ -111,6 +116,16 @@ Start the heartbeat daemon for this project. Follow these steps exactly:
      - Required Event Subscriptions: `app_mention`, `assistant_thread_started`, `message.channels`, `message.groups`, `message.im`
      - Socket Mode must be enabled in the Slack App settings.
      - Note: Slack bot connects via Socket Mode WebSocket in-process with the daemon. It supports DMs, channel mentions, thread sessions, file upload/download, Block Kit buttons, and message edit/delete.
+
+   - **If yes to LINE**: Do NOT use AskUserQuestion for LINE fields. Ask in normal free-form text for these values (all optional, user can skip):
+     - LINE Channel Access Token (hint: create a Messaging API channel at https://developers.line.biz → Messaging API → Channel access token (long-lived), click "Issue")
+     - LINE Channel Secret (hint: same page → Basic settings → Channel secret)
+     - Allowed LINE user IDs (optional — LINE user IDs start with `U` followed by 32 hex characters). Empty means all users can interact.
+     - Webhook port (default: 3100 — the local port the webhook HTTP server listens on)
+     - Webhook path (default: `/webhook` — set to agent name for multi-agent setups, e.g. `/line/beo`)
+     - Set `line.channelAccessToken`, `line.channelSecret`, `line.allowedUserIds` (as array of strings), `line.webhookPort` (as number), and `line.webhookPath` (as string) accordingly.
+     - The user needs to set the Webhook URL in LINE Developers Console to point to their public URL + webhookPath (e.g. `https://example.ngrok-free.dev/line/beo`). Remind them to use ngrok or a similar tunnel for local development: `ngrok http <webhookPort>`.
+     - Note: LINE bot runs a local HTTP webhook server in-process with the daemon. It supports DMs, group chats (with @mention gating), text/image/video/audio/file/sticker/location messages, loading animations, and reply/push messaging.
 
    - **Security level mapping** — set `security.level` in settings based on their choice:
      - "Locked" → `"locked"`
@@ -170,6 +185,11 @@ To get `<DISCORD_BOT_ID>`: read the daemon log for the bot's user ID (shown in t
 **To start chatting on Slack**
 DM your bot directly in Slack, or @mention it in any channel it's been added to.
 The bot supports file upload/download, Block Kit buttons, message editing/deleting, and thread sessions.
+
+**To start chatting on LINE**
+Add your bot as a friend on LINE and send a message directly.
+In group chats, @mention the bot's display name. Make sure your Webhook URL is set in LINE Developers Console.
+The bot supports text, images, video, audio, files, stickers, and location messages.
 
 **To talk to your agent directly on Claude Code**
 `cd <WORKING_DIR> && claude --resume <SESSION_ID>`
@@ -233,6 +253,13 @@ Defaults: `WEB_HOST=127.0.0.1`, `WEB_PORT=4632` unless changed via settings or `
     "allowedUserIds": ["U0123ABC"],
     "listenChannels": ["C0123ABC"]
   },
+  "line": {
+    "channelAccessToken": "long-lived-token...",
+    "channelSecret": "hex-secret...",
+    "allowedUserIds": ["U0123456789abcdef0123456789abcdef"],
+    "webhookPort": 3100,
+    "webhookPath": "/webhook"
+  },
   "security": {
     "level": "moderate",
     "allowedTools": [],
@@ -261,6 +288,11 @@ Defaults: `WEB_HOST=127.0.0.1`, `WEB_PORT=4632` unless changed via settings or `
 - `slack.appToken` — Slack App-level token for Socket Mode (starts with `xapp-`)
 - `slack.allowedUserIds` — array of string Slack user IDs allowed to interact (empty = all)
 - `slack.listenChannels` — array of string channel IDs where the bot responds without @mention
+- `line.channelAccessToken` — LINE channel access token (long-lived, from LINE Developers Console)
+- `line.channelSecret` — LINE channel secret (for webhook signature verification)
+- `line.allowedUserIds` — array of string LINE user IDs allowed to interact (empty = all)
+- `line.webhookPort` — local port for the webhook HTTP server (default: 3100)
+- `line.webhookPath` — webhook URL path (default: `/webhook`). Set to agent name for multi-agent setups (e.g. `/line/beo`)
 - `security.level` — one of: `locked`, `strict`, `moderate`, `unrestricted`
 - `security.allowedTools` — extra tools to allow on top of the level (e.g. `["Bash(git:*)"]`)
 - `security.disallowedTools` — tools to block on top of the level

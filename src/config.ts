@@ -59,6 +59,7 @@ const DEFAULT_SETTINGS: Settings = {
   telegram: { token: "", allowedUserIds: [] },
   discord: { token: "", allowedUserIds: [], listenChannels: [] },
   slack: { botToken: "", appToken: "", allowedUserIds: [], listenChannels: [] },
+  line: { channelAccessToken: "", channelSecret: "", allowedUserIds: [], webhookPort: 3100, webhookPath: "/webhook" },
   security: { level: "moderate", allowedTools: [], disallowedTools: [] },
   web: { enabled: false, host: "127.0.0.1", port: 4632 },
   stt: { baseUrl: "", model: "" },
@@ -101,6 +102,20 @@ export interface SlackConfig {
   listenChannels: string[];
 }
 
+export interface LineConfig {
+  /** LINE channel access token (from LINE Developers console) */
+  channelAccessToken: string;
+  /** LINE channel secret (for webhook signature verification) */
+  channelSecret: string;
+  /** LINE user IDs (U + 32 hex chars) allowed to interact with the bot.
+   *  Empty array means all users are allowed. */
+  allowedUserIds: string[];
+  /** Local port for the webhook HTTP server (default: 3100) */
+  webhookPort: number;
+  /** Webhook URL path (default: "/webhook"). Set to agent name for multi-agent setups, e.g. "/beo" */
+  webhookPath: string;
+}
+
 export type SecurityLevel =
   | "locked"
   | "strict"
@@ -124,6 +139,7 @@ export interface Settings {
   telegram: TelegramConfig;
   discord: DiscordConfig;
   slack: SlackConfig;
+  line: LineConfig;
   security: SecurityConfig;
   web: WebConfig;
   stt: SttConfig;
@@ -279,6 +295,17 @@ function parseSettings(raw: Record<string, any>): Settings {
       listenChannels: Array.isArray(raw.slack?.listenChannels)
         ? raw.slack.listenChannels.map(String)
         : [],
+    },
+    line: {
+      channelAccessToken: typeof raw.line?.channelAccessToken === "string" ? raw.line.channelAccessToken.trim() : "",
+      channelSecret: typeof raw.line?.channelSecret === "string" ? raw.line.channelSecret.trim() : "",
+      allowedUserIds: Array.isArray(raw.line?.allowedUserIds)
+        ? raw.line.allowedUserIds.map(String)
+        : [],
+      webhookPort: Number.isFinite(raw.line?.webhookPort) ? Number(raw.line.webhookPort) : 3100,
+      webhookPath: typeof raw.line?.webhookPath === "string" && raw.line.webhookPath.trim()
+        ? (raw.line.webhookPath.trim().startsWith("/") ? raw.line.webhookPath.trim() : `/${raw.line.webhookPath.trim()}`)
+        : "/webhook",
     },
     security: {
       level,
