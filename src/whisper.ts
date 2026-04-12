@@ -280,18 +280,50 @@ function decodeOggOpusToWavViaNode(inputPath: string, wavPath: string, log: Whis
   log(`voice decode: node converter completed`);
 }
 
+function hasFfmpeg(): boolean {
+  try {
+    execSync("ffmpeg -version", { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function decodeViaFfmpeg(inputPath: string, wavPath: string, log: WhisperDebugLog): void {
+  log(`voice decode: running ffmpeg ${inputPath} → ${wavPath}`);
+  // 16kHz mono PCM — what whisper.cpp expects
+  const result = spawnSync(
+    "ffmpeg",
+    ["-y", "-i", inputPath, "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", wavPath],
+    { encoding: "utf8" }
+  );
+  if (result.status !== 0) {
+    const stderr = result.stderr?.trim() || "";
+    throw new Error(`ffmpeg decode failed (exit ${result.status ?? "unknown"})${stderr ? `: ${stderr}` : ""}`);
+  }
+  log(`voice decode: ffmpeg completed`);
+}
+
 async function ensureWavInput(inputPath: string, log: WhisperDebugLog): Promise<string> {
   const ext = extname(inputPath).toLowerCase();
   log(`voice input: path=${inputPath} ext=${ext || "(none)"}`);
   if (ext === ".wav") return inputPath;
 
-  if (ext !== ".ogg" && ext !== ".oga") {
-    throw new Error(`unsupported audio format "${ext || "(none)"}" without ffmpeg; supported: .oga, .ogg, .wav`);
+  const wavPath = join(TMP_FOLDER, `${basename(inputPath, extname(inputPath))}-${Date.now()}.wav`);
+
+  // .ogg/.oga → use the bundled node decoder (no extra deps needed)
+  if (ext === ".ogg" || ext === ".oga") {
+    decodeOggOpusToWavViaNode(inputPath, wavPath, log);
+    return wavPath;
   }
 
-  const wavPath = join(TMP_FOLDER, `${basename(inputPath, extname(inputPath))}-${Date.now()}.wav`);
-  decodeOggOpusToWavViaNode(inputPath, wavPath, log);
-  return wavPath;
+  // Anything else (.m4a from LINE, .mp3, .webm, ...) → fall back to ffmpeg if available
+  if (hasFfmpeg()) {
+    decodeViaFfmpeg(inputPath, wavPath, log);
+    return wavPath;
+  }
+
+  throw new Error(`unsupported audio format "${ext || "(none)"}" — install ffmpeg to handle ${ext} files, or use .wav/.ogg`);
 }
 
 export function warmupWhisperAssets(options?: { printOutput?: boolean }): Promise<void> {
