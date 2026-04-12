@@ -1019,24 +1019,73 @@ async function handleMessage(event: SlackMessage): Promise<void> {
       await setAssistantStatus(config.botToken, channelId, replyThreadTs, "正在思考中...").catch(() => {});
     }, 20_000);
 
-    const result = await runUserMessage("slack", prefixedPrompt, sessionThreadId);
+    // --- Streaming reply (#1) ---
+    // Defer posting until first text chunk arrives, then throttle updates.
+    let streamMsgTs: string | null = null;
+    let streamMsgPromise: Promise<string | null> | null = null;
+    let streamText = "";
+    let lastStreamUpdate = 0;
+    let finalResultText: string | null = null;
+
+    try {
+      await streamUserMessage(
+        "slack",
+        prefixedPrompt,
+        (text: string) => {
+          streamText = text;
+          const now = Date.now();
+
+          if (!streamMsgPromise) {
+            // First chunk — post the message with real text (no placeholder)
+            streamMsgPromise = postMessage(config.botToken, channelId, streamText, replyThreadTs);
+            streamMsgPromise.then(ts => { streamMsgTs = ts; }).catch(() => {});
+            lastStreamUpdate = now;
+          } else if (streamMsgTs && now - lastStreamUpdate >= STREAM_UPDATE_INTERVAL_MS) {
+            lastStreamUpdate = now;
+            updateMessage(config.botToken, channelId, streamMsgTs, streamText).catch(() => {});
+          }
+        },
+        () => { /* onUnblock */ },
+        sessionThreadId,
+        (text: string) => { finalResultText = text; },
+      );
+    } catch (err) {
+      clearInterval(statusRefreshInterval);
+      await removeReaction(config.botToken, channelId, event.ts, "hourglass_flowing_sand");
+      await clearAssistantStatus(config.botToken, channelId, replyThreadTs);
+      const errMsg = err instanceof Error ? err.message : String(err);
+      // Ensure deferred post resolved before updating
+      if (streamMsgPromise) streamMsgTs = await streamMsgPromise;
+      if (streamMsgTs) {
+        await updateMessage(config.botToken, channelId, streamMsgTs, `Error: ${errMsg}`);
+      } else {
+        await sendMessage(config.botToken, channelId, `Error: ${errMsg}`, replyThreadTs);
+      }
+      throw err;
+    }
+
+    // Ensure deferred post resolved
+    if (streamMsgPromise) streamMsgTs = await streamMsgPromise;
 
     // Stop refreshing status
     clearInterval(statusRefreshInterval);
 
-    if (result.exitCode !== 0) {
-      // Remove thinking reaction and status on error, before sending error message
+    const responseText = finalResultText ?? streamText;
+
+    if (!responseText) {
+      // Empty response
       await removeReaction(config.botToken, channelId, event.ts, "hourglass_flowing_sand");
       await clearAssistantStatus(config.botToken, channelId, replyThreadTs);
-      await sendMessage(
-        config.botToken,
-        channelId,
-        `Error (exit ${result.exitCode}): ${result.stderr || result.stdout || "Unknown error"}`,
-        replyThreadTs,
-      );
+      if (streamMsgTs) {
+        await updateMessage(config.botToken, channelId, streamMsgTs, "(empty response)");
+        lastBotMessageTs.set(botMessageKey(channelId, replyThreadTs), streamMsgTs);
+      } else {
+        const sentTs = await postMessage(config.botToken, channelId, "(empty response)", replyThreadTs);
+        if (sentTs) lastBotMessageTs.set(botMessageKey(channelId, replyThreadTs), sentTs);
+      }
     } else {
       // Extract all directives
-      const { cleanedText: afterReact, reactionEmoji } = extractReactionDirective(result.stdout || "");
+      const { cleanedText: afterReact, reactionEmoji } = extractReactionDirective(responseText);
       const { cleanedText: afterEdit, editContent, deleteCount, deleteMatches } = extractEditDirective(afterReact);
       const { cleanedText: afterUpload, uploads } = extractUploadDirectives(afterEdit);
       const { cleanedText: afterChannelRead, channelReads } = extractChannelReadDirectives(afterUpload);
@@ -1111,8 +1160,6 @@ async function handleMessage(event: SlackMessage): Promise<void> {
         }
       }
 
-
-
       // #12: Handle channel read directives — fetch and send as follow-up message to agent
       for (const read of channelReads) {
         try {
@@ -1120,7 +1167,7 @@ async function handleMessage(event: SlackMessage): Promise<void> {
           const historyPath = join(process.cwd(), ".claude", "claudeclaw", "inbox", "slack", `channel-${read.channelId}-${Date.now()}.txt`);
           await mkdir(join(process.cwd(), ".claude", "claudeclaw", "inbox", "slack"), { recursive: true });
           await Bun.write(historyPath, history);
-          // Send follow-up to agent with channel history
+          // Send follow-up to agent with channel history (non-streaming, secondary operation)
           const followUp = `[System] Channel history for ${read.channelId} saved to: ${historyPath}\nPlease read this file and summarize or respond based on the user's request.`;
           await runUserMessage("slack", followUp, sessionThreadId);
           debugLog(`Channel history fetched: ${read.channelId} → ${historyPath}`);
@@ -1129,28 +1176,37 @@ async function handleMessage(event: SlackMessage): Promise<void> {
         }
       }
 
-      // Send new response (if any text remains after directives)
+      // Finalize response — update streaming message or replace with Block Kit
       if (finalText) {
-        let sentTs: string | null = null;
         if (buttons || select) {
-          // #3: Send as Block Kit message
-          sentTs = await sendBlockKitMessage(config.botToken, channelId, finalText, buttons, select, replyThreadTs);
+          // Block Kit needs a fresh message; remove streaming message
+          if (streamMsgTs) await deleteMessage(config.botToken, channelId, streamMsgTs);
+          const sentTs = await sendBlockKitMessage(config.botToken, channelId, finalText, buttons, select, replyThreadTs);
+          if (sentTs) lastBotMessageTs.set(msgKey, sentTs);
+        } else if (finalText.length > 3800) {
+          // Update streaming message with first chunk, post remaining chunks
+          if (streamMsgTs) {
+            await updateMessage(config.botToken, channelId, streamMsgTs, finalText.slice(0, 3800));
+            lastBotMessageTs.set(msgKey, streamMsgTs);
+          }
+          for (let i = 3800; i < finalText.length; i += 3800) {
+            const chunkTs = await postMessage(config.botToken, channelId, finalText.slice(i, i + 3800), replyThreadTs);
+            if (chunkTs) lastBotMessageTs.set(msgKey, chunkTs);
+          }
         } else {
-          sentTs = await postMessage(config.botToken, channelId, finalText, replyThreadTs);
-          // Handle long messages that need chunking
-          if (sentTs && finalText.length > 3800) {
-            // First chunk already sent via postMessage, send remaining
-            for (let i = 3800; i < finalText.length; i += 3800) {
-              const chunkTs = await postMessage(config.botToken, channelId, finalText.slice(i, i + 3800), replyThreadTs);
-              if (chunkTs) sentTs = chunkTs;
-            }
+          // Simple case — update streaming message with final cleaned text
+          if (streamMsgTs) {
+            await updateMessage(config.botToken, channelId, streamMsgTs, finalText);
+            lastBotMessageTs.set(msgKey, streamMsgTs);
           }
         }
-        if (sentTs) lastBotMessageTs.set(msgKey, sentTs);
-      } else if (!editContent && deleteCount === 0 && uploads.length === 0 && channelReads.length === 0) {
-        // No text, no directives at all — send empty response
-        const sentTs = await postMessage(config.botToken, channelId, "(empty response)", replyThreadTs);
-        if (sentTs) lastBotMessageTs.set(msgKey, sentTs);
+      } else if (streamMsgTs && !editContent && deleteCount === 0 && uploads.length === 0 && channelReads.length === 0) {
+        // No text, no directives — show empty
+        await updateMessage(config.botToken, channelId, streamMsgTs, "(empty response)");
+        lastBotMessageTs.set(msgKey, streamMsgTs);
+      } else if (streamMsgTs) {
+        // Directives handled but no visible text — remove streaming message
+        await deleteMessage(config.botToken, channelId, streamMsgTs);
       }
 
       // Remove thinking reaction and status AFTER reply is sent
@@ -1234,27 +1290,76 @@ async function handleBlockAction(payload: any): Promise<void> {
     : null;
 
   const prompt = `[Slack interactive from ${user.id}]\nUser clicked: "${label}" (action: ${actionId}, value: ${value})`;
-  const result = await runUserMessage("slack", prompt, sessionThreadId);
 
-  // Stop refreshing status
+  // --- Streaming reply for interactive actions (deferred post) ---
+  let streamMsgTs: string | null = null;
+  let streamMsgPromise: Promise<string | null> | null = null;
+  let streamText = "";
+  let lastStreamUpdate = 0;
+  let finalResultText: string | null = null;
+
+  try {
+    await streamUserMessage(
+      "slack",
+      prompt,
+      (text: string) => {
+        streamText = text;
+        const now = Date.now();
+        if (!streamMsgPromise) {
+          streamMsgPromise = postMessage(config.botToken, channelId, streamText, replyThreadTs);
+          streamMsgPromise.then(ts => { streamMsgTs = ts; }).catch(() => {});
+          lastStreamUpdate = now;
+        } else if (streamMsgTs && now - lastStreamUpdate >= STREAM_UPDATE_INTERVAL_MS) {
+          lastStreamUpdate = now;
+          updateMessage(config.botToken, channelId, streamMsgTs, streamText).catch(() => {});
+        }
+      },
+      () => {},
+      sessionThreadId,
+      (text: string) => { finalResultText = text; },
+    );
+  } catch (err) {
+    if (statusRefreshInterval) clearInterval(statusRefreshInterval);
+    if (messageTs) await removeReaction(config.botToken, channelId, messageTs, "hourglass_flowing_sand");
+    if (replyThreadTs) await clearAssistantStatus(config.botToken, channelId, replyThreadTs);
+    if (streamMsgPromise) streamMsgTs = await streamMsgPromise;
+    const errMsg = err instanceof Error ? err.message : String(err);
+    if (streamMsgTs) {
+      await updateMessage(config.botToken, channelId, streamMsgTs, `Error: ${errMsg}`);
+    } else {
+      await sendMessage(config.botToken, channelId, `Error: ${errMsg}`, replyThreadTs);
+    }
+    return;
+  }
+
+  if (streamMsgPromise) streamMsgTs = await streamMsgPromise;
   if (statusRefreshInterval) clearInterval(statusRefreshInterval);
 
-  if (result.exitCode === 0 && result.stdout) {
-    const { cleanedText } = extractReactionDirective(result.stdout);
+  const responseText = finalResultText ?? streamText;
+  if (responseText) {
+    const { cleanedText } = extractReactionDirective(responseText);
     const { cleanedText: finalText, buttons, select } = extractBlockKitDirectives(cleanedText);
 
     if (finalText) {
       const msgKey = botMessageKey(channelId, replyThreadTs);
-      let sentTs: string | null = null;
       if (buttons || select) {
-        sentTs = await sendBlockKitMessage(config.botToken, channelId, finalText, buttons, select, replyThreadTs);
+        if (streamMsgTs) await deleteMessage(config.botToken, channelId, streamMsgTs);
+        const sentTs = await sendBlockKitMessage(config.botToken, channelId, finalText, buttons, select, replyThreadTs);
+        if (sentTs) lastBotMessageTs.set(msgKey, sentTs);
       } else {
-        sentTs = await postMessage(config.botToken, channelId, finalText, replyThreadTs);
+        if (streamMsgTs) {
+          await updateMessage(config.botToken, channelId, streamMsgTs, finalText);
+          lastBotMessageTs.set(msgKey, streamMsgTs);
+        }
       }
-      if (sentTs) lastBotMessageTs.set(msgKey, sentTs);
+    } else if (streamMsgTs) {
+      await deleteMessage(config.botToken, channelId, streamMsgTs);
     }
-  } else if (result.exitCode !== 0) {
-    await sendMessage(config.botToken, channelId, `Error: ${result.stderr || "Unknown"}`, replyThreadTs);
+  } else if (streamMsgTs) {
+    await updateMessage(config.botToken, channelId, streamMsgTs, "(empty response)");
+  } else {
+    const sentTs = await postMessage(config.botToken, channelId, "(empty response)", replyThreadTs);
+    if (sentTs) lastBotMessageTs.set(botMessageKey(channelId, replyThreadTs), sentTs);
   }
 
   // Remove thinking reaction and status AFTER reply is sent

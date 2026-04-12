@@ -11,6 +11,30 @@ import {
 import { getSettings, type ModelConfig, type SecurityConfig } from "./config";
 import { buildClockPromptPrefix } from "./timezone";
 import { selectModel } from "./model-router";
+import { query as sdkQuery } from "@anthropic-ai/claude-agent-sdk";
+import { execSync } from "child_process";
+import { homedir } from "os";
+
+/** Resolve the Claude Code CLI binary path. Checks env var, common locations, then falls back to `which`. */
+function resolveClaudeCodePath(): string {
+  if (process.env.CLAUDE_CODE_PATH) return process.env.CLAUDE_CODE_PATH;
+
+  const candidates = [
+    join(homedir(), ".local", "bin", "claude"),
+    join(homedir(), ".claude", "bin", "claude"),
+    "/usr/local/bin/claude",
+  ];
+  for (const p of candidates) {
+    if (existsSync(p)) return p;
+  }
+
+  // Fallback: ask the shell
+  try {
+    return execSync("which claude", { encoding: "utf8" }).trim();
+  } catch {
+    throw new Error("Claude Code CLI not found. Install it or set CLAUDE_CODE_PATH.");
+  }
+}
 
 const LOGS_DIR = join(process.cwd(), ".claude/claudeclaw/logs");
 // Resolve prompts relative to the claudeclaw installation, not the project dir
@@ -559,15 +583,8 @@ async function streamClaude(
     ? await getThreadSession(threadId)
     : await getSession();
   const { security, model, api } = getSettings();
-  const securityArgs = buildSecurityArgs(security);
 
-  // stream-json gives us events as they happen — text before tool calls,
-  // so we can unblock the UI as soon as Claude acknowledges, not after sub-agents finish.
-  // --verbose is required for stream-json to produce output in -p (print) mode.
-  const args = ["claude", "-p", prompt, "--output-format", "stream-json", "--verbose", ...securityArgs];
-
-  if (existing) args.push("--resume", existing.sessionId);
-
+  // Build system prompt (same components as execClaude)
   const promptContent = await loadPrompts();
   const appendParts: string[] = ["You are running inside ClaudeClaw."];
   if (promptContent) appendParts.push(promptContent);
@@ -580,29 +597,62 @@ async function streamClaude(
   }
 
   if (security.level !== "unrestricted") appendParts.push(DIR_SCOPE_PROMPT);
-  if (appendParts.length > 0) {
-    args.push("--append-system-prompt", appendParts.join("\n\n"));
+
+  // Build SDK options
+  const sdkOptions: Record<string, unknown> = {
+    cwd: process.cwd(),
+    pathToClaudeCodeExecutable: resolveClaudeCodePath(),
+    systemPrompt: { type: "preset", preset: "claude_code", append: appendParts.join("\n\n") },
+    includePartialMessages: true,
+    permissionMode: "bypassPermissions",
+    allowDangerouslySkipPermissions: true,
+  };
+
+  // Model
+  const normalizedModel = model.trim().toLowerCase();
+  if (model.trim() && normalizedModel !== "glm") {
+    sdkOptions.model = model.trim();
   }
 
-  const normalizedModel = model.trim().toLowerCase();
-  if (model.trim() && normalizedModel !== "glm") args.push("--model", model.trim());
+  // Session resume
+  if (existing) {
+    sdkOptions.resume = existing.sessionId;
+  }
 
-  const { CLAUDECODE: _, ...cleanEnv } = process.env;
-  const childEnv = buildChildEnv(cleanEnv as Record<string, string>, model, api);
+  // Security — tool restrictions
+  if (security.level === "locked") {
+    sdkOptions.allowedTools = ["Read", "Grep", "Glob"];
+  } else if (security.level === "strict") {
+    sdkOptions.disallowedTools = ["Bash", "WebSearch", "WebFetch"];
+  }
+  if (security.allowedTools.length > 0) {
+    sdkOptions.allowedTools = security.allowedTools;
+  }
+  if (security.disallowedTools.length > 0) {
+    sdkOptions.disallowedTools = security.disallowedTools;
+  }
 
-  console.log(`[${new Date().toLocaleTimeString()}] Running: ${name} (stream-json, session: ${existing?.sessionId?.slice(0, 8) ?? "new"})`);
+  // Environment overrides
+  const envOverrides: Record<string, string> = {};
+  if (api.trim()) envOverrides.ANTHROPIC_AUTH_TOKEN = api.trim();
+  if (normalizedModel === "glm") {
+    envOverrides.ANTHROPIC_BASE_URL = "https://api.z.ai/api/anthropic";
+    envOverrides.API_TIMEOUT_MS = "3000000";
+  }
+  if (Object.keys(envOverrides).length > 0) {
+    sdkOptions.env = envOverrides;
+  }
 
-  const proc = Bun.spawn(args, {
-    stdout: "pipe",
-    stderr: "pipe",
-    env: childEnv,
-  });
+  // Timeout via AbortController
+  const abortController = new AbortController();
+  const timeoutId = setTimeout(() => abortController.abort(), CLAUDE_TIMEOUT_MS);
+  sdkOptions.abortController = abortController;
 
-  const reader = proc.stdout.getReader();
-  const decoder = new TextDecoder();
-  let buf = "";
+  console.log(`[${new Date().toLocaleTimeString()}] Running: ${name} (SDK stream, session: ${existing?.sessionId?.slice(0, 8) ?? "new"})`);
+
   let unblocked = false;
-  let textEmitted = false;
+  let accumulatedText = "";
+  let sessionCaptured = !!existing;
 
   const maybeUnblock = () => {
     if (!unblocked) {
@@ -611,81 +661,70 @@ async function streamClaude(
     }
   };
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
+  try {
+    const conversation = sdkQuery({ prompt, options: sdkOptions as any });
 
-    // Parse complete newline-delimited JSON events
-    const lines = buf.split("\n");
-    buf = lines.pop() ?? "";
+    for await (const message of conversation) {
+      // Capture session ID from init event
+      if (message.type === "system" && message.session_id && !sessionCaptured) {
+        sessionCaptured = true;
+        const sid = message.session_id;
+        if (threadId) {
+          await createThreadSession(threadId, sid);
+          console.log(`[${new Date().toLocaleTimeString()}] Thread session created (SDK): ${sid} (thread ${threadId.slice(0, 8)})`);
+        } else {
+          await createSession(sid);
+          console.log(`[${new Date().toLocaleTimeString()}] Session created (SDK): ${sid}`);
+        }
+      }
 
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      try {
-        const event = JSON.parse(trimmed) as Record<string, unknown>;
-
-        // Debug: log every event type
-        const eventSummary = event.type === "assistant"
-          ? `assistant (content: ${JSON.stringify((event.message as any)?.content?.map((b: any) => ({ type: b.type, textLen: b.text?.length })))?.slice(0, 200)})`
-          : event.type === "result"
-            ? `result (len: ${(event.result as string)?.length ?? 0})`
-            : `${event.type}${event.subtype ? `.${event.subtype}` : ""}`;
-        console.log(`[stream-json] event: ${eventSummary}`);
-
-        if (event.type === "system" && (event.subtype === "init" || event.session_id)) {
-          // Capture session ID for new sessions
-          const sid = event.session_id as string | undefined;
-          if (sid && !existing) {
-            if (threadId) {
-              await createThreadSession(threadId, sid);
-              console.log(`[${new Date().toLocaleTimeString()}] Thread session created (stream-json): ${sid} (thread ${threadId.slice(0, 8)})`);
-            } else {
-              await createSession(sid);
-              console.log(`[${new Date().toLocaleTimeString()}] Session created (stream-json): ${sid}`);
-            }
-          }
-        } else if (event.type === "assistant") {
-          // Text and tool_use blocks from the assistant
-          type ContentBlock = { type: string; text?: string; id?: string; name?: string; input?: Record<string, unknown> };
-          const msg = event.message as { content?: ContentBlock[] } | undefined;
-          const blocks = msg?.content ?? [];
-          let hasActivity = false;
-          for (const block of blocks) {
-            if (block.type === "text" && block.text) {
-              onChunk(block.text);
-              textEmitted = true;
-              hasActivity = true;
-            } else if (block.type === "tool_use") {
-              hasActivity = true;
-            }
-          }
-          if (hasActivity) maybeUnblock();
-        } else if (event.type === "tool_use") {
-          // Top-level tool_use event (some stream-json versions) — unblock the UI
-          maybeUnblock();
-        } else if (event.type === "result") {
-          // Final result event — always emit as the authoritative response
-          const resultText = (event as Record<string, unknown>).result as string | undefined;
-          if (resultText) {
-            if (onResult) {
-              // Use onResult to replace accumulated text with the final result
-              onResult(resultText);
-            } else if (!textEmitted) {
-              onChunk(resultText);
-            }
-          }
+      // Streaming text deltas (incremental tokens)
+      if (message.type === "stream_event") {
+        const event = (message as any).event;
+        if (
+          event?.type === "content_block_delta" &&
+          event?.delta?.type === "text_delta" &&
+          event?.delta?.text
+        ) {
+          accumulatedText += event.delta.text;
+          onChunk(accumulatedText);
           maybeUnblock();
         }
-      } catch {}
+      }
+
+      // Complete assistant message — sync accumulated text as checkpoint
+      if (message.type === "assistant") {
+        const msg = (message as any).message;
+        if (msg?.content) {
+          let fullText = "";
+          for (const block of msg.content) {
+            if (block.type === "text" && block.text) {
+              fullText += block.text;
+            }
+          }
+          if (fullText) {
+            // Reset accumulator to authoritative text from this turn
+            accumulatedText = fullText;
+            onChunk(accumulatedText);
+            maybeUnblock();
+          }
+        }
+      }
+
+      // Final result — authoritative response text
+      if (message.type === "result") {
+        const resultMsg = message as any;
+        if (resultMsg.subtype === "success" && resultMsg.result) {
+          if (onResult) onResult(resultMsg.result);
+        }
+        maybeUnblock();
+      }
     }
+  } finally {
+    clearTimeout(timeoutId);
   }
 
-  await proc.exited;
-  // Ensure unblock fires even if something unexpected happened
   maybeUnblock();
-
   console.log(`[${new Date().toLocaleTimeString()}] Done: ${name}`);
 }
 
