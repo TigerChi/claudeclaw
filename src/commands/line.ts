@@ -746,9 +746,27 @@ export function startLine(debug = false): void {
   (async () => {
     await ensureProjectClaudeMd();
     await fetchBotInfo();
-    startWebhookServer(config.webhookPort);
+    try {
+      startWebhookServer(config.webhookPort);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("EADDRINUSE") || msg.includes("Failed to start") || msg.includes("port")) {
+        console.error(`[Line] Port ${config.webhookPort} is already in use.`);
+        console.error(`[Line] If running multiple LINE agents, start the proxy first:`);
+        console.error(`[Line]   bun run <claudeclaw>/src/index.ts proxy start`);
+        console.error(`[Line] Then set a unique webhookPort in this agent's settings.json.`);
+      } else {
+        console.error(`[Line] Fatal: ${msg}`);
+      }
+    }
   })().catch((err) => {
-    console.error(`[Line] Fatal: ${err}`);
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes("EADDRINUSE") || msg.includes("Failed to start") || msg.includes("port")) {
+      console.error(`[Line] Port ${config.webhookPort} is already in use.`);
+      console.error(`[Line] If running multiple LINE agents, use /claudeclaw:proxy start first.`);
+    } else {
+      console.error(`[Line] Fatal: ${msg}`);
+    }
   });
 }
 

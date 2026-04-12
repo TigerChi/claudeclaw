@@ -446,11 +446,19 @@ export async function start(args: string[] = []) {
     if (accessToken && accessToken !== lineAccessToken) {
       const { startLine, sendMessageToUser: lineSend, stopLine } = await import("./line");
       if (lineAccessToken) stopLine();
+
+      // Check if LINE proxy is running — if so, daemon connects via proxy (no port conflict)
+      const { isProxyRunning } = await import("./proxy");
+      const proxyActive = await isProxyRunning();
+      if (proxyActive) {
+        console.log(`  LINE: proxy detected, using internal :${currentSettings.line.webhookPort}`);
+      }
+
       startLine(debugFlag);
       lineStop = stopLine;
       lineSendToUser = (userId, text) => lineSend(userId, text);
       lineAccessToken = accessToken;
-      console.log(`[${ts()}] LINE: enabled`);
+      console.log(`[${ts()}] LINE: enabled${proxyActive ? " (via proxy)" : ""}`);
     } else if (!accessToken && lineAccessToken) {
       if (lineStop) lineStop();
       lineStop = null;
