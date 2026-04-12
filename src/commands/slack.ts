@@ -74,12 +74,58 @@ interface SlackSocketPayload {
   reason?: string;
 }
 
+// --- Backoff policy (modeled after OpenClaw) ---
+
+const SLACK_AUTH_ERROR_RE =
+  /account_inactive|invalid_auth|token_revoked|token_expired|not_authed|org_login_required|team_access_not_granted|missing_scope|cannot_find_service|invalid_token/i;
+
+interface BackoffPolicy {
+  initialMs: number;
+  maxMs: number;
+  factor: number;
+  jitter: number;
+  maxAttempts: number;
+}
+
+const RECONNECT_POLICY: BackoffPolicy = {
+  initialMs: 2_000,
+  maxMs: 30_000,
+  factor: 1.8,
+  jitter: 0.25,
+  maxAttempts: 12,
+};
+
+function computeBackoff(policy: BackoffPolicy, attempt: number): number {
+  const base = policy.initialMs * policy.factor ** Math.max(attempt - 1, 0);
+  const jitter = base * policy.jitter * Math.random();
+  return Math.min(policy.maxMs, Math.round(base + jitter));
+}
+
+function sleepWithAbort(ms: number, signal?: AbortSignal): Promise<void> {
+  if (ms <= 0) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) { reject(new Error("aborted")); return; }
+    const timer = setTimeout(() => { signal?.removeEventListener("abort", onAbort); resolve(); }, ms);
+    function onAbort() { clearTimeout(timer); reject(new Error("aborted")); }
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function isNonRecoverableAuthError(error: unknown): boolean {
+  const msg = error instanceof Error ? error.message : typeof error === "string" ? error : "";
+  return SLACK_AUTH_ERROR_RE.test(msg);
+}
+
 // --- Socket state ---
 
 let ws: WebSocket | null = null;
-let running = true;
+let abortController: AbortController | null = null;
 let slackDebug = false;
-let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let proactiveTimer: ReturnType<typeof setTimeout> | null = null;
+
+// Health tracking
+let lastEventAt = 0;
+let connectionCount = 0;
 
 // Dedup: track recently processed message timestamps to avoid handling both message + app_mention
 const recentlyProcessed = new Map<string, number>();
@@ -1395,86 +1441,195 @@ async function handleSocketPayload(
   debugLog(`Unhandled socket event type: ${type}`);
 }
 
-// --- Socket connection ---
+// --- Socket connection (OpenClaw-style while-loop + AbortSignal) ---
 
-function connectSocket(appToken: string): void {
-  if (!running) return;
+const PROACTIVE_RECONNECT_MS = 29 * 60 * 1000; // 29 min — before Slack's 30-min forced rotation
 
-  debugLog("Fetching Socket Mode URL...");
-
-  fetch(`${SLACK_API}/apps.connections.open`, {
+/** Fetch a fresh Socket Mode WebSocket URL from Slack. */
+async function fetchSocketUrl(appToken: string): Promise<string> {
+  const res = await fetch(`${SLACK_API}/apps.connections.open`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${appToken}`,
       "Content-Type": "application/x-www-form-urlencoded",
     },
-  })
-    .then((r) => r.json())
-    .then((data: any) => {
-      if (!data.ok || !data.url) {
-        throw new Error(`apps.connections.open failed: ${data.error ?? "no URL returned"}`);
-      }
-      openSocket(data.url as string, appToken);
-    })
-    .catch((err) => {
-      console.error(`[Slack] Failed to open socket connection: ${err instanceof Error ? err.message : err}`);
-      scheduleReconnect(appToken);
-    });
+  });
+  const data: any = await res.json();
+  if (!data.ok || !data.url) {
+    throw new Error(`apps.connections.open failed: ${data.error ?? "no URL returned"}`);
+  }
+  return data.url as string;
 }
 
-function openSocket(url: string, appToken: string): void {
-  debugLog(`Opening WebSocket: ${url.slice(0, 60)}...`);
+/**
+ * Open a WebSocket and return a promise that resolves when it closes.
+ * The proactive 29-min rotation timer is tracked and cleaned up properly.
+ */
+function openSocket(url: string, appToken: string, signal: AbortSignal): Promise<{
+  event: "close" | "error";
+  code?: number;
+  reason?: string;
+  error?: unknown;
+}> {
+  return new Promise((resolve) => {
+    debugLog(`Opening WebSocket: ${url.slice(0, 60)}...`);
 
-  ws = new WebSocket(url);
+    // Clean up previous socket if somehow still open
+    if (ws && ws.readyState !== WebSocket.CLOSED) {
+      ws.onclose = null;
+      ws.onerror = null;
+      try { ws.close(1000, "Replaced"); } catch { /* best-effort */ }
+    }
 
-  ws.onopen = () => {
-    debugLog("WebSocket opened");
-  };
+    ws = new WebSocket(url);
+    let resolved = false;
 
-  ws.onmessage = (event) => {
-    const raw = String(event.data);
-    const sendAck = (envelopeId: string, payload?: unknown) => {
-      if (ws?.readyState === WebSocket.OPEN) {
-        const msg: Record<string, unknown> = { envelope_id: envelopeId };
-        if (payload !== undefined) msg.payload = payload;
-        ws.send(JSON.stringify(msg));
-      }
+    const resolveOnce = (value: { event: "close" | "error"; code?: number; reason?: string; error?: unknown }) => {
+      if (resolved) return;
+      resolved = true;
+      // Clean up proactive timer
+      if (proactiveTimer) { clearTimeout(proactiveTimer); proactiveTimer = null; }
+      signal.removeEventListener("abort", onAbort);
+      resolve(value);
     };
-    handleSocketPayload(raw, sendAck).catch((err) => {
-      console.error(`[Slack] Socket payload error: ${err instanceof Error ? err.message : err}`);
-    });
-  };
 
-  ws.onclose = (event) => {
-    debugLog(`WebSocket closed: code=${event.code} reason=${event.reason}`);
-    ws = null;
-    if (!running) return;
-    console.log("[Slack] Connection closed, reconnecting...");
-    scheduleReconnect(appToken);
-  };
+    ws.onopen = () => {
+      connectionCount++;
+      lastEventAt = Date.now();
+      debugLog(`WebSocket opened (connection #${connectionCount})`);
+    };
 
-  ws.onerror = () => {
-    // onclose fires after onerror, handled there
-  };
+    ws.onmessage = (event) => {
+      lastEventAt = Date.now();
+      const raw = String(event.data);
+      const currentWs = ws;
+      const sendAck = (envelopeId: string, payload?: unknown) => {
+        if (currentWs?.readyState === WebSocket.OPEN) {
+          const msg: Record<string, unknown> = { envelope_id: envelopeId };
+          if (payload !== undefined) msg.payload = payload;
+          currentWs.send(JSON.stringify(msg));
+        }
+      };
+      handleSocketPayload(raw, sendAck).catch((err) => {
+        console.error(`[Slack] Socket payload error: ${err instanceof Error ? err.message : err}`);
+      });
+    };
 
-  // Slack Socket Mode connections rotate every ~30 minutes.
-  // We reconnect proactively at ~29 minutes to avoid forced disconnects.
-  const RECONNECT_MS = 29 * 60 * 1000;
-  setTimeout(() => {
-    if (!running) return;
-    debugLog("Proactive reconnect (30-min rotation)");
-    ws?.close(1000, "Proactive reconnect");
-  }, RECONNECT_MS);
+    ws.onclose = (event) => {
+      debugLog(`WebSocket closed: code=${event.code} reason=${event.reason}`);
+      ws = null;
+      resolveOnce({ event: "close", code: event.code, reason: event.reason });
+    };
 
+    ws.onerror = (event) => {
+      // onclose normally fires after onerror — but if it doesn't, resolve here
+      const err = (event as ErrorEvent).error ?? (event as ErrorEvent).message ?? "unknown";
+      resolveOnce({ event: "error", error: err });
+    };
+
+    // Proactive reconnect: close gracefully at 29 min (tracked, single timer)
+    if (proactiveTimer) clearTimeout(proactiveTimer);
+    proactiveTimer = setTimeout(() => {
+      proactiveTimer = null;
+      if (signal.aborted) return;
+      debugLog("Proactive reconnect (29-min rotation)");
+      ws?.close(1000, "Proactive reconnect");
+    }, PROACTIVE_RECONNECT_MS);
+
+    // Abort handler — external stop request
+    function onAbort() {
+      if (proactiveTimer) { clearTimeout(proactiveTimer); proactiveTimer = null; }
+      if (ws) {
+        try { ws.close(1000, "Stop requested"); } catch { /* best-effort */ }
+      }
+      resolveOnce({ event: "close", code: 1000, reason: "Stop requested" });
+    }
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
-function scheduleReconnect(appToken: string): void {
-  if (!running) return;
-  if (reconnectTimer) clearTimeout(reconnectTimer);
-  const delay = 3000 + Math.random() * 4000;
-  reconnectTimer = setTimeout(() => {
-    if (running) connectSocket(appToken);
-  }, delay);
+/**
+ * Main connection loop — keeps reconnecting until aborted.
+ * Modeled after OpenClaw's monitorSlackProvider pattern:
+ * while-loop + exponential backoff + auth error detection.
+ */
+async function socketLoop(appToken: string, signal: AbortSignal): Promise<void> {
+  let reconnectAttempts = 0;
+
+  while (!signal.aborted) {
+    // Phase 1: get a WebSocket URL
+    let url: string;
+    try {
+      debugLog("Fetching Socket Mode URL...");
+      url = await fetchSocketUrl(appToken);
+    } catch (err) {
+      if (signal.aborted) break;
+
+      if (isNonRecoverableAuthError(err)) {
+        console.error(`[Slack] Non-recoverable auth error — stopping: ${err instanceof Error ? err.message : err}`);
+        break;
+      }
+
+      reconnectAttempts++;
+      if (RECONNECT_POLICY.maxAttempts > 0 && reconnectAttempts >= RECONNECT_POLICY.maxAttempts) {
+        console.error(`[Slack] Max reconnect attempts (${RECONNECT_POLICY.maxAttempts}) reached, giving up`);
+        break;
+      }
+
+      const delayMs = computeBackoff(RECONNECT_POLICY, reconnectAttempts);
+      console.error(`[Slack] Failed to fetch socket URL, retry ${reconnectAttempts}/${RECONNECT_POLICY.maxAttempts} in ${Math.round(delayMs / 1000)}s: ${err instanceof Error ? err.message : err}`);
+
+      try { await sleepWithAbort(delayMs, signal); } catch { break; }
+      continue;
+    }
+
+    // Phase 2: connect and wait for disconnect
+    try {
+      const disconnect = await openSocket(url, appToken, signal);
+
+      if (signal.aborted) break;
+
+      // Successful connection resets the counter
+      if (disconnect.code === 1000) {
+        // Normal close (proactive rotation, etc.) — reset attempts
+        reconnectAttempts = 0;
+      }
+
+      if (disconnect.error && isNonRecoverableAuthError(disconnect.error)) {
+        console.error(`[Slack] Non-recoverable auth error during connection — stopping`);
+        break;
+      }
+
+      reconnectAttempts++;
+      if (RECONNECT_POLICY.maxAttempts > 0 && reconnectAttempts >= RECONNECT_POLICY.maxAttempts) {
+        console.error(`[Slack] Max reconnect attempts (${RECONNECT_POLICY.maxAttempts}) reached, giving up`);
+        break;
+      }
+
+      const delayMs = disconnect.code === 1000
+        ? Math.round(1000 + Math.random() * 2000) // Quick reconnect for proactive rotation
+        : computeBackoff(RECONNECT_POLICY, reconnectAttempts);
+
+      const reason = disconnect.reason || disconnect.event;
+      console.log(`[Slack] Disconnected (${reason}), reconnecting in ${Math.round(delayMs / 1000)}s (attempt ${reconnectAttempts}/${RECONNECT_POLICY.maxAttempts})`);
+
+      try { await sleepWithAbort(delayMs, signal); } catch { break; }
+    } catch (err) {
+      if (signal.aborted) break;
+      console.error(`[Slack] Unexpected error in socket loop: ${err instanceof Error ? err.message : err}`);
+      reconnectAttempts++;
+      const delayMs = computeBackoff(RECONNECT_POLICY, reconnectAttempts);
+      try { await sleepWithAbort(delayMs, signal); } catch { break; }
+    }
+  }
+
+  // Cleanup
+  if (proactiveTimer) { clearTimeout(proactiveTimer); proactiveTimer = null; }
+  if (ws) {
+    try { ws.close(1000, "Loop ended"); } catch { /* best-effort */ }
+    ws = null;
+  }
+  debugLog("Socket loop ended");
 }
 
 // --- Exports ---
@@ -1493,17 +1648,14 @@ export async function sendMessageToUser(
 }
 
 export function stopSlack(): void {
-  running = false;
-  if (reconnectTimer) {
-    clearTimeout(reconnectTimer);
-    reconnectTimer = null;
+  if (abortController) {
+    abortController.abort();
+    abortController = null;
   }
+  // Belt-and-suspenders: clean up anything the abort handler might miss
+  if (proactiveTimer) { clearTimeout(proactiveTimer); proactiveTimer = null; }
   if (ws) {
-    try {
-      ws.close(1000, "Stop requested");
-    } catch {
-      // best-effort
-    }
+    try { ws.close(1000, "Stop requested"); } catch { /* best-effort */ }
     ws = null;
   }
 }
@@ -1512,8 +1664,14 @@ export function startSlack(debug = false): void {
   slackDebug = debug;
   const config = getSettings().slack;
 
-  if (ws) stopSlack();
-  running = true;
+  // Stop previous instance cleanly
+  if (abortController) stopSlack();
+
+  // Fresh AbortController for this session
+  abortController = new AbortController();
+  const signal = abortController.signal;
+  connectionCount = 0;
+  lastEventAt = 0;
 
   console.log("Slack bot started (Socket Mode)");
   console.log(`  Allowed users: ${config.allowedUserIds.length === 0 ? "all" : config.allowedUserIds.join(", ")}`);
@@ -1539,9 +1697,12 @@ export function startSlack(debug = false): void {
       console.error(`[Slack] auth.test failed: ${err instanceof Error ? err.message : err}`);
     }
 
-    connectSocket(config.appToken);
+    // Enter the main socket loop (blocks until aborted or max attempts)
+    await socketLoop(config.appToken, signal);
   })().catch((err) => {
-    console.error(`[Slack] Fatal: ${err}`);
+    if (!signal.aborted) {
+      console.error(`[Slack] Fatal: ${err}`);
+    }
   });
 }
 
@@ -1575,7 +1736,8 @@ export async function slack(): Promise<void> {
     console.error(`[Slack] auth.test failed: ${err instanceof Error ? err.message : err}`);
   }
 
-  connectSocket(config.appToken);
-  // Keep process alive
-  await new Promise(() => {});
+  abortController = new AbortController();
+  connectionCount = 0;
+  lastEventAt = 0;
+  await socketLoop(config.appToken, abortController.signal);
 }
