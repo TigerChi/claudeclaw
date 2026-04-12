@@ -116,8 +116,8 @@ function buildChildEnv(baseEnv: Record<string, string>, model: string, api: stri
   return childEnv;
 }
 
-/** Default timeout for a single Claude Code invocation (5 minutes). */
-const CLAUDE_TIMEOUT_MS = 5 * 60 * 1000;
+/** Default timeout for a single Claude Code invocation (15 minutes). */
+const CLAUDE_TIMEOUT_MS = 15 * 60 * 1000;
 
 async function runClaudeOnce(
   baseArgs: string[],
