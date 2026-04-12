@@ -59,7 +59,21 @@ const DEFAULT_SETTINGS: Settings = {
   telegram: { token: "", allowedUserIds: [] },
   discord: { token: "", allowedUserIds: [], listenChannels: [] },
   slack: { botToken: "", appToken: "", allowedUserIds: [], listenChannels: [] },
-  line: { channelAccessToken: "", channelSecret: "", allowedUserIds: [], requireMention: true, groups: {}, webhookPort: 3100, webhookPath: "/webhook" },
+  line: {
+    channelAccessToken: "",
+    channelSecret: "",
+    allowedUserIds: [],
+    pairing: {
+      enabled: false,
+      code: "",
+      welcomeMessage: "Hi! 我是受保護的 bot，請輸入配對碼以開始使用。",
+      successMessage: "✅ 配對成功，歡迎加入！現在可以開始對話了。",
+    },
+    requireMention: true,
+    groups: {},
+    webhookPort: 3100,
+    webhookPath: "/webhook",
+  },
   security: { level: "moderate", allowedTools: [], disallowedTools: [] },
   web: { enabled: false, host: "127.0.0.1", port: 4632 },
   stt: { baseUrl: "", model: "" },
@@ -109,6 +123,19 @@ export interface LineGroupConfig {
   requireMention?: boolean;
 }
 
+/** Pairing configuration: lets unknown DM users self-enroll into the allowlist
+ *  by sending a secret code, instead of needing manual settings.json edits. */
+export interface LinePairingConfig {
+  /** When true and `allowedUserIds` is non-empty, unknown DM users can pair using `code`. */
+  enabled: boolean;
+  /** The pairing code users must send to join the allowlist. Empty disables pairing. */
+  code: string;
+  /** Message sent to unknown users prompting them to enter the pairing code. */
+  welcomeMessage: string;
+  /** Message sent after a successful pairing. */
+  successMessage: string;
+}
+
 export interface LineConfig {
   /** LINE channel access token (from LINE Developers console) */
   channelAccessToken: string;
@@ -117,6 +144,8 @@ export interface LineConfig {
   /** LINE user IDs (U + 32 hex chars) allowed to interact with the bot.
    *  Empty array means all users are allowed. */
   allowedUserIds: string[];
+  /** Pairing flow for unknown DM users (only used when `allowedUserIds` is non-empty). */
+  pairing: LinePairingConfig;
   /** Whether the bot requires @mention to respond in groups/rooms (default: true).
    *  Can be overridden per-group via the `groups` map. */
   requireMention: boolean;
@@ -314,6 +343,16 @@ function parseSettings(raw: Record<string, any>): Settings {
       allowedUserIds: Array.isArray(raw.line?.allowedUserIds)
         ? raw.line.allowedUserIds.map(String)
         : [],
+      pairing: {
+        enabled: typeof raw.line?.pairing?.enabled === "boolean" ? raw.line.pairing.enabled : false,
+        code: typeof raw.line?.pairing?.code === "string" ? raw.line.pairing.code.trim() : "",
+        welcomeMessage: typeof raw.line?.pairing?.welcomeMessage === "string" && raw.line.pairing.welcomeMessage.trim()
+          ? raw.line.pairing.welcomeMessage
+          : "Hi! 我是受保護的 bot，請輸入配對碼以開始使用。",
+        successMessage: typeof raw.line?.pairing?.successMessage === "string" && raw.line.pairing.successMessage.trim()
+          ? raw.line.pairing.successMessage
+          : "✅ 配對成功，歡迎加入！現在可以開始對話了。",
+      },
       requireMention: typeof raw.line?.requireMention === "boolean" ? raw.line.requireMention : true,
       groups: (() => {
         const result: Record<string, LineGroupConfig> = {};
@@ -428,6 +467,22 @@ export async function reloadSettings(): Promise<Settings> {
 export function getSettings(): Settings {
   if (!cached) throw new Error("Settings not loaded. Call loadSettings() first.");
   return cached;
+}
+
+/** Add a LINE user ID to the allowlist on disk and refresh the in-memory cache.
+ *  Used by the pairing flow when an unknown user successfully enters the pairing code.
+ *  Reads the raw JSON to preserve all other fields exactly as written by the user. */
+export async function addLineAllowedUser(userId: string): Promise<void> {
+  if (!userId) return;
+  const rawText = await Bun.file(SETTINGS_FILE).text();
+  const raw = JSON.parse(rawText);
+  if (!raw.line) raw.line = {};
+  if (!Array.isArray(raw.line.allowedUserIds)) raw.line.allowedUserIds = [];
+  if (raw.line.allowedUserIds.includes(userId)) return; // already allowed
+  raw.line.allowedUserIds.push(userId);
+  await Bun.write(SETTINGS_FILE, JSON.stringify(raw, null, 2) + "\n");
+  // Refresh in-memory cache so next message is authorized without waiting for hot-reload
+  await reloadSettings();
 }
 
 const PROMPT_EXTENSIONS = [".md", ".txt", ".prompt"];

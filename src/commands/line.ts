@@ -1,5 +1,5 @@
 import { ensureProjectClaudeMd, runUserMessage } from "../runner";
-import { getSettings, loadSettings } from "../config";
+import { addLineAllowedUser, getSettings, loadSettings } from "../config";
 import { peekThreadSession } from "../sessionManager";
 import { transcribeAudioToText } from "../whisper";
 import { mkdir } from "node:fs/promises";
@@ -382,13 +382,38 @@ async function handleMessageEvent(event: LineMessageEvent): Promise<void> {
     return;
   }
 
+  const isGroup = event.source.type === "group" || event.source.type === "room";
+
   // Authorization check
   if (config.allowedUserIds.length > 0 && !config.allowedUserIds.includes(userId)) {
+    // Pairing flow: only for DM text messages, only when pairing is enabled with a code set
+    if (
+      !isGroup &&
+      event.message.type === "text" &&
+      config.pairing.enabled &&
+      config.pairing.code
+    ) {
+      const text = (event.message.text ?? "").trim();
+      if (text === config.pairing.code) {
+        try {
+          await addLineAllowedUser(userId);
+          console.log(`[${new Date().toLocaleTimeString()}] LINE pairing success: ${userId}`);
+          await sendText(userId, config.pairing.successMessage, event.replyToken);
+        } catch (err) {
+          console.error(`[Line] Pairing persist failed for ${userId}: ${err instanceof Error ? err.message : err}`);
+          await sendText(userId, "配對流程發生錯誤，請稍後再試。", event.replyToken);
+        }
+      } else {
+        debugLog(`Pairing prompt sent to ${userId} (input did not match code)`);
+        await sendText(userId, config.pairing.welcomeMessage, event.replyToken);
+      }
+      return;
+    }
     debugLog(`Unauthorized user: ${userId}`);
     return;
   }
 
-  const isGroup = event.source.type === "group" || event.source.type === "room";
+
   const chatId = getChatId(event.source);
   const sessionThreadId = lineSessionId(event.source);
 
