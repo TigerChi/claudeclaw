@@ -1185,6 +1185,7 @@ async function handleBlockAction(payload: any): Promise<void> {
   const user = payload.user as { id: string; username?: string };
   const channelId = (payload.channel as { id: string })?.id;
   const message = payload.message as { ts: string; thread_ts?: string } | undefined;
+  const container = payload.container as { thread_ts?: string } | undefined;
 
   if (!actions?.length || !channelId || !user?.id) return;
 
@@ -1202,9 +1203,15 @@ async function handleBlockAction(payload: any): Promise<void> {
     ? action.selected_option?.text?.text ?? value
     : value;
 
-  const threadTs = message?.thread_ts ?? message?.ts;
-  const replyThreadTs = threadTs ?? message?.ts;
-  const sessionThreadId = threadTs ? slackThreadId(channelId, threadTs) : undefined;
+  // Resolve thread context for session continuity.
+  // message.thread_ts is the thread root (only present when the button message is inside a thread).
+  // container.thread_ts is a fallback source for the same value.
+  // IMPORTANT: Do NOT fall back to message.ts — that's the button message's own ts,
+  // which would create a brand-new session instead of continuing the existing conversation.
+  const threadTs = message?.thread_ts ?? container?.thread_ts;
+  const inThread = !!threadTs;
+  const replyThreadTs = threadTs ?? message?.ts; // still reply in the button's thread or as a new thread
+  const sessionThreadId = inThread ? slackThreadId(channelId, threadTs!) : undefined;
 
   console.log(
     `[${new Date().toLocaleTimeString()}] Slack ${user.id} [interactive]: "${actionId}" = "${value}"`,
