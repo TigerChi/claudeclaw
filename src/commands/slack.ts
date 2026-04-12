@@ -1267,7 +1267,18 @@ async function handleBlockAction(payload: any): Promise<void> {
   const threadTs = message?.thread_ts ?? container?.thread_ts;
   const inThread = !!threadTs;
   const replyThreadTs = threadTs ?? message?.ts; // still reply in the button's thread or as a new thread
-  const sessionThreadId = inThread ? slackThreadId(channelId, threadTs!) : undefined;
+  let sessionThreadId = inThread ? slackThreadId(channelId, threadTs!) : undefined;
+
+  // Fall back to global session when no thread session exists for this threadId.
+  // This handles the case where a top-level message used the global session and
+  // replied in a thread — the button click sees a thread but should continue
+  // in the global session, not create a new one.
+  if (sessionThreadId) {
+    const existingThread = await peekThreadSession(sessionThreadId);
+    if (!existingThread) {
+      sessionThreadId = undefined;
+    }
+  }
 
   console.log(
     `[${new Date().toLocaleTimeString()}] Slack ${user.id} [interactive]: "${actionId}" = "${value}"`,
