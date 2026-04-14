@@ -1480,8 +1480,15 @@ async function handleSocketPayload(
   }
 
   if (type === "disconnect") {
-    debugLog(`Disconnect requested: ${data.reason ?? data.payload?.reason}`);
-    ws?.close(1000, "Disconnect requested");
+    const reason = data.reason ?? data.payload?.reason ?? "unknown";
+    console.log(`[Slack] Server disconnect: ${reason}`);
+    if (reason === "link_disabled") {
+      ws?.close(4100, `disconnect:${reason}`);
+    } else if (reason === "too_many_websockets") {
+      ws?.close(4200, `disconnect:${reason}`);
+    } else {
+      ws?.close(4000, `disconnect:${reason}`);
+    }
     return;
   }
 
@@ -1593,9 +1600,11 @@ function openSocket(url: string, appToken: string, signal: AbortSignal): Promise
   code?: number;
   reason?: string;
   error?: unknown;
+  openedAt?: number;
 }> {
   return new Promise((resolve) => {
     debugLog(`Opening WebSocket: ${url.slice(0, 60)}...`);
+    const openedAt = Date.now();
 
     // Clean up previous socket if somehow still open
     if (ws && ws.readyState !== WebSocket.CLOSED) {
@@ -1607,7 +1616,7 @@ function openSocket(url: string, appToken: string, signal: AbortSignal): Promise
     ws = new WebSocket(url);
     let resolved = false;
 
-    const resolveOnce = (value: { event: "close" | "error"; code?: number; reason?: string; error?: unknown }) => {
+    const resolveOnce = (value: { event: "close" | "error"; code?: number; reason?: string; error?: unknown; openedAt?: number }) => {
       if (resolved) return;
       resolved = true;
       // Clean up proactive timer
@@ -1641,13 +1650,13 @@ function openSocket(url: string, appToken: string, signal: AbortSignal): Promise
     ws.onclose = (event) => {
       debugLog(`WebSocket closed: code=${event.code} reason=${event.reason}`);
       ws = null;
-      resolveOnce({ event: "close", code: event.code, reason: event.reason });
+      resolveOnce({ event: "close", code: event.code, reason: event.reason, openedAt });
     };
 
     ws.onerror = (event) => {
       // onclose normally fires after onerror — but if it doesn't, resolve here
       const err = (event as ErrorEvent).error ?? (event as ErrorEvent).message ?? "unknown";
-      resolveOnce({ event: "error", error: err });
+      resolveOnce({ event: "error", error: err, openedAt });
     };
 
     // Proactive reconnect: close gracefully at 29 min (tracked, single timer)
@@ -1665,7 +1674,7 @@ function openSocket(url: string, appToken: string, signal: AbortSignal): Promise
       if (ws) {
         try { ws.close(1000, "Stop requested"); } catch { /* best-effort */ }
       }
-      resolveOnce({ event: "close", code: 1000, reason: "Stop requested" });
+      resolveOnce({ event: "close", code: 1000, reason: "Stop requested", openedAt });
     }
     signal.addEventListener("abort", onAbort, { once: true });
   });
@@ -1712,15 +1721,23 @@ async function socketLoop(appToken: string, signal: AbortSignal): Promise<void> 
 
       if (signal.aborted) break;
 
-      // Successful connection resets the counter
-      if (disconnect.code === 1000) {
-        // Normal close (proactive rotation, etc.) — reset attempts
-        reconnectAttempts = 0;
-      }
-
       if (disconnect.error && isNonRecoverableAuthError(disconnect.error)) {
         console.error(`[Slack] Non-recoverable auth error during connection — stopping`);
         break;
+      }
+
+      // link_disabled — Socket Mode turned off, no point retrying
+      if (disconnect.code === 4100) {
+        console.error(`[Slack] Socket Mode disabled (link_disabled) — stopping`);
+        break;
+      }
+
+      // Only reset attempts if the connection was stable (>30s alive)
+      const connectionDuration = disconnect.openedAt ? Date.now() - disconnect.openedAt : 0;
+      const wasStable = connectionDuration > 30_000;
+
+      if (disconnect.code === 1000 && wasStable) {
+        reconnectAttempts = 0;
       }
 
       reconnectAttempts++;
@@ -1729,12 +1746,14 @@ async function socketLoop(appToken: string, signal: AbortSignal): Promise<void> 
         break;
       }
 
-      const delayMs = disconnect.code === 1000
-        ? Math.round(1000 + Math.random() * 2000) // Quick reconnect for proactive rotation
+      // Quick reconnect only for proactive rotation (code 1000 + stable)
+      // Everything else uses exponential backoff
+      const delayMs = (disconnect.code === 1000 && wasStable)
+        ? Math.round(1000 + Math.random() * 2000)
         : computeBackoff(RECONNECT_POLICY, reconnectAttempts);
 
       const reason = disconnect.reason || disconnect.event;
-      console.log(`[Slack] Disconnected (${reason}), reconnecting in ${Math.round(delayMs / 1000)}s (attempt ${reconnectAttempts}/${RECONNECT_POLICY.maxAttempts})`);
+      console.log(`[Slack] Disconnected (${reason}), reconnecting in ${Math.round(delayMs / 1000)}s (attempt ${reconnectAttempts}/${RECONNECT_POLICY.maxAttempts}, alive ${Math.round(connectionDuration / 1000)}s)`);
 
       try { await sleepWithAbort(delayMs, signal); } catch { break; }
     } catch (err) {
