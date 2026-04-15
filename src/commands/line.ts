@@ -124,6 +124,39 @@ const PROFILE_TTL_MS = 5 * 60 * 1000;
 // Loading animation interval handles per reply token
 const loadingTimers = new Map<string, ReturnType<typeof setInterval>>();
 
+// Known users — tracks DM users who have interacted with the bot.
+// Used by forwardToLine when allowedUserIds is empty (allow-all mode).
+const KNOWN_USERS_FILE = join(process.cwd(), ".claude", "claudeclaw", "line-known-users.json");
+
+const knownUsers = new Set<string>();
+
+async function loadKnownUsers(): Promise<void> {
+  try {
+    const raw = await Bun.file(KNOWN_USERS_FILE).text();
+    const arr = JSON.parse(raw);
+    if (Array.isArray(arr)) arr.forEach((id: string) => knownUsers.add(id));
+  } catch {
+    // file doesn't exist yet — that's fine
+  }
+}
+
+async function trackKnownUser(userId: string): Promise<void> {
+  if (knownUsers.has(userId)) return;
+  knownUsers.add(userId);
+  try {
+    await Bun.write(KNOWN_USERS_FILE, JSON.stringify([...knownUsers], null, 2) + "\n");
+  } catch (err) {
+    console.error(`[Line] Failed to persist known user: ${err}`);
+  }
+}
+
+/** Get the list of users to forward messages to (push API). */
+export function getLineForwardTargets(): string[] {
+  const config = getSettings().line;
+  if (config.allowedUserIds.length > 0) return config.allowedUserIds;
+  return [...knownUsers];
+}
+
 // --- Debug ---
 
 function debugLog(message: string): void {
@@ -383,6 +416,9 @@ async function handleMessageEvent(event: LineMessageEvent): Promise<void> {
   }
 
   const isGroup = event.source.type === "group" || event.source.type === "room";
+
+  // Track DM users for forwarding (push API)
+  if (!isGroup) trackKnownUser(userId);
 
   // Authorization check
   if (config.allowedUserIds.length > 0 && !config.allowedUserIds.includes(userId)) {
@@ -738,6 +774,9 @@ export function startLine(debug = false): void {
     console.log("  LINE: not configured");
     return;
   }
+
+  // Load known users for forwarding
+  loadKnownUsers().catch(() => {});
 
   console.log("LINE bot started (Webhook)");
   console.log(`  Allowed users: ${config.allowedUserIds.length === 0 ? "all" : config.allowedUserIds.join(", ")}`);

@@ -10,6 +10,17 @@ import { initConfig, loadSettings, reloadSettings, resolvePrompt, type Heartbeat
 import { getDayAndMinuteAtOffset } from "../timezone";
 import { startWebUi, type WebServerHandle } from "../web";
 import type { Job } from "../jobs";
+import {
+  registerAgent,
+  unregisterAgent,
+  startSocketServer as startBusSocket,
+  stopSocketServer as stopBusSocket,
+  checkInbox,
+  sendToAgent,
+  buildAgentMessagePrompt,
+  updateHeartbeat,
+  type AgentMessage,
+} from "../agent-bus";
 
 const CLAUDE_DIR = join(process.cwd(), ".claude");
 const HEARTBEAT_DIR = join(CLAUDE_DIR, "claudeclaw");
@@ -340,6 +351,11 @@ export async function start(args: string[] = []) {
     if (slackStop) slackStop();
     if (lineStop) lineStop();
     if (web) web.stop();
+    // Agent Bus cleanup
+    stopBusSocket();
+    if (settings.agentBus.enabled && settings.agentBus.name) {
+      await unregisterAgent(settings.agentBus.name).catch(() => {});
+    }
     await teardownStatusline();
     await cleanupPidFile();
     process.exit(0);
@@ -356,6 +372,7 @@ export async function start(args: string[] = []) {
     console.log(`    - blocked: ${settings.security.disallowedTools.join(", ")}`);
   console.log(`  Heartbeat: ${settings.heartbeat.enabled ? `every ${settings.heartbeat.interval}m` : "disabled"}`);
   console.log(`  Web UI: ${webEnabled ? `http://${settings.web.host}:${webPort}` : "disabled"}`);
+  console.log(`  Agent Bus: ${settings.agentBus.enabled ? `"${settings.agentBus.name}"` : "disabled"}`);
   if (debugFlag) console.log("  Debug: enabled");
   console.log(`  Jobs loaded: ${jobs.length}`);
   jobs.forEach((j) => console.log(`    - ${j.name} [${j.schedule}]`));
@@ -440,11 +457,12 @@ export async function start(args: string[] = []) {
 
   // --- LINE ---
   let lineSendToUser: ((userId: string, text: string) => Promise<void>) | null = null;
+  let lineForwardTargets: () => string[] = () => [];
   let lineAccessToken = "";
 
   async function initLine(accessToken: string) {
     if (accessToken && accessToken !== lineAccessToken) {
-      const { startLine, sendMessageToUser: lineSend, stopLine } = await import("./line");
+      const { startLine, sendMessageToUser: lineSend, stopLine, getLineForwardTargets } = await import("./line");
       if (lineAccessToken) stopLine();
 
       // Check if LINE proxy is running — if so, daemon connects via proxy (no port conflict)
@@ -457,12 +475,14 @@ export async function start(args: string[] = []) {
       startLine(debugFlag);
       lineStop = stopLine;
       lineSendToUser = (userId, text) => lineSend(userId, text);
+      lineForwardTargets = getLineForwardTargets;
       lineAccessToken = accessToken;
       console.log(`[${ts()}] LINE: enabled${proxyActive ? " (via proxy)" : ""}`);
     } else if (!accessToken && lineAccessToken) {
       if (lineStop) lineStop();
       lineStop = null;
       lineSendToUser = null;
+      lineForwardTargets = () => [];
       lineAccessToken = "";
       console.log(`[${ts()}] LINE: disabled`);
     }
@@ -611,11 +631,13 @@ export async function start(args: string[] = []) {
   }
 
   function forwardToLine(label: string, result: { exitCode: number; stdout: string; stderr: string }) {
-    if (!lineSendToUser || currentSettings.line.allowedUserIds.length === 0) return;
+    if (!lineSendToUser) return;
+    const targets = lineForwardTargets();
+    if (targets.length === 0) return;
     const text = result.exitCode === 0
       ? `${label ? `[${label}]\n` : ""}${result.stdout || "(empty)"}`
       : `${label ? `[${label}] ` : ""}error (exit ${result.exitCode}): ${result.stderr || "Unknown"}`;
-    for (const userId of currentSettings.line.allowedUserIds) {
+    for (const userId of targets) {
       lineSendToUser(userId, text).catch((err) =>
         console.error(`[LINE] Failed to forward to ${userId}: ${err}`)
       );
@@ -714,6 +736,57 @@ export async function start(args: string[] = []) {
 
   if (currentSettings.heartbeat.enabled) scheduleHeartbeat();
 
+  // --- Agent Bus init ---
+  if (currentSettings.agentBus.enabled && currentSettings.agentBus.name) {
+    const busName = currentSettings.agentBus.name;
+    await registerAgent(busName, process.cwd(), process.pid, "online");
+
+    startBusSocket(busName, async (msg) => {
+      // Handle incoming agent messages via socket (real-time)
+      if (msg.type === "system") {
+        await handleSystemMessage(msg);
+        return;
+      }
+      const prompt = buildAgentMessagePrompt([msg]);
+      const r = await run("agent-bus", prompt);
+      // Forward non-empty results to messaging channels
+      if (r.exitCode === 0 && r.stdout?.trim()) {
+        forwardToTelegram("agent-bus", r);
+        forwardToDiscord("agent-bus", r);
+        forwardToSlack("agent-bus", r);
+        forwardToLine("agent-bus", r);
+      }
+    });
+
+    console.log(`[${ts()}] Agent Bus: enabled as "${busName}"`);
+  }
+
+  async function handleSystemMessage(msg: AgentMessage & { action?: string; reason?: string }) {
+    const busName = currentSettings.agentBus.name;
+    console.log(`[${ts()}] Agent Bus: system action "${msg.action}" from "${msg.from}"`);
+    switch (msg.action) {
+      case "status":
+        await sendToAgent(msg.from, JSON.stringify({
+          agent: busName,
+          pid: process.pid,
+          uptime: Date.now() - daemonStartedAt,
+          heartbeat: currentSettings.heartbeat.enabled,
+          security: currentSettings.security.level,
+        }), { from: busName, type: "response", replyTo: msg.id });
+        break;
+      case "reload-settings":
+        currentSettings = await reloadSettings();
+        await sendToAgent(msg.from, `Settings reloaded.`, { from: busName, type: "response", replyTo: msg.id });
+        break;
+      case "reload-jobs":
+        currentJobs = await loadJobs();
+        await sendToAgent(msg.from, `Jobs reloaded: ${currentJobs.length} job(s).`, { from: busName, type: "response", replyTo: msg.id });
+        break;
+      default:
+        console.log(`[${ts()}] Agent Bus: unknown system action "${msg.action}"`);
+    }
+  }
+
   // --- Hot-reload loop (every 30s) ---
   setInterval(async () => {
     try {
@@ -771,6 +844,27 @@ export async function start(args: string[] = []) {
 
       // LINE changes
       await initLine(newSettings.line.channelAccessToken);
+
+      // Agent Bus: check file inbox for offline messages
+      if (currentSettings.agentBus.enabled && currentSettings.agentBus.name) {
+        const busName = currentSettings.agentBus.name;
+        await updateHeartbeat(busName);
+        const inboxMessages = await checkInbox(busName);
+        for (const msg of inboxMessages) {
+          if (msg.type === "system") {
+            await handleSystemMessage(msg as any);
+            continue;
+          }
+          const prompt = buildAgentMessagePrompt([msg]);
+          const r = await run("agent-bus", prompt);
+          if (r.exitCode === 0 && r.stdout?.trim()) {
+            forwardToTelegram("agent-bus", r);
+            forwardToDiscord("agent-bus", r);
+            forwardToSlack("agent-bus", r);
+            forwardToLine("agent-bus", r);
+          }
+        }
+      }
     } catch (err) {
       console.error(`[${ts()}] Hot-reload error:`, err);
     }
@@ -811,7 +905,7 @@ export async function start(args: string[] = []) {
         resolvePrompt(job.prompt)
           .then((prompt) => run(job.name, prompt))
           .then((r) => {
-            if (job.notify === false) return;
+              if (job.notify === false) return;
             if (job.notify === "error" && r.exitCode === 0) return;
             forwardToTelegram(job.name, r);
             forwardToDiscord(job.name, r);

@@ -1,5 +1,5 @@
 import { start } from "./commands/start";
-import { stop, stopAll } from "./commands/stop";
+import { stop, stopAll, restart } from "./commands/stop";
 import { clear } from "./commands/clear";
 import { status } from "./commands/status";
 import { telegram } from "./commands/telegram";
@@ -16,6 +16,8 @@ if (command === "--stop-all") {
   stopAll();
 } else if (command === "--stop") {
   stop();
+} else if (command === "--restart") {
+  restart().then(() => start());
 } else if (command === "--clear") {
   clear();
 } else if (command === "start") {

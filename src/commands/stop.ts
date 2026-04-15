@@ -53,6 +53,35 @@ export async function stop() {
   process.exit(0);
 }
 
+export async function restart() {
+  const pidFile = getPidPath();
+  let pid: string;
+  try {
+    pid = (await Bun.file(pidFile).text()).trim();
+  } catch {
+    console.log("No daemon is running. Starting fresh...");
+    return; // caller will proceed to start
+  }
+
+  try {
+    process.kill(Number(pid), "SIGTERM");
+    console.log(`Stopped daemon (PID ${pid}).`);
+  } catch {
+    console.log(`Daemon process ${pid} already dead.`);
+  }
+
+  await cleanupPidFile();
+  await teardownStatusline();
+
+  try {
+    await unlink(join(HEARTBEAT_DIR, "state.json"));
+  } catch {}
+
+  // Brief pause to let port/socket release
+  await new Promise((r) => setTimeout(r, 500));
+  console.log("Restarting...");
+}
+
 export async function stopAll() {
   const projectsDir = join(homedir(), ".claude", "projects");
   let dirs: string[];

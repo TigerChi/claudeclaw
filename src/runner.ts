@@ -8,9 +8,10 @@ import {
   incrementThreadTurn,
   markThreadCompactWarned,
 } from "./sessionManager";
-import { getSettings, type ModelConfig, type SecurityConfig } from "./config";
+import { getSettings, type ModelConfig, type SecurityConfig, type AgentBusConfig } from "./config";
 import { buildClockPromptPrefix } from "./timezone";
 import { selectModel } from "./model-router";
+import { listAgents, extractAgentDirectives, sendToAgent } from "./agent-bus";
 import { query as sdkQuery } from "@anthropic-ai/claude-agent-sdk";
 import { execSync } from "child_process";
 import { homedir } from "os";
@@ -437,6 +438,46 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
   }
 
   if (security.level !== "unrestricted") appendParts.push(DIR_SCOPE_PROMPT);
+
+  // Agent Bus: inject inter-agent communication instructions when enabled
+  const agentBus: AgentBusConfig = (settings as any).agentBus ?? { enabled: false, name: "" };
+  if (agentBus.enabled && agentBus.name) {
+    try {
+      const registry = await listAgents();
+      const others = Object.entries(registry)
+        .filter(([name]) => name !== agentBus.name)
+        .map(([name, entry]) => `  - ${name} (${entry.status}, project: ${entry.projectDir})`)
+        .join("\n");
+
+      const busPrompt = [
+        "## Agent Bus — Inter-Agent Communication",
+        "",
+        `You are agent "${agentBus.name}". You can communicate with other agents using the Agent Bus.`,
+        "",
+        "### Available agents:",
+        others || "  (no other agents registered yet)",
+        "",
+        "### How to send a message to another agent:",
+        "Use the [send-agent:<name>] directive in your response:",
+        "  [send-agent:alice] Please check the latest deployment status",
+        "",
+        "### How Agent Bus messages work:",
+        "- When you receive an Agent Bus message, your plain text reply (anything NOT inside a [send-agent:] directive) will be automatically forwarded to the user on all active messaging channels (LINE, Telegram, Slack, Discord).",
+        "- [send-agent:] directives in your reply are extracted and sent to that agent. They are NOT shown to the user.",
+        "- So if you want to talk to the user: write plain text. If you want to talk to another agent: use [send-agent:].",
+        "- You can do BOTH in the same reply — plain text goes to the user, directives go to agents.",
+        "",
+        "### Rules:",
+        "- Only use [send-agent:] when the user explicitly asks you to contact another agent, or when the task clearly requires another agent's help.",
+        "- Do NOT send messages to yourself.",
+        "- Keep inter-agent messages concise and actionable.",
+      ].join("\n");
+      appendParts.push(busPrompt);
+    } catch (err) {
+      console.error(`[${new Date().toLocaleTimeString()}] Failed to build Agent Bus prompt:`, err);
+    }
+  }
+
   if (appendParts.length > 0) {
     args.push("--append-system-prompt", appendParts.join("\n\n"));
   }
@@ -566,7 +607,23 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
 }
 
 export async function run(name: string, prompt: string, threadId?: string): Promise<RunResult> {
-  return enqueue(() => execClaude(name, prompt, threadId), threadId);
+  const result = await enqueue(() => execClaude(name, prompt, threadId), threadId);
+
+  // Process [send-agent:] directives in output — works for all channels
+  const agentBus: AgentBusConfig = (getSettings() as any).agentBus ?? { enabled: false, name: "" };
+  if (agentBus.enabled && agentBus.name && result.stdout) {
+    const { cleaned, directives } = extractAgentDirectives(result.stdout, agentBus.name);
+    if (directives.length > 0) {
+      for (const d of directives) {
+        sendToAgent(d.to, d.payload, { from: agentBus.name, type: "message" }).catch((err) => {
+          console.error(`[${new Date().toLocaleTimeString()}] Agent Bus: failed to send to "${d.to}":`, err);
+        });
+      }
+      result.stdout = cleaned;
+    }
+  }
+
+  return result;
 }
 
 async function streamClaude(
