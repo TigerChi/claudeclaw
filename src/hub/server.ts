@@ -25,7 +25,15 @@ const PROXY_PREFIX = "/api/agents/";
 const PROXY_INFIX = "/proxy/";
 
 async function authorize(req: Request): Promise<{ ok: boolean; readOnly: boolean }> {
-  const token = extractBearer(req.headers.get("authorization"));
+  let token = extractBearer(req.headers.get("authorization"));
+  if (!token) {
+    // Fallback: cookie. The SPA writes this cookie before opening the
+    // per-daemon UI in a new tab, since browser navigation can't carry
+    // the Authorization header that fetch() uses.
+    const cookie = req.headers.get("cookie") || "";
+    const match = cookie.match(/(?:^|; )claudeclaw_hub_token=([^;]+)/);
+    if (match) token = decodeURIComponent(match[1]);
+  }
   const ok = await verifyBearerToken(token);
   return { ok, readOnly: false };
 }
@@ -205,6 +213,30 @@ export function startHubServer(opts: HubServerOptions): HubServerHandle {
           } catch (err) {
             return badRequest(String(err));
           }
+        }
+
+        if (segments.length === 1 && segments[0] === "restart-all" && req.method === "POST") {
+          // POST /api/agents/restart-all
+          // Restarts every agent in the registry (alive ones get stopped first,
+          // then spawned again; dead ones get spawned).
+          const all = await listAgents();
+          const results: Array<{ id: string; path: string; ok: boolean; pid?: number; error?: string }> = [];
+          for (const agent of all) {
+            try {
+              if (agent.alive) {
+                const stopped = await stopByPath(agent.path, 4000);
+                if (!stopped.ok && stopped.reason !== "already-dead") {
+                  results.push({ id: agent.id, path: agent.path, ok: false, error: stopped.reason ?? "stop-failed" });
+                  continue;
+                }
+              }
+              const spawned = await spawnDetachedDaemon(agent.path);
+              results.push({ id: agent.id, path: agent.path, ok: true, pid: spawned.pid });
+            } catch (err) {
+              results.push({ id: agent.id, path: agent.path, ok: false, error: String(err) });
+            }
+          }
+          return json({ ok: true, results });
         }
       }
 

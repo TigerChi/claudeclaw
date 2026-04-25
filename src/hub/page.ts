@@ -112,7 +112,51 @@ export function hubPage(): string {
     }
     pre { white-space: pre-wrap; word-break: break-all; font-size: 12px; color: #8b949e; }
     code { background: #0d1117; padding: 2px 6px; border-radius: 4px; }
-    .toolbar { margin-bottom: 12px; display: flex; gap: 8px; flex-wrap: wrap; }
+    .toolbar { margin-bottom: 12px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    button[disabled] { opacity: 0.5; cursor: not-allowed; }
+    .action-msg {
+      padding: 5px 10px;
+      border-radius: 6px;
+      font-size: 12px;
+      transition: opacity 0.4s ease;
+    }
+    .action-msg.ok { background: #133626; color: #3fb950; border: 1px solid #1f6c40; }
+    .action-msg.error { background: #3a1a1a; color: #f85149; border: 1px solid #6e2222; }
+    .action-msg.fade { opacity: 0; }
+    .header-msg {
+      font-size: 11px;
+      padding: 4px 10px;
+      border-radius: 6px;
+      background: #133626;
+      color: #3fb950;
+      border: 1px solid #1f6c40;
+    }
+    .header-msg.error { background: #3a1a1a; color: #f85149; border-color: #6e2222; }
+    .header-msg:empty { display: none; }
+
+    /* Mobile: stack sidebar above detail, smaller header */
+    @media (max-width: 768px) {
+      header {
+        flex-wrap: wrap;
+        padding: 10px 14px;
+        gap: 8px;
+      }
+      header h1 { font-size: 14px; }
+      header .status { font-size: 11px; }
+      header button { padding: 5px 10px; font-size: 11px; }
+      main { flex-direction: column; }
+      aside {
+        width: 100%;
+        max-height: 35vh;
+        border-right: none;
+        border-bottom: 1px solid #30363d;
+      }
+      section.detail { padding: 14px; }
+      .row .label { width: 84px; font-size: 11px; }
+      .row .value { font-size: 12px; }
+      .toolbar { flex-wrap: wrap; }
+      .toolbar .open-daemon { margin-left: 0 !important; }
+    }
   </style>
 </head>
 <body>
@@ -194,12 +238,128 @@ export function hubPage(): string {
       await refreshDetail();
     }
 
-    async function actOnAgent(id, action) {
+    async function actOnAgent(id, action, btn) {
+      const verb = action === "stop" ? "Stopping…" : action === "start" ? "Starting…" : "Restarting…";
+      const orig = btn ? btn.textContent : "";
+      // Disable all toolbar buttons while one is in flight
+      const all = document.querySelectorAll(".toolbar [data-act]");
+      all.forEach((b) => (b.disabled = true));
+      if (btn) btn.textContent = verb;
+
       try {
-        await api("/api/agents/" + id + "/" + action, { method: "POST" });
+        const res = await api("/api/agents/" + id + "/" + action, { method: "POST" });
+        const data = await res.json().catch(() => ({}));
+        let msg;
+        if (action === "stop") {
+          msg = data.alreadyStopped
+            ? "Already stopped"
+            : "✓ Stopped" + (data.pid ? " (PID " + data.pid + ")" : "");
+        } else if (action === "start") {
+          msg = data.alreadyRunning
+            ? "Already running" + (data.pid ? " (PID " + data.pid + ")" : "")
+            : "✓ Started" + (data.pid ? " — PID " + data.pid : "");
+        } else {
+          msg = "✓ Restarted" + (data.pid ? " — new PID " + data.pid : "");
+        }
+        showActionMsg(msg, "ok");
         await refreshAgents();
       } catch (e) {
-        alert("Failed: " + e.message);
+        showActionMsg("✗ Failed: " + (e && e.message ? e.message : e), "error");
+      } finally {
+        all.forEach((b) => (b.disabled = false));
+        if (btn) btn.textContent = orig;
+      }
+    }
+
+    function showActionMsg(text, kind) {
+      const el = document.getElementById("action-msg");
+      if (!el) return;
+      el.className = "action-msg " + kind;
+      el.textContent = text;
+      // fade after 3s, clear after fade
+      setTimeout(() => {
+        if (el.textContent !== text) return;
+        el.classList.add("fade");
+        setTimeout(() => {
+          if (el.textContent === text) {
+            el.textContent = "";
+            el.className = "action-msg";
+          }
+        }, 400);
+      }, 3000);
+    }
+
+    function showHeaderMsg(text, kind) {
+      const el = document.getElementById("header-msg");
+      if (!el) return;
+      el.className = "header-msg" + (kind === "error" ? " error" : "");
+      el.textContent = text;
+      setTimeout(() => {
+        if (el.textContent === text) el.textContent = "";
+      }, 3000);
+    }
+
+    async function restartAll() {
+      const total = state.agents.length;
+      if (total === 0) {
+        showHeaderMsg("No agents to restart");
+        return;
+      }
+      if (!window.confirm("Restart all " + total + " agent(s)? This may take 10–30 seconds.")) return;
+      const btn = document.getElementById("restart-all");
+      const orig = btn ? btn.textContent : "";
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = "Restarting…";
+      }
+      showHeaderMsg("Restarting all agents… (this may take a while)");
+      try {
+        const res = await api("/api/agents/restart-all", { method: "POST" });
+        const data = await res.json().catch(() => ({}));
+        const results = data.results || [];
+        const okCount = results.filter((r) => r.ok).length;
+        const failed = results.filter((r) => !r.ok);
+        if (failed.length === 0) {
+          showHeaderMsg("✓ Restarted " + okCount + "/" + results.length);
+        } else {
+          showHeaderMsg("⚠ " + okCount + "/" + results.length + " ok, " + failed.length + " failed", "error");
+        }
+        await refreshAgents();
+      } catch (e) {
+        showHeaderMsg("✗ Failed: " + (e && e.message ? e.message : e), "error");
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = orig;
+        }
+      }
+    }
+
+    async function copyToken() {
+      const token = state.token;
+      if (!token) return;
+      // Modern API requires secure context (https or localhost). Tailscale plain
+      // HTTP is not "secure" so we always provide a fallback.
+      try {
+        if (navigator.clipboard && window.isSecureContext) {
+          await navigator.clipboard.writeText(token);
+          showHeaderMsg("✓ Token copied");
+          return;
+        }
+      } catch (e) { /* fall through */ }
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = token;
+        ta.style.position = "fixed";
+        ta.style.left = "-9999px";
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        document.body.removeChild(ta);
+        showHeaderMsg("✓ Token copied");
+      } catch (e) {
+        // Last resort: show it so user can copy manually
+        window.prompt("Copy your hub token:", token);
       }
     }
 
@@ -211,6 +371,15 @@ export function hubPage(): string {
       if (h > 0) return h + "h " + m + "m";
       if (m > 0) return m + "m";
       return (s % 60) + "s";
+    }
+
+    // Each messaging channel reports as { configured: boolean, allowedUserCount: number }.
+    // The previous truthy check on the object itself was always "on".
+    function channelStatus(c) {
+      if (!c || !c.configured) return "off";
+      const n = c.allowedUserCount || 0;
+      if (n === 0) return "on (all users)";
+      return "on (" + n + " user" + (n !== 1 ? "s" : "") + ")";
     }
 
     function renderAuthPrompt() {
@@ -245,11 +414,12 @@ export function hubPage(): string {
         aside += '<div class="empty">No agents discovered.<br/>Start one with <code>claudeclaw start --detach</code> in any project.</div>';
       } else {
         for (const a of agents) {
+          const name = (a.path || "").split("/").filter(Boolean).pop() || a.path;
           aside +=
             '<div class="agent ' + (a.id === state.selectedId ? "active" : "") + '" data-id="' + a.id + '">' +
             '<span class="dot ' + (a.alive ? "alive" : "") + '"></span>' +
             '<div class="meta">' +
-            '<div class="path" title="' + a.path + '">' + a.path + '</div>' +
+            '<div class="path" title="' + a.path + '">' + name + '</div>' +
             '<div class="sub">' + (a.alive ? ("PID " + a.pid + (a.web ? " — :" + a.web.port : "")) : "stopped") + '</div>' +
             '</div></div>';
         }
@@ -265,8 +435,9 @@ export function hubPage(): string {
           (agent.alive
             ? '<button class="danger" data-act="stop" data-id="' + agent.id + '">Stop</button>'
             : '<button data-act="start" data-id="' + agent.id + '">Start</button>') +
+          '<div id="action-msg" class="action-msg"></div>' +
           (agent.alive && agent.web
-            ? '<a target="_blank" href="/api/agents/' + agent.id + '/proxy/" style="margin-left:auto"><button>Open per-daemon UI</button></a>'
+            ? '<a target="_blank" class="open-daemon" href="/api/agents/' + agent.id + '/proxy/" style="margin-left:auto"><button>Open per-daemon UI</button></a>'
             : '') +
           '</div>' +
           '<div class="panel"><h3>Agent</h3>' +
@@ -292,8 +463,10 @@ export function hubPage(): string {
           detail +=
             '<div class="panel"><h3>Session</h3>' +
             row("Security", sec) +
-            row("Telegram", agentState.telegram ? "on" : "off") +
-            row("Discord", agentState.discord ? "on" : "off") +
+            row("Telegram", channelStatus(agentState.telegram)) +
+            row("Discord", channelStatus(agentState.discord)) +
+            row("Slack", channelStatus(agentState.slack)) +
+            row("LINE", channelStatus(agentState.line)) +
             '</div>';
         }
 
@@ -319,7 +492,10 @@ export function hubPage(): string {
         '<header>' +
         '<h1>🦞 ClaudeClaw Hub</h1>' +
         '<span class="status">' + agents.filter((a) => a.alive).length + ' alive / ' + agents.length + ' total</span>' +
-        '<button id="refresh" style="margin-left:auto">Refresh</button>' +
+        '<span id="header-msg" class="header-msg"></span>' +
+        '<button id="restart-all" style="margin-left:auto" title="Stop and re-spawn every listed agent">↻ Restart all</button>' +
+        '<button id="copy-token" title="Copy hub token to clipboard for sharing">🔑 Token</button>' +
+        '<button id="refresh">Refresh</button>' +
         '<button id="signout">Sign out</button>' +
         '</header>' +
         '<main><aside>' + aside + '</aside><section class="detail">' + detail + '</section></main>';
@@ -328,7 +504,16 @@ export function hubPage(): string {
         el.onclick = () => selectAgent(el.getAttribute("data-id"));
       });
       document.querySelectorAll("[data-act]").forEach((el) => {
-        el.onclick = () => actOnAgent(el.getAttribute("data-id"), el.getAttribute("data-act"));
+        el.onclick = () => actOnAgent(el.getAttribute("data-id"), el.getAttribute("data-act"), el);
+      });
+      // Per-daemon UI opens in a new tab; browser navigation can't carry the
+      // Authorization header, so plant a cookie that the hub server reads as
+      // a fallback. SameSite=Lax is enough for same-origin top-level navigation.
+      document.querySelectorAll(".open-daemon").forEach((el) => {
+        el.addEventListener("click", () => {
+          document.cookie = "claudeclaw_hub_token=" + encodeURIComponent(state.token) +
+            "; path=/; SameSite=Lax";
+        });
       });
       const refreshBtn = document.getElementById("refresh");
       if (refreshBtn) refreshBtn.onclick = () => refreshAgents();
@@ -338,6 +523,10 @@ export function hubPage(): string {
         localStorage.removeItem("claudeclaw_hub_token");
         render();
       };
+      const copyBtn = document.getElementById("copy-token");
+      if (copyBtn) copyBtn.onclick = () => copyToken();
+      const restartAllBtn = document.getElementById("restart-all");
+      if (restartAllBtn) restartAllBtn.onclick = () => restartAll();
     }
 
     function row(label, value) {
