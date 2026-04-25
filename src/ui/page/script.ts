@@ -1,4 +1,14 @@
-export const pageScript = String.raw`    const $ = (id) => document.getElementById(id);
+export const pageScript = String.raw`    // When this UI is served directly by a daemon, location.pathname is "/" and
+    // API_BASE = "". When the hub reverse-proxies us at /api/agents/<id>/proxy/,
+    // pathname starts with that prefix; absolute fetches like "/api/state" would
+    // otherwise resolve against the hub's origin and 404. Detect the proxy
+    // prefix and rewrite all API calls through it.
+    const API_BASE = (function () {
+      const m = window.location.pathname.match(/^(\/api\/agents\/[^/]+\/proxy)\b/);
+      return m ? m[1] : "";
+    })();
+
+    const $ = (id) => document.getElementById(id);
 
     const clockEl = $("clock");
     const dateEl = $("date");
@@ -416,7 +426,7 @@ export const pageScript = String.raw`    const $ = (id) => document.getElementBy
 
     async function refreshState() {
       try {
-        const res = await fetch("/api/state");
+        const res = await fetch(API_BASE + "/api/state");
         const state = await res.json();
         const pills = buildPills(state);
         dockEl.innerHTML = pills.map((p) =>
@@ -519,7 +529,7 @@ export const pageScript = String.raw`    const $ = (id) => document.getElementBy
     async function loadSettings() {
       if (!hbToggle) return;
       try {
-        const res = await fetch("/api/settings");
+        const res = await fetch(API_BASE + "/api/settings");
         const data = await res.json();
         const on = Boolean(data?.heartbeat?.enabled);
         const intervalMinutes = Number(data?.heartbeat?.interval) || 15;
@@ -542,7 +552,7 @@ export const pageScript = String.raw`    const $ = (id) => document.getElementBy
       infoModal.setAttribute("aria-hidden", "false");
       infoBody.innerHTML = '<div class="info-section"><div class="info-title">Loading</div><pre class="info-json">Loading technical data...</pre></div>';
       try {
-        const res = await fetch("/api/technical-info");
+        const res = await fetch(API_BASE + "/api/technical-info");
         const data = await res.json();
         renderTechnicalInfo(data);
       } catch (err) {
@@ -598,7 +608,7 @@ export const pageScript = String.raw`    const $ = (id) => document.getElementBy
       openHeartbeatModal();
       hbModalStatus.textContent = "Loading...";
       try {
-        const res = await fetch("/api/settings/heartbeat");
+        const res = await fetch(API_BASE + "/api/settings/heartbeat");
         const out = await res.json();
         if (!out.ok) throw new Error(out.error || "failed to load heartbeat");
         const hb = out.heartbeat || {};
@@ -686,7 +696,7 @@ export const pageScript = String.raw`    const $ = (id) => document.getElementBy
         hbToggle.disabled = true;
         setHeartbeatUi(next, next ? "Enabled" : "Disabled", intervalMinutes, currentPrompt);
         try {
-          const res = await fetch("/api/settings/heartbeat", {
+          const res = await fetch(API_BASE + "/api/settings/heartbeat", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ enabled: next }),
@@ -727,7 +737,7 @@ export const pageScript = String.raw`    const $ = (id) => document.getElementBy
         hbCancelBtn.disabled = true;
         hbModalStatus.textContent = "Saving...";
         try {
-          const res = await fetch("/api/settings/heartbeat", {
+          const res = await fetch(API_BASE + "/api/settings/heartbeat", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -878,7 +888,7 @@ export const pageScript = String.raw`    const $ = (id) => document.getElementBy
       button.disabled = true;
       if (quickJobsStatus) quickJobsStatus.textContent = "Deleting job...";
       try {
-        const res = await fetch("/api/jobs/" + encodeURIComponent(name), { method: "DELETE" });
+        const res = await fetch(API_BASE + "/api/jobs/" + encodeURIComponent(name), { method: "DELETE" });
         const out = await res.json();
         if (!out.ok) throw new Error(out.error || "delete failed");
         if (quickJobsStatus) quickJobsStatus.textContent = "Deleted " + name;
@@ -911,7 +921,7 @@ export const pageScript = String.raw`    const $ = (id) => document.getElementBy
         quickJobSubmit.disabled = true;
         quickJobStatus.textContent = "Saving job...";
         try {
-          const res = await fetch("/api/jobs/quick", {
+          const res = await fetch(API_BASE + "/api/jobs/quick", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -1155,7 +1165,7 @@ export const pageScript = String.raw`    const $ = (id) => document.getElementBy
       chatAbortController = new AbortController();
 
       try {
-        var res = await fetch("/api/chat", {
+        var res = await fetch(API_BASE + "/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ message: message }),

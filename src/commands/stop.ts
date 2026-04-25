@@ -1,7 +1,7 @@
 import { writeFile, unlink, readFile } from "fs/promises";
 import { join } from "path";
 import { getPidPath, cleanupPidFile } from "../pid";
-import { unregisterDaemon, listRegisteredDaemons } from "../daemon-registry";
+import { listRegisteredDaemons } from "../daemon-registry";
 
 const CLAUDE_DIR = join(process.cwd(), ".claude");
 const HEARTBEAT_DIR = join(CLAUDE_DIR, "claudeclaw");
@@ -43,7 +43,6 @@ export async function stop() {
 
   await cleanupPidFile();
   await teardownStatusline();
-  await unregisterDaemon();
 
   try {
     await unlink(join(HEARTBEAT_DIR, "state.json"));
@@ -73,7 +72,6 @@ export async function restart() {
 
   await cleanupPidFile();
   await teardownStatusline();
-  await unregisterDaemon();
 
   try {
     await unlink(join(HEARTBEAT_DIR, "state.json"));
@@ -135,7 +133,6 @@ export async function stopByPath(projectPath: string, waitMs = 4000): Promise<St
     }
   }
   try { await unlink(pidFile); } catch {}
-  await unregisterDaemon(projectPath);
   return { ok: true, pid };
 }
 
