@@ -7,6 +7,7 @@ import { writeState, type StateData } from "../statusline";
 import { cronMatches, nextCronMatch } from "../cron";
 import { clearJobSchedule, loadJobs } from "../jobs";
 import { writePidFile, cleanupPidFile, checkExistingDaemon } from "../pid";
+import { registerDaemon, unregisterDaemon } from "../daemon-registry";
 import { initConfig, loadSettings, reloadSettings, resolvePrompt, type HeartbeatConfig, type Settings } from "../config";
 import { getDayAndMinuteAtOffset } from "../timezone";
 import { startWebUi, type WebServerHandle } from "../web";
@@ -367,6 +368,7 @@ export async function start(args: string[] = []) {
 
   await setupStatusline();
   await writePidFile();
+  await registerDaemon();
   let web: WebServerHandle | null = null;
   let discordStopGateway: (() => void) | null = null;
   let slackStop: (() => void) | null = null;
@@ -384,6 +386,7 @@ export async function start(args: string[] = []) {
     }
     await teardownStatusline();
     await cleanupPidFile();
+    await unregisterDaemon();
     process.exit(0);
   }
   process.on("SIGTERM", shutdown);

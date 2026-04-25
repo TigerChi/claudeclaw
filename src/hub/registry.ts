@@ -1,8 +1,6 @@
-import { homedir } from "os";
 import { join } from "path";
-import { readdir, readFile } from "fs/promises";
-import { createHash } from "crypto";
-import { checkPidAt } from "../pid";
+import { readFile } from "fs/promises";
+import { listRegisteredDaemons, agentIdForPath } from "../daemon-registry";
 
 export interface AgentRecord {
   id: string;
@@ -14,13 +12,7 @@ export interface AgentRecord {
   lastStateAt: number | null;
 }
 
-function decodeProjectDir(encoded: string): string {
-  return "/" + encoded.slice(1).replace(/-/g, "/");
-}
-
-export function agentIdForPath(path: string): string {
-  return createHash("sha1").update(path).digest("hex").slice(0, 12);
-}
+export { agentIdForPath };
 
 interface ParsedState {
   startedAt: number | null;
@@ -47,38 +39,37 @@ async function readState(projectPath: string): Promise<ParsedState> {
 }
 
 /**
- * Enumerate all known agent daemons by scanning ~/.claude/projects/ and
- * probing each project's daemon.pid + state.json.
+ * Enumerate all known agent daemons from the global daemon registry, marking
+ * each as alive/dead based on whether its PID is still running. The registry
+ * is populated by daemons themselves on start and cleared on clean shutdown,
+ * so it always reflects real cwd paths (no lossy directory-name decoding).
  *
- * Includes dead/stale entries (alive=false) so the dashboard can show them
- * with a "start" action; callers can filter as needed.
+ * Stale entries (registered but pid dead — e.g. crashed daemon) are kept in
+ * the result with alive=false so the dashboard can show a "start" action.
  */
 export async function listAgents(): Promise<AgentRecord[]> {
-  const projectsDir = join(homedir(), ".claude", "projects");
-  let dirs: string[];
-  try {
-    dirs = await readdir(projectsDir);
-  } catch {
-    return [];
-  }
-
+  const daemons = await listRegisteredDaemons();
   const results: AgentRecord[] = [];
-  for (const dir of dirs) {
-    const projectPath = decodeProjectDir(dir);
-    const pidFile = join(projectPath, ".claude", "claudeclaw", "daemon.pid");
-    const pid = await checkPidAt(pidFile);
-    const state = await readState(projectPath);
-    if (pid === null && state.startedAt === null && state.web === null) continue;
+
+  for (const d of daemons) {
+    let alive = false;
+    try {
+      process.kill(d.pid, 0);
+      alive = true;
+    } catch {}
+
+    const state = await readState(d.path);
     results.push({
-      id: agentIdForPath(projectPath),
-      path: projectPath,
-      pid,
-      alive: pid !== null,
+      id: agentIdForPath(d.path),
+      path: d.path,
+      pid: alive ? d.pid : null,
+      alive,
       web: state.web,
-      startedAt: state.startedAt,
+      startedAt: d.startedAt || state.startedAt,
       lastStateAt: state.startedAt,
     });
   }
+
   results.sort((a, b) => a.path.localeCompare(b.path));
   return results;
 }

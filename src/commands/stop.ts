@@ -1,7 +1,7 @@
-import { writeFile, unlink, readdir, readFile } from "fs/promises";
+import { writeFile, unlink, readFile } from "fs/promises";
 import { join } from "path";
-import { homedir } from "os";
 import { getPidPath, cleanupPidFile } from "../pid";
+import { unregisterDaemon, listRegisteredDaemons } from "../daemon-registry";
 
 const CLAUDE_DIR = join(process.cwd(), ".claude");
 const HEARTBEAT_DIR = join(CLAUDE_DIR, "claudeclaw");
@@ -43,6 +43,7 @@ export async function stop() {
 
   await cleanupPidFile();
   await teardownStatusline();
+  await unregisterDaemon();
 
   try {
     await unlink(join(HEARTBEAT_DIR, "state.json"));
@@ -72,6 +73,7 @@ export async function restart() {
 
   await cleanupPidFile();
   await teardownStatusline();
+  await unregisterDaemon();
 
   try {
     await unlink(join(HEARTBEAT_DIR, "state.json"));
@@ -133,32 +135,29 @@ export async function stopByPath(projectPath: string, waitMs = 4000): Promise<St
     }
   }
   try { await unlink(pidFile); } catch {}
+  await unregisterDaemon(projectPath);
   return { ok: true, pid };
 }
 
 export async function stopAll() {
-  const projectsDir = join(homedir(), ".claude", "projects");
-  let dirs: string[];
-  try {
-    dirs = await readdir(projectsDir);
-  } catch {
-    console.log("No projects found.");
+  const daemons = await listRegisteredDaemons();
+  if (daemons.length === 0) {
+    console.log("No running daemons found.");
     process.exit(0);
   }
 
-  let found = 0;
-  for (const dir of dirs) {
-    const projectPath = "/" + dir.slice(1).replace(/-/g, "/");
-    const result = await stopByPath(projectPath, 0);
+  let stopped = 0;
+  for (const d of daemons) {
+    const result = await stopByPath(d.path, 0);
     if (result.ok) {
-      found++;
-      console.log(`\x1b[33m■ Stopped\x1b[0m PID ${result.pid} — ${projectPath}`);
+      stopped++;
+      console.log(`\x1b[33m■ Stopped\x1b[0m PID ${result.pid} — ${d.path}`);
     } else if (result.reason === "kill-failed") {
-      console.log(`\x1b[31m✗ Failed to stop\x1b[0m PID ${result.pid} — ${projectPath}`);
+      console.log(`\x1b[31m✗ Failed to stop\x1b[0m PID ${result.pid} — ${d.path}`);
     }
   }
 
-  if (found === 0) {
+  if (stopped === 0) {
     console.log("No running daemons found.");
   }
 
