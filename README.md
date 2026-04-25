@@ -77,7 +77,11 @@ The setup wizard walks you through model, heartbeat, Telegram, Discord, and secu
 ### Communication
 - **Telegram:** Text, image, and voice support.
 - **Discord:** DMs, server mentions/replies, slash commands, voice messages, and image attachments.
+- **Slack:** DMs and channel mentions over Socket Mode. Supports thread sessions, file upload/download, Block Kit buttons, and message edit/delete.
+- **LINE:** DMs and group chats via Messaging API. Supports text/image/video/audio/file/sticker/location messages, group @mention gating, and per-stranger pairing-code self-enrollment.
 - **Time Awareness:** Message time prefixes help the agent understand delays and daily patterns.
+
+See [docs/LINE-GUIDE.md](docs/LINE-GUIDE.md) for the LINE setup walkthrough (channel access token, webhook URL, ngrok, multi-agent proxy, pairing code).
 
 ### Multi-Session Threads (Discord)
 - **Independent Thread Sessions:** Each Discord thread gets its own Claude CLI session, fully isolated from the main channel.
@@ -93,6 +97,21 @@ See [docs/MULTI_SESSION.md](docs/MULTI_SESSION.md) for technical details.
 - **Web Dashboard:** Manage jobs, monitor runs, and inspect logs in real time.
 - **Security Levels:** Four access levels from read-only to full system access.
 - **Model Selection:** Switch models based on your workload.
+
+### Multi-Agent Hub
+- **Single dashboard for many daemons.** One URL lists every ClaudeClaw agent registered on the host (alive or stopped) with start / stop / restart / "restart all" controls.
+- **Reverse proxy to per-daemon UIs.** Click an agent to see its full web UI without exposing each daemon's port.
+- **Bearer-token auth** (32-byte token, SHA-256 hashed at rest). Bind loopback by default; bind a Tailscale IP to share the dashboard with teammates.
+- **Mobile-friendly layout.**
+
+In Claude Code:
+
+```
+/claudeclaw:hub init           # generate token (one-time)
+/claudeclaw:hub start --detach # → http://127.0.0.1:4631
+```
+
+See [docs/HUB-GUIDE.md](docs/HUB-GUIDE.md) for full usage and [docs/HUB-INTERNALS.md](docs/HUB-INTERNALS.md) for architecture.
 
 ## FAQ
 

@@ -17,6 +17,22 @@
 
 ## 2. 測試前確認 cache 已同步最新檔案
 
-Plugin 真正執行的目錄是 `~/.claude/plugins/cache/claudeclaw/claudeclaw/<version>/`，**不是** marketplace 這份。Cache 由 Claude Code 系統管理，要等它同步完才會跑到最新改動。
+Plugin 真正執行的目錄是 `~/.claude/plugins/cache/claudeclaw/claudeclaw/<version>/`，**不是** marketplace 這份。**Cache 不維護 git，純粹是 marketplace 的檔案副本**。
 
-不要手動編輯 cache，會被覆蓋。所有開發都在 marketplace 進行。
+要同步：
+
+```bash
+rsync -a --delete \
+  --exclude=.git --exclude=node_modules \
+  --exclude=.claude --exclude=.codemachine --exclude=AGENTS.md \
+  ~/.claude/plugins/marketplaces/claudeclaw/ \
+  ~/.claude/plugins/cache/claudeclaw/claudeclaw/1.0.0/
+```
+
+不要在 cache 編輯（會被下次 rsync 覆蓋）。所有開發在 marketplace 進行，commit 之後跑 rsync 同步給 cache。
+
+**回報慣例**：對 marketplace 做改動 + rsync 後，回報訊息必須明確寫一句「已同步到 cache」。不要只把指令放在輸出裡讓 Tiger 自己看。
+
+## 3. Push 到 GitHub 前一律先確認
+
+任何 `git push`（包括新分支、fast-forward、`--force`、`--delete`）**必須先取得 Tiger 同意**才執行。本地 commit / merge / rebase 失敗可以 reset 救回；遠端 push 把穩定狀態覆蓋掉後就難救了。「整併好本地」不等於「可以推上 GitHub」，是兩個獨立的決定。
