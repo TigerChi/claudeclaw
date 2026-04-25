@@ -8,6 +8,7 @@ import { slack } from "./commands/slack";
 import { line } from "./commands/line";
 import { send } from "./commands/send";
 import { proxy } from "./commands/proxy";
+import { hub } from "./commands/hub";
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -36,6 +37,8 @@ if (command === "--stop-all") {
   send(args.slice(1));
 } else if (command === "proxy") {
   proxy(args.slice(1));
+} else if (command === "hub") {
+  hub(args.slice(1));
 } else {
   start();
 }

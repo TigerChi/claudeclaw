@@ -82,6 +82,60 @@ export async function restart() {
   console.log("Restarting...");
 }
 
+export interface StopByPathResult {
+  ok: boolean;
+  pid?: number;
+  reason?: "no-pid-file" | "already-dead" | "kill-failed";
+}
+
+/**
+ * Stop a daemon running in `projectPath`. Returns ok:true if a SIGTERM was
+ * delivered (or pid file removed). Used by `stopAll` and the hub control plane.
+ * Does NOT exit the process. Waits up to `waitMs` for the process to actually die.
+ */
+export async function stopByPath(projectPath: string, waitMs = 4000): Promise<StopByPathResult> {
+  const pidFile = join(projectPath, ".claude", "claudeclaw", "daemon.pid");
+
+  let pidStr: string;
+  try {
+    pidStr = (await readFile(pidFile, "utf-8")).trim();
+  } catch {
+    return { ok: false, reason: "no-pid-file" };
+  }
+  const pid = Number(pidStr);
+  if (!pid || isNaN(pid)) {
+    try { await unlink(pidFile); } catch {}
+    return { ok: false, reason: "no-pid-file" };
+  }
+
+  // Verify alive before SIGTERM
+  try {
+    process.kill(pid, 0);
+  } catch {
+    try { await unlink(pidFile); } catch {}
+    return { ok: false, pid, reason: "already-dead" };
+  }
+
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch {
+    return { ok: false, pid, reason: "kill-failed" };
+  }
+
+  // Wait for actual exit
+  const deadline = Date.now() + waitMs;
+  while (Date.now() < deadline) {
+    try {
+      process.kill(pid, 0);
+      await Bun.sleep(100);
+    } catch {
+      break;
+    }
+  }
+  try { await unlink(pidFile); } catch {}
+  return { ok: true, pid };
+}
+
 export async function stopAll() {
   const projectsDir = join(homedir(), ".claude", "projects");
   let dirs: string[];
@@ -95,23 +149,12 @@ export async function stopAll() {
   let found = 0;
   for (const dir of dirs) {
     const projectPath = "/" + dir.slice(1).replace(/-/g, "/");
-    const pidFile = join(projectPath, ".claude", "claudeclaw", "daemon.pid");
-
-    let pid: string;
-    try {
-      pid = (await readFile(pidFile, "utf-8")).trim();
-      process.kill(Number(pid), 0);
-    } catch {
-      continue;
-    }
-
-    found++;
-    try {
-      process.kill(Number(pid), "SIGTERM");
-      console.log(`\x1b[33m■ Stopped\x1b[0m PID ${pid} — ${projectPath}`);
-      try { await unlink(pidFile); } catch {}
-    } catch {
-      console.log(`\x1b[31m✗ Failed to stop\x1b[0m PID ${pid} — ${projectPath}`);
+    const result = await stopByPath(projectPath, 0);
+    if (result.ok) {
+      found++;
+      console.log(`\x1b[33m■ Stopped\x1b[0m PID ${result.pid} — ${projectPath}`);
+    } else if (result.reason === "kill-failed") {
+      console.log(`\x1b[31m✗ Failed to stop\x1b[0m PID ${result.pid} — ${projectPath}`);
     }
   }
 

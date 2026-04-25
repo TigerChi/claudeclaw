@@ -47,3 +47,29 @@ export async function cleanupPidFile(): Promise<void> {
     // already gone
   }
 }
+
+/**
+ * Read a PID file at `pidFile` and return the live PID, or null if the file
+ * is missing/unreadable or the process is dead. Cleans up stale files.
+ * Hub and registry use this to probe arbitrary project daemons.
+ */
+export async function checkPidAt(pidFile: string): Promise<number | null> {
+  let raw: string;
+  try {
+    raw = (await readFile(pidFile, "utf-8")).trim();
+  } catch {
+    return null;
+  }
+  const pid = Number(raw);
+  if (!pid || isNaN(pid)) {
+    try { await unlink(pidFile); } catch {}
+    return null;
+  }
+  try {
+    process.kill(pid, 0);
+    return pid;
+  } catch {
+    try { await unlink(pidFile); } catch {}
+    return null;
+  }
+}

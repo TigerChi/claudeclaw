@@ -1,4 +1,5 @@
 import { writeFile, unlink, mkdir } from "fs/promises";
+import { openSync } from "fs";
 import { join } from "path";
 import { fileURLToPath } from "url";
 import { run, runUserMessage, streamUserMessage, bootstrap, ensureProjectClaudeMd, loadHeartbeatPromptTemplate } from "../runner";
@@ -224,6 +225,7 @@ export async function start(args: string[] = []) {
   let debugFlag = false;
   let webFlag = false;
   let replaceExistingFlag = false;
+  let detachFlag = false;
   let webPortFlag: number | null = null;
   const payloadParts: string[] = [];
 
@@ -247,6 +249,8 @@ export async function start(args: string[] = []) {
       webFlag = true;
     } else if (arg === "--replace-existing") {
       replaceExistingFlag = true;
+    } else if (arg === "--detach") {
+      detachFlag = true;
     } else if (arg === "--web-port") {
       const raw = args[i + 1];
       if (!raw) {
@@ -266,7 +270,7 @@ export async function start(args: string[] = []) {
   }
   const payload = payloadParts.join(" ").trim();
   if (hasPromptFlag && !payload) {
-    console.error("Usage: claudeclaw start --prompt <prompt> [--trigger] [--telegram] [--discord] [--debug] [--web] [--web-port <port>] [--replace-existing]");
+    console.error("Usage: claudeclaw start --prompt <prompt> [--trigger] [--telegram] [--discord] [--debug] [--web] [--web-port <port>] [--detach] [--replace-existing]");
     process.exit(1);
   }
   if (!hasPromptFlag && payload) {
@@ -283,6 +287,10 @@ export async function start(args: string[] = []) {
   }
   if (hasPromptFlag && !hasTriggerFlag && (webFlag || webPortFlag !== null)) {
     console.error("`--web` is daemon-only. Remove `--prompt`, or add `--trigger`.");
+    process.exit(1);
+  }
+  if (hasPromptFlag && !hasTriggerFlag && detachFlag) {
+    console.error("`--detach` is daemon-only. Remove `--prompt`, or add `--trigger`.");
     process.exit(1);
   }
 
@@ -330,6 +338,24 @@ export async function start(args: string[] = []) {
     }
 
     await cleanupPidFile();
+  }
+
+  if (detachFlag && process.env.CLAUDECLAW_DETACHED !== "1") {
+    await mkdir(join(HEARTBEAT_DIR, "logs"), { recursive: true });
+    const logPath = join(HEARTBEAT_DIR, "logs", "daemon.log");
+    const logFd = openSync(logPath, "a");
+    const childArgs = process.argv.slice(1).filter((a) => a !== "--detach");
+    const proc = Bun.spawn([process.execPath, ...childArgs], {
+      cwd: process.cwd(),
+      stdin: "ignore",
+      stdout: logFd,
+      stderr: logFd,
+      env: { ...process.env, CLAUDECLAW_DETACHED: "1" },
+    });
+    proc.unref();
+    console.log(`ClaudeClaw daemon started in background (PID ${proc.pid})`);
+    console.log(`  Logs: ${logPath}`);
+    process.exit(0);
   }
 
   await initConfig();
