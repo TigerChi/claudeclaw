@@ -34,11 +34,16 @@ const PREFLIGHT_SCRIPT = fileURLToPath(new URL("../preflight.ts", import.meta.ur
 
 const STATUSLINE_SCRIPT = `#!/usr/bin/env node
 const { readFileSync } = require("fs");
-const { join } = require("path");
+const { join, basename } = require("path");
 
 const DIR = join(__dirname, "claudeclaw");
 const STATE_FILE = join(DIR, "state.json");
 const PID_FILE = join(DIR, "daemon.pid");
+
+// Project folder name — shown in the box header so multi-window users can tell
+// which Claude Code session belongs to which agent without scrolling up.
+var AGENT = basename(process.cwd());
+if (AGENT.length > 18) AGENT = AGENT.slice(0, 17) + "…";
 
 const R = "\\x1b[0m";
 const DIM = "\\x1b[2m";
@@ -69,8 +74,15 @@ var TR = DIM + "\\u256e" + R;
 var BL = DIM + "\\u2570" + R;
 var BR = DIM + "\\u256f" + R;
 var H = DIM + "\\u2500" + R;
-var HEADER = TL + H.repeat(6) + " \\ud83e\\udd9e ClaudeClaw \\ud83e\\udd9e " + H.repeat(6) + TR;
-var FOOTER = BL + H.repeat(30) + BR;
+// Visual width budget for the box: 30 H-equivalents. Each emoji ≈ 2 wide.
+// Inner content " 🦞 NAME 🦞 " visual width = 8 + AGENT.length.
+var TARGET = 30;
+var INNER = 8 + AGENT.length;
+var FILL = Math.max(2, TARGET - INNER);
+var FILL_L = Math.floor(FILL / 2);
+var FILL_R = FILL - FILL_L;
+var HEADER = TL + H.repeat(FILL_L) + " \\ud83e\\udd9e " + AGENT + " \\ud83e\\udd9e " + H.repeat(FILL_R) + TR;
+var FOOTER = BL + H.repeat(TARGET) + BR;
 
 if (!alive()) {
   process.stdout.write(
