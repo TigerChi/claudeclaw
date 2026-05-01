@@ -486,6 +486,42 @@ async function sendBlockKitMessage(
   return data?.ts ?? null;
 }
 
+/**
+ * Replace the actions block on an existing Block Kit message with a
+ * context block recording who clicked which button. This is what makes
+ * past button choices visible when scrolling back through a thread.
+ */
+async function freezeMessageWithChoice(
+  token: string,
+  channelId: string,
+  messageTs: string,
+  originalBlocks: any[] | undefined,
+  fallbackText: string,
+  userId: string,
+  choiceLabel: string,
+): Promise<void> {
+  const blocks = Array.isArray(originalBlocks) ? originalBlocks : [];
+  // Drop interactive blocks; keep section/context/header/divider/etc.
+  const kept = blocks.filter((b) => b?.type !== "actions");
+  kept.push({
+    type: "context",
+    elements: [
+      {
+        type: "mrkdwn",
+        text: `✅ <@${userId}> 已選擇：*${choiceLabel}*`,
+      },
+    ],
+  });
+  await slackApi(token, "chat.update", {
+    channel: channelId,
+    ts: messageTs,
+    text: fallbackText || "(updated)",
+    blocks: kept,
+  }).catch((err) => {
+    debugLog(`freezeMessageWithChoice failed: ${err instanceof Error ? err.message : err}`);
+  });
+}
+
 // --- #4: Edit/Delete directive extraction ---
 
 function extractEditDirective(text: string): {
@@ -908,34 +944,39 @@ async function handleMessage(event: SlackMessage): Promise<void> {
       threadHistoryLoaded.add(sessionThreadId);
     }
 
-    let imagePath: string | null = null;
-    let voicePath: string | null = null;
-    let voiceTranscript: string | null = null;
+    const imagePaths: string[] = [];
+    const voiceTranscripts: string[] = [];
     const docPaths: { path: string; name: string }[] = [];
 
     if (hasImage) {
-      try {
-        imagePath = await downloadSlackFile(config.botToken, imageFiles[0], "image");
-      } catch (err) {
-        console.error(`[Slack] Failed to download image: ${err instanceof Error ? err.message : err}`);
+      for (const imgFile of imageFiles) {
+        try {
+          const p = await downloadSlackFile(config.botToken, imgFile, "image");
+          if (p) imagePaths.push(p);
+        } catch (err) {
+          console.error(`[Slack] Failed to download image: ${err instanceof Error ? err.message : err}`);
+        }
       }
     }
 
     if (hasVoice) {
-      try {
-        voicePath = await downloadSlackFile(config.botToken, voiceFiles[0], "voice");
-      } catch (err) {
-        console.error(`[Slack] Failed to download voice: ${err instanceof Error ? err.message : err}`);
-      }
-
-      if (voicePath) {
+      for (const voiceFile of voiceFiles) {
+        let voicePath: string | null = null;
         try {
-          voiceTranscript = await transcribeAudioToText(voicePath, {
-            debug: slackDebug,
-            log: (msg) => debugLog(msg),
-          });
+          voicePath = await downloadSlackFile(config.botToken, voiceFile, "voice");
         } catch (err) {
-          console.error(`[Slack] Failed to transcribe voice: ${err instanceof Error ? err.message : err}`);
+          console.error(`[Slack] Failed to download voice: ${err instanceof Error ? err.message : err}`);
+        }
+        if (voicePath) {
+          try {
+            const transcript = await transcribeAudioToText(voicePath, {
+              debug: slackDebug,
+              log: (msg) => debugLog(msg),
+            });
+            if (transcript) voiceTranscripts.push(transcript);
+          } catch (err) {
+            console.error(`[Slack] Failed to transcribe voice: ${err instanceof Error ? err.message : err}`);
+          }
         }
       }
     }
@@ -984,15 +1025,24 @@ async function handleMessage(event: SlackMessage): Promise<void> {
     } else if (cleanText.trim()) {
       promptParts.push(`Message: ${cleanText}`);
     }
-    if (imagePath) {
-      promptParts.push(`Image path: ${imagePath}`);
-      promptParts.push("The user attached an image. Inspect this image file directly before answering.");
+    if (imagePaths.length > 0) {
+      for (const p of imagePaths) {
+        promptParts.push(`Image path: ${p}`);
+      }
+      const noun = imagePaths.length === 1 ? "an image" : `${imagePaths.length} images`;
+      const target = imagePaths.length === 1 ? "this image file" : "each of these image files";
+      promptParts.push(`The user attached ${noun}. Inspect ${target} directly before answering.`);
     } else if (hasImage) {
-      promptParts.push("The user attached an image, but downloading it failed. Respond and ask them to resend.");
+      promptParts.push("The user attached image(s), but downloading failed. Respond and ask them to resend.");
     }
-    if (voiceTranscript) {
-      promptParts.push(`Voice transcript: ${voiceTranscript}`);
+    if (voiceTranscripts.length === 1) {
+      promptParts.push(`Voice transcript: ${voiceTranscripts[0]}`);
       promptParts.push("The user attached voice audio. Use the transcript as their spoken message.");
+    } else if (voiceTranscripts.length > 1) {
+      voiceTranscripts.forEach((t, i) => {
+        promptParts.push(`Voice transcript ${i + 1}: ${t}`);
+      });
+      promptParts.push("The user attached multiple voice clips. Treat the transcripts in order as their spoken messages.");
     } else if (hasVoice) {
       promptParts.push("The user attached voice audio, but it could not be transcribed. Ask them to resend a clearer clip.");
     }
@@ -1258,6 +1308,25 @@ async function handleBlockAction(payload: any): Promise<void> {
   const label = action.type === "static_select"
     ? action.selected_option?.text?.text ?? value
     : value;
+
+  // Freeze the original button message so anyone scrolling back through the
+  // thread can see which option was picked and by whom. We do this before
+  // kicking off the Claude turn so the visual state is consistent even if
+  // the streaming reply takes a while to arrive.
+  const clickedMessageTs = (payload.message as { ts?: string } | undefined)?.ts;
+  const messageBlocks = (payload.message as any)?.blocks as any[] | undefined;
+  const messageFallbackText = (payload.message as { text?: string } | undefined)?.text ?? "";
+  if (clickedMessageTs) {
+    await freezeMessageWithChoice(
+      config.botToken,
+      channelId,
+      clickedMessageTs,
+      messageBlocks,
+      messageFallbackText,
+      user.id,
+      label,
+    );
+  }
 
   // Resolve thread context for session continuity.
   // message.thread_ts is the thread root (only present when the button message is inside a thread).
