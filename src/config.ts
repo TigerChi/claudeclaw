@@ -56,7 +56,16 @@ const DEFAULT_SETTINGS: Settings = {
     excludeWindows: [],
     forwardToTelegram: true,
   },
-  telegram: { token: "", allowedUserIds: [] },
+  telegram: {
+    token: "",
+    allowedUserIds: [],
+    pairing: {
+      enabled: false,
+      code: "",
+      welcomeMessage: "Hi! 我是受保護的 bot，請輸入配對碼以開始使用。",
+      successMessage: "✅ 配對成功，歡迎加入！現在可以開始對話了。",
+    },
+  },
   discord: { token: "", allowedUserIds: [], listenChannels: [] },
   slack: { botToken: "", appToken: "", allowedUserIds: [], listenChannels: [] },
   line: {
@@ -94,9 +103,18 @@ export interface HeartbeatConfig {
   forwardToTelegram: boolean;
 }
 
+export interface TelegramPairingConfig {
+  enabled: boolean;
+  code: string;
+  welcomeMessage: string;
+  successMessage: string;
+}
+
 export interface TelegramConfig {
   token: string;
   allowedUserIds: number[];
+  /** Pairing flow for unknown private-chat users — code-only, no need to look up Telegram numeric IDs by hand. */
+  pairing: TelegramPairingConfig;
 }
 
 export interface DiscordConfig {
@@ -326,6 +344,18 @@ function parseSettings(raw: Record<string, any>): Settings {
     telegram: {
       token: raw.telegram?.token ?? "",
       allowedUserIds: raw.telegram?.allowedUserIds ?? [],
+      pairing: {
+        enabled: Boolean(raw.telegram?.pairing?.enabled),
+        code: typeof raw.telegram?.pairing?.code === "string" ? raw.telegram.pairing.code : "",
+        welcomeMessage:
+          typeof raw.telegram?.pairing?.welcomeMessage === "string" && raw.telegram.pairing.welcomeMessage
+            ? raw.telegram.pairing.welcomeMessage
+            : "Hi! 我是受保護的 bot，請輸入配對碼以開始使用。",
+        successMessage:
+          typeof raw.telegram?.pairing?.successMessage === "string" && raw.telegram.pairing.successMessage
+            ? raw.telegram.pairing.successMessage
+            : "✅ 配對成功，歡迎加入！現在可以開始對話了。",
+      },
     },
     discord: {
       token: typeof raw.discord?.token === "string" ? raw.discord.token.trim() : "",
@@ -495,6 +525,19 @@ export async function addLineAllowedUser(userId: string): Promise<void> {
   raw.line.allowedUserIds.push(userId);
   await Bun.write(SETTINGS_FILE, JSON.stringify(raw, null, 2) + "\n");
   // Refresh in-memory cache so next message is authorized without waiting for hot-reload
+  await reloadSettings();
+}
+
+/** Telegram counterpart of addLineAllowedUser — used by the Telegram pairing flow. */
+export async function addTelegramAllowedUser(userId: number): Promise<void> {
+  if (!userId) return;
+  const rawText = await Bun.file(SETTINGS_FILE).text();
+  const raw = JSON.parse(rawText);
+  if (!raw.telegram) raw.telegram = {};
+  if (!Array.isArray(raw.telegram.allowedUserIds)) raw.telegram.allowedUserIds = [];
+  if (raw.telegram.allowedUserIds.includes(userId)) return;
+  raw.telegram.allowedUserIds.push(userId);
+  await Bun.write(SETTINGS_FILE, JSON.stringify(raw, null, 2) + "\n");
   await reloadSettings();
 }
 

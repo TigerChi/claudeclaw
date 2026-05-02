@@ -1,5 +1,5 @@
 import { ensureProjectClaudeMd, run, runUserMessage, compactCurrentSession } from "../runner";
-import { getSettings, loadSettings } from "../config";
+import { addTelegramAllowedUser, getSettings, loadSettings } from "../config";
 import { resetSession, peekSession } from "../sessions";
 import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
@@ -592,7 +592,40 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     `Handle message chat=${chatId} type=${chatType} from=${userId ?? "unknown"} reason=${triggerReason} text="${(text ?? "").slice(0, 80)}"`
   );
 
-  if (userId && config.allowedUserIds.length > 0 && !config.allowedUserIds.includes(userId)) {
+  // Authorization. Mirror the LINE design:
+  //
+  // Pairing flow triggers when a code is configured and the user isn't already
+  // on the allowlist — works even with empty allowedUserIds, so the operator
+  // never has to look up Telegram numeric IDs by hand.
+  //
+  // Without pairing configured, fall back to the classic allowlist behavior:
+  // empty list = allow all, non-empty = strict allowlist.
+  const hasPairing = config.pairing.enabled && Boolean(config.pairing.code);
+  const onAllowlist = userId !== undefined && config.allowedUserIds.includes(userId);
+
+  if (userId && hasPairing && !onAllowlist) {
+    if (isPrivate) {
+      const trimmed = (text ?? "").trim();
+      if (trimmed === config.pairing.code) {
+        try {
+          await addTelegramAllowedUser(userId);
+          console.log(`[${new Date().toLocaleTimeString()}] Telegram pairing success: ${userId}`);
+          await sendMessage(config.token, chatId, config.pairing.successMessage, threadId);
+        } catch (err) {
+          console.error(`[Telegram] Pairing persist failed for ${userId}: ${err instanceof Error ? err.message : err}`);
+          await sendMessage(config.token, chatId, "配對流程發生錯誤，請稍後再試。", threadId);
+        }
+      } else {
+        debugLog(`Telegram pairing prompt sent to ${userId} (input did not match code)`);
+        await sendMessage(config.token, chatId, config.pairing.welcomeMessage, threadId);
+      }
+      return;
+    }
+    debugLog(`Telegram unauthorized non-private user ${userId} (pairing only via private chat)`);
+    return;
+  }
+
+  if (userId && config.allowedUserIds.length > 0 && !onAllowlist) {
     if (isPrivate) {
       await sendMessage(config.token, chatId, "Unauthorized.");
     } else {

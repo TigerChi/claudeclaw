@@ -420,15 +420,20 @@ async function handleMessageEvent(event: LineMessageEvent): Promise<void> {
   // Track DM users for forwarding (push API)
   if (!isGroup) trackKnownUser(userId);
 
-  // Authorization check
-  if (config.allowedUserIds.length > 0 && !config.allowedUserIds.includes(userId)) {
-    // Pairing flow: only for DM text messages, only when pairing is enabled with a code set
-    if (
-      !isGroup &&
-      event.message.type === "text" &&
-      config.pairing.enabled &&
-      config.pairing.code
-    ) {
+  // Authorization check.
+  //
+  // Pairing flow triggers when there's a pairing code set and the user isn't
+  // already on the allowlist — this is the primary way to add users. It works
+  // even with an empty `allowedUserIds`, supporting "pairing-only" setups
+  // where the operator never has to look up LINE User IDs by hand.
+  //
+  // If pairing isn't configured, fall back to the classic allowlist behavior:
+  // empty list = allow all, non-empty = strict allowlist.
+  const hasPairing = config.pairing.enabled && Boolean(config.pairing.code);
+  const onAllowlist = config.allowedUserIds.includes(userId);
+
+  if (hasPairing && !onAllowlist) {
+    if (!isGroup && event.message.type === "text") {
       const text = (event.message.text ?? "").trim();
       if (text === config.pairing.code) {
         try {
@@ -445,6 +450,11 @@ async function handleMessageEvent(event: LineMessageEvent): Promise<void> {
       }
       return;
     }
+    debugLog(`Unauthorized user (no pairing channel for groups/non-text): ${userId}`);
+    return;
+  }
+
+  if (config.allowedUserIds.length > 0 && !onAllowlist) {
     debugLog(`Unauthorized user: ${userId}`);
     return;
   }
