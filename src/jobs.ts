@@ -3,13 +3,19 @@ import { join } from "path";
 
 const JOBS_DIR = join(process.cwd(), ".claude", "claudeclaw", "jobs");
 
+export type Channel = "telegram" | "discord" | "slack" | "line";
+
 export interface Job {
   name: string;
   schedule: string;
   prompt: string;
   recurring: boolean;
   notify: true | false | "error";
+  /** Channels to forward to. Empty = broadcast to all enabled channels (legacy behavior). */
+  channels: Channel[];
 }
+
+const KNOWN_CHANNELS: Channel[] = ["telegram", "discord", "slack", "line"];
 
 function parseFrontmatterValue(raw: string): string {
   return raw.trim().replace(/^["']|["']$/g, "");
@@ -51,7 +57,19 @@ function parseJobFile(name: string, content: string): Job | null {
     : notifyRaw === "error" ? "error"
     : true;
 
-  return { name, schedule, prompt, recurring, notify };
+  const channelsLine = lines.find((l) => l.startsWith("channels:"));
+  const channelsRaw = channelsLine
+    ? parseFrontmatterValue(channelsLine.replace("channels:", "")).toLowerCase()
+    : "";
+  const channels: Channel[] =
+    channelsRaw === "" || channelsRaw === "all"
+      ? []
+      : channelsRaw
+          .split(",")
+          .map((c) => c.trim())
+          .filter((c): c is Channel => (KNOWN_CHANNELS as string[]).includes(c));
+
+  return { name, schedule, prompt, recurring, notify, channels };
 }
 
 export async function loadJobs(): Promise<Job[]> {

@@ -30,15 +30,21 @@ Create a new cron job interactively.
 2. Then ask:
    - "What prompt should Claude execute?" (header: "Prompt", options: suggest 2-3 prompts relevant to the project context)
 
-3. Create the job file at `.claude/claudeclaw/jobs/<name>.md` with this exact format:
+3. Optionally ask which channel(s) the job should notify:
+   - "Where should results be sent?" (header: "Channels", options: "All enabled (default)", "telegram", "slack", "line", "discord", "Multiple — let me specify")
+   - For "Multiple", accept a comma-separated list (e.g. `line,slack`).
+
+4. Create the job file at `.claude/claudeclaw/jobs/<name>.md` with this exact format:
    ```markdown
    ---
    schedule: "<cron expression>"
+   channels: "<comma-separated, optional>"
    ---
    <prompt>
    ```
+   Omit `channels:` (or set `all`) to broadcast to every enabled channel — that is the legacy default.
 
-4. Confirm creation. Remind the user the daemon hot-reloads jobs every 30 seconds — no restart needed.
+5. Confirm creation. Remind the user the daemon hot-reloads jobs every 30 seconds — no restart needed.
 
 ### `edit <job-name>`
 
@@ -86,9 +92,12 @@ Jobs live in `.claude/claudeclaw/jobs/` as markdown files:
 ---
 schedule: "0 9 * * *"
 recurring: true
+channels: line,slack
 ---
 Your prompt here. Claude will run this at the scheduled time.
 ```
+
+**`channels`**: comma-separated list of `telegram`, `discord`, `slack`, `line`. Omit (or `all`) to broadcast to every enabled channel — the legacy default. Use this to keep noisy jobs out of channels they don't belong in.
 
 **Cron syntax**: `minute hour day-of-month month day-of-week`
 
