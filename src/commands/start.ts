@@ -947,10 +947,12 @@ export async function start(args: string[] = []) {
           .then((r) => {
               if (job.notify === false) return;
             if (job.notify === "error" && r.exitCode === 0) return;
-            forwardToTelegram(job.name, r);
-            forwardToDiscord(job.name, r);
-            forwardToSlack(job.name, r);
-            forwardToLine(job.name, r);
+            const wantAll = job.channels.length === 0;
+            const want = (c: string) => wantAll || job.channels.includes(c as never);
+            if (want("telegram")) forwardToTelegram(job.name, r);
+            if (want("discord")) forwardToDiscord(job.name, r);
+            if (want("slack")) forwardToSlack(job.name, r);
+            if (want("line")) forwardToLine(job.name, r);
           })
           .finally(async () => {
             if (job.recurring) return;
