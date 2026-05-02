@@ -101,6 +101,28 @@ function computeBackoff(policy: BackoffPolicy, attempt: number): number {
   return Math.min(policy.maxMs, Math.round(base + jitter));
 }
 
+/**
+ * Wait until the current ws is fully CLOSED (or null).
+ * Prevents stale-socket race when reopening — Slack server needs the previous
+ * socket truly torn down before it'll accept a new one without too_many_websockets.
+ */
+function waitForWsClosed(timeoutMs = 3_000): Promise<void> {
+  return new Promise((resolve) => {
+    if (!ws || ws.readyState === WebSocket.CLOSED) { resolve(); return; }
+    const target = ws;
+    const timer = setTimeout(() => {
+      target.removeEventListener("close", onClose);
+      resolve();
+    }, timeoutMs);
+    function onClose() { clearTimeout(timer); resolve(); }
+    target.addEventListener("close", onClose, { once: true });
+    // Best-effort nudge if it's lingering open
+    if (target.readyState === WebSocket.OPEN || target.readyState === WebSocket.CONNECTING) {
+      try { target.close(1000, "Cleanup before reconnect"); } catch { /* best-effort */ }
+    }
+  });
+}
+
 function sleepWithAbort(ms: number, signal?: AbortSignal): Promise<void> {
   if (ms <= 0) return Promise.resolve();
   return new Promise((resolve, reject) => {
@@ -1809,6 +1831,21 @@ async function socketLoop(appToken: string, signal: AbortSignal): Promise<void> 
         reconnectAttempts = 0;
       }
 
+      // too_many_websockets: Slack server still tracks a stale socket from us.
+      // No amount of fast retrying will help — wait for server-side GC, don't
+      // burn the retry budget. (See issue #1.)
+      const isTooManyWs = disconnect.code === 4200
+        || (disconnect.reason ?? "").includes("too_many_websockets");
+
+      if (isTooManyWs) {
+        const delayMs = 5 * 60_000 + Math.round(Math.random() * 60_000); // 5–6 min
+        console.log(`[Slack] too_many_websockets — Slack server still has a stale slot, waiting ${Math.round(delayMs / 1000)}s before retry (no attempt counter)`);
+        // Wait for previous ws to fully close before next attempt
+        await waitForWsClosed();
+        try { await sleepWithAbort(delayMs, signal); } catch { break; }
+        continue;
+      }
+
       reconnectAttempts++;
       if (RECONNECT_POLICY.maxAttempts > 0 && reconnectAttempts >= RECONNECT_POLICY.maxAttempts) {
         console.error(`[Slack] Max reconnect attempts (${RECONNECT_POLICY.maxAttempts}) reached, giving up`);
@@ -1824,6 +1861,8 @@ async function socketLoop(appToken: string, signal: AbortSignal): Promise<void> 
       const reason = disconnect.reason || disconnect.event;
       console.log(`[Slack] Disconnected (${reason}), reconnecting in ${Math.round(delayMs / 1000)}s (attempt ${reconnectAttempts}/${RECONNECT_POLICY.maxAttempts}, alive ${Math.round(connectionDuration / 1000)}s)`);
 
+      // Ensure previous ws is fully closed before opening a new one
+      await waitForWsClosed();
       try { await sleepWithAbort(delayMs, signal); } catch { break; }
     } catch (err) {
       if (signal.aborted) break;
@@ -1869,6 +1908,21 @@ export function stopSlack(): void {
     try { ws.close(1000, "Stop requested"); } catch { /* best-effort */ }
     ws = null;
   }
+}
+
+/**
+ * Async stop: close ws gracefully and wait for the close frame to be flushed
+ * before resolving. Prevents Slack server from holding a stale slot, which
+ * would cause too_many_websockets on the next startup. (See issue #1.)
+ */
+export async function stopSlackGraceful(timeoutMs = 2_000): Promise<void> {
+  if (abortController) {
+    abortController.abort();
+    abortController = null;
+  }
+  if (proactiveTimer) { clearTimeout(proactiveTimer); proactiveTimer = null; }
+  await waitForWsClosed(timeoutMs);
+  ws = null;
 }
 
 export function startSlack(debug = false): void {
@@ -1917,8 +1971,11 @@ export function startSlack(debug = false): void {
   });
 }
 
-process.on("SIGTERM", () => stopSlack());
-process.on("SIGINT", () => stopSlack());
+// Standalone-mode shutdown: graceful close so Slack server releases the slot
+// immediately, preventing too_many_websockets on next start. (See issue #1.)
+// Daemon mode has its own shutdown handler in start.ts that does the same.
+process.on("SIGTERM", () => { void stopSlackGraceful(); });
+process.on("SIGINT", () => { void stopSlackGraceful(); });
 
 /** Standalone entry point (bun run src/index.ts slack) */
 export async function slack(): Promise<void> {

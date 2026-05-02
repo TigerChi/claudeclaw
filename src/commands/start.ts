@@ -383,12 +383,12 @@ export async function start(args: string[] = []) {
   await registerDaemon();
   let web: WebServerHandle | null = null;
   let discordStopGateway: (() => void) | null = null;
-  let slackStop: (() => void) | null = null;
+  let slackStop: (() => void | Promise<void>) | null = null;
   let lineStop: (() => void) | null = null;
 
   async function shutdown() {
     if (discordStopGateway) discordStopGateway();
-    if (slackStop) slackStop();
+    if (slackStop) await slackStop();
     if (lineStop) lineStop();
     if (web) web.stop();
     // Agent Bus cleanup
@@ -476,15 +476,15 @@ export async function start(args: string[] = []) {
 
   async function initSlack(botToken: string) {
     if (botToken && botToken !== slackBotToken) {
-      const { startSlack, sendMessageToUser: slackSend, stopSlack } = await import("./slack");
+      const { startSlack, sendMessageToUser: slackSend, stopSlack, stopSlackGraceful } = await import("./slack");
       if (slackBotToken) stopSlack();
       startSlack(debugFlag);
-      slackStop = stopSlack;
+      slackStop = stopSlackGraceful;
       slackSendToUser = (userId, text) => slackSend(botToken, userId, text);
       slackBotToken = botToken;
       console.log(`[${ts()}] Slack: enabled`);
     } else if (!botToken && slackBotToken) {
-      if (slackStop) slackStop();
+      if (slackStop) await slackStop();
       slackStop = null;
       slackSendToUser = null;
       slackBotToken = "";
