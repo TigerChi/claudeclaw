@@ -83,6 +83,10 @@ The setup wizard walks you through model, heartbeat, Telegram, Discord, and secu
 
 See [docs/LINE-GUIDE.md](docs/LINE-GUIDE.md) for the LINE setup walkthrough (channel access token, webhook URL, ngrok, multi-agent proxy, pairing code).
 
+For the side-by-side access-control comparison across all four messaging platforms (allowlist, pairing, mention/reply triggers, listen channels, plus the roadmap for unifying them), see [docs/Channel_Guide.md](docs/Channel_Guide.md).
+
+For commands you can send to the bot from inside a chat (`/cancel` to stop the current reply, message queueing behavior, etc.), see [docs/CHAT-COMMANDS.md](docs/CHAT-COMMANDS.md).
+
 ### Multi-Session Threads (Discord)
 - **Independent Thread Sessions:** Each Discord thread gets its own Claude CLI session, fully isolated from the main channel.
 - **Parallel Processing:** Thread conversations run concurrently — messages in different threads don't block each other.
