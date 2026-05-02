@@ -1,4 +1,5 @@
 import { openSync } from "fs";
+import { createInterface } from "readline";
 import { startHubServer } from "../hub/server";
 import {
   HUB_LOG_FILE,
@@ -14,18 +15,81 @@ import { hasAuth, initAuth, rotateAuth } from "../hub/auth";
 import { listAgents, findAgentById, findAgentByPath } from "../hub/registry";
 import { spawnDetachedDaemon } from "../hub/spawn";
 import { stopByPath } from "./stop";
+import {
+  enableAutostart,
+  disableAutostart,
+  isAutostartEnabled,
+  isMacOS,
+} from "../hub/autostart";
 
 function printUsage() {
-  console.error(
-    `Usage: claudeclaw hub <subcommand> [options]
-  init                       Generate a Bearer token (printed once)
-  start [--detach] [--host H] [--port P]   Start the hub daemon
-  stop                       Stop the hub daemon
-  status                     Show hub status
-  token --rotate             Generate a new token (revokes old)
-  restart <agent-id|path>    Restart a project daemon
-`
-  );
+  const COL_L = 35;
+  const COL_R = 55;
+  const dash = (n: number) => "─".repeat(n);
+  const top = "┌" + dash(COL_L + 2) + "┬" + dash(COL_R + 2) + "┐";
+  const sep = "├" + dash(COL_L + 2) + "┼" + dash(COL_R + 2) + "┤";
+  const bot = "└" + dash(COL_L + 2) + "┴" + dash(COL_R + 2) + "┘";
+  const row = (l: string, r: string) => `│ ${l.padEnd(COL_L)} │ ${r.padEnd(COL_R)} │`;
+
+  const rows: Array<[string, string]> = [
+    ["Subcommand", "What it does"],
+    ["(no args)", "Detect: print status if running, start --detach if not"],
+    ["status", "Show hub PID, URL, auth, autostart, agents"],
+    ["start [--detach --host --port]", "Start the hub (auto-inits token on first run)"],
+    ["stop", "Stop the hub"],
+    ["init [--force]", "Manually generate bearer token (rarely needed)"],
+    ["token --rotate", "Replace the current token (revokes old)"],
+    ["restart <agent-id|path>", "Restart a registered daemon"],
+    ["autostart <enable|disable|status>", "Manage launch-on-login (macOS only)"],
+  ];
+
+  console.log(top);
+  rows.forEach(([l, r], i) => {
+    console.log(row(l, r));
+    if (i < rows.length - 1) console.log(sep);
+  });
+  console.log(bot);
+  console.log("");
+  console.log("Typical first-time flow:");
+  console.log("  /claudeclaw:hub             → auto-inits token, asks about autostart, starts hub");
+  console.log("  open http://127.0.0.1:4631  → paste the bearer token");
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function promptYesNo(question: string): Promise<boolean> {
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise((resolve) => {
+    rl.question(question, (answer) => {
+      rl.close();
+      const a = answer.trim().toLowerCase();
+      resolve(a === "y" || a === "yes");
+    });
+  });
+}
+
+async function maybePromptAutostart() {
+  if (!isMacOS()) return;
+  if (await isAutostartEnabled()) return;
+  if (process.stdin.isTTY) {
+    const yes = await promptYesNo("\n要把 hub 設定為開機自動啟動嗎? (autostart) [y/N]: ");
+    if (yes) {
+      const r = await enableAutostart();
+      if (r.ok) console.log("✓ Autostart enabled. Hub will launch on login.\n");
+      else console.error(`✗ Autostart enable failed: ${r.reason}\n`);
+    }
+  } else {
+    // Non-TTY (e.g. via slash command). Slash command (.md) instructs Claude
+    // to ask the user separately and then run `hub autostart enable` on yes.
+    console.log("To enable launch-on-login later: claudeclaw hub autostart enable\n");
+  }
 }
 
 async function cmdInit(args: string[]) {
@@ -42,6 +106,7 @@ async function cmdInit(args: string[]) {
   console.log("    " + token);
   console.log("");
   console.log("  Use header `Authorization: Bearer <token>` for /api/* requests.");
+  await maybePromptAutostart();
 }
 
 async function cmdToken(args: string[]) {
@@ -76,22 +141,45 @@ async function cmdStart(args: string[]) {
   }
 
   await ensureHubDir();
+
+  // Already running → degrade to status + usage. Lets `claudeclaw hub` (or
+  // `/claudeclaw:hub`) be a single ergonomic entry point: start when stopped,
+  // status (with help) when already up.
+  // Verify the PID is actually alive — stale pid files (after crash, kill -9,
+  // or reboot) would otherwise misreport "running" forever.
+  const existing = await readHubPid();
+  if (existing) {
+    if (isProcessAlive(existing)) {
+      await cmdStatus();
+      return;
+    }
+    // Stale pid file. Clean up and continue with normal start.
+    await cleanupHubPid();
+  }
+
   const cfg = await readHubConfig();
   const finalHost = host ?? cfg.host;
   const finalPort = port ?? cfg.port;
 
-  // Persist explicit overrides for next run
   if (host !== null || port !== null) {
     await writeHubConfig({ host: finalHost, port: finalPort });
   }
 
+  // Auto-init bearer token on first ever run.
+  if (!(await hasAuth())) {
+    const token = await initAuth();
+    console.log("ClaudeClaw Hub auth initialized.");
+    console.log("");
+    console.log("  Bearer token (copy now — you won't see this again):");
+    console.log("");
+    console.log("    " + token);
+    console.log("");
+    console.log("  Use header `Authorization: Bearer <token>` for /api/* requests.");
+    console.log("");
+    await maybePromptAutostart();
+  }
+
   if (finalHost !== "127.0.0.1" && finalHost !== "::1" && finalHost !== "localhost") {
-    if (!(await hasAuth())) {
-      console.error(
-        "Refusing to bind non-loopback host without auth configured. Run `claudeclaw hub init` first."
-      );
-      process.exit(1);
-    }
     console.warn(
       `Warning: hub is binding ${finalHost}. Bearer token alone is NOT confidential over plain HTTP.\n` +
         `         Front the hub with TLS (caddy, nginx, traefik) before exposing it remotely.`
@@ -114,12 +202,6 @@ async function cmdStart(args: string[]) {
     process.exit(0);
   }
 
-  const existing = await readHubPid();
-  if (existing) {
-    console.error(`Hub already running (PID ${existing}). Use \`claudeclaw hub stop\` first.`);
-    process.exit(1);
-  }
-
   const handle = startHubServer({ host: finalHost, port: finalPort });
   await writeHubPid(process.pid, handle.port);
 
@@ -133,13 +215,17 @@ async function cmdStart(args: string[]) {
 
   console.log(`ClaudeClaw Hub listening on http://${handle.host}:${handle.port}`);
   console.log(`  PID: ${process.pid}`);
-  console.log(`  Auth: ${(await hasAuth()) ? "configured" : "NOT CONFIGURED — run `claudeclaw hub init`"}`);
 }
 
 async function cmdStop() {
   const pid = await readHubPid();
   if (!pid) {
     console.log("Hub is not running.");
+    await cleanupHubPid();
+    return;
+  }
+  if (!isProcessAlive(pid)) {
+    console.log(`Hub process ${pid} already dead. Cleaning up pid file.`);
     await cleanupHubPid();
     return;
   }
@@ -162,6 +248,9 @@ async function cmdStatus() {
     console.log("\x1b[31m○ Hub is not running\x1b[0m");
   }
   console.log(`  Auth: ${(await hasAuth()) ? "configured" : "not configured"}`);
+  if (isMacOS()) {
+    console.log(`  Autostart: ${(await isAutostartEnabled()) ? "enabled" : "disabled"}`);
+  }
   console.log("");
   const agents = await listAgents();
   console.log(`Discovered agents (${agents.length}):`);
@@ -170,6 +259,40 @@ async function cmdStatus() {
     const sub = a.alive ? `PID ${a.pid}` + (a.web ? ` :${a.web.port}` : "") : "stopped";
     console.log(`  ${dot} ${a.path} — ${sub}`);
   }
+  console.log("");
+  printUsage();
+}
+
+async function cmdAutostart(args: string[]) {
+  const sub = args[0] ?? "status";
+  if (sub === "enable") {
+    const r = await enableAutostart();
+    if (!r.ok) {
+      console.error(r.reason);
+      process.exit(1);
+    }
+    console.log("Autostart enabled. Hub will launch on login.");
+    return;
+  }
+  if (sub === "disable") {
+    const r = await disableAutostart();
+    if (!r.ok) {
+      console.error(r.reason);
+      process.exit(1);
+    }
+    console.log("Autostart disabled.");
+    return;
+  }
+  if (sub === "status") {
+    if (!isMacOS()) {
+      console.log("Autostart: not supported on this platform (macOS only).");
+      return;
+    }
+    console.log(`Autostart: ${(await isAutostartEnabled()) ? "enabled" : "disabled"}`);
+    return;
+  }
+  console.error("Usage: claudeclaw hub autostart <enable|disable|status>");
+  process.exit(1);
 }
 
 async function cmdRestart(args: string[]) {
@@ -199,9 +322,10 @@ async function cmdRestart(args: string[]) {
 
 export async function hub(args: string[]) {
   const sub = args[0];
+  // No subcommand → default to `start`. cmdStart auto-handles already-running
+  // (prints status + usage) and missing auth (auto-init).
   if (!sub) {
-    printUsage();
-    process.exit(1);
+    return cmdStart([]);
   }
   const rest = args.slice(1);
   switch (sub) {
@@ -217,7 +341,10 @@ export async function hub(args: string[]) {
       return cmdToken(rest);
     case "restart":
       return cmdRestart(rest);
+    case "autostart":
+      return cmdAutostart(rest);
     default:
+      console.error(`Unknown subcommand: ${sub}`);
       printUsage();
       process.exit(1);
   }

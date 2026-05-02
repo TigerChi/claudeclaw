@@ -114,6 +114,16 @@ export function hubPage(): string {
     code { background: #0d1117; padding: 2px 6px; border-radius: 4px; }
     .toolbar { margin-bottom: 12px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
     button[disabled] { opacity: 0.5; cursor: not-allowed; }
+    .pair-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .pair-code {
+      background: #161b22;
+      padding: 2px 8px;
+      border-radius: 3px;
+      font-size: 13px;
+      color: #58a6ff;
+      letter-spacing: 0.5px;
+    }
+    .copy-btn { font-size: 11px; padding: 2px 10px; }
     .action-msg {
       padding: 5px 10px;
       border-radius: 6px;
@@ -239,6 +249,11 @@ export function hubPage(): string {
     }
 
     async function actOnAgent(id, action, btn) {
+      if (action === "copy-pair") {
+        const text = btn ? btn.getAttribute("data-text") : "";
+        await copyText(text, "✓ Pair code copied", "Copy your LINE pair code:");
+        return;
+      }
       const verb = action === "stop" ? "Stopping…" : action === "start" ? "Starting…" : "Restarting…";
       const orig = btn ? btn.textContent : "";
       // Disable all toolbar buttons while one is in flight
@@ -335,32 +350,35 @@ export function hubPage(): string {
       }
     }
 
-    async function copyToken() {
-      const token = state.token;
-      if (!token) return;
-      // Modern API requires secure context (https or localhost). Tailscale plain
-      // HTTP is not "secure" so we always provide a fallback.
+    // Modern Clipboard API requires a secure context (https or localhost).
+    // Tailscale plain HTTP isn't "secure" so we always carry a textarea
+    // fallback, with window.prompt as a last-resort manual-copy.
+    async function copyText(text, successMsg, promptLabel) {
+      if (!text) return;
       try {
         if (navigator.clipboard && window.isSecureContext) {
-          await navigator.clipboard.writeText(token);
-          showHeaderMsg("✓ Token copied");
+          await navigator.clipboard.writeText(text);
+          showHeaderMsg(successMsg);
           return;
         }
       } catch (e) { /* fall through */ }
       try {
         const ta = document.createElement("textarea");
-        ta.value = token;
+        ta.value = text;
         ta.style.position = "fixed";
         ta.style.left = "-9999px";
         document.body.appendChild(ta);
         ta.select();
         document.execCommand("copy");
         document.body.removeChild(ta);
-        showHeaderMsg("✓ Token copied");
+        showHeaderMsg(successMsg);
       } catch (e) {
-        // Last resort: show it so user can copy manually
-        window.prompt("Copy your hub token:", token);
+        window.prompt(promptLabel, text);
       }
+    }
+
+    async function copyToken() {
+      await copyText(state.token, "✓ Token copied", "Copy your hub token:");
     }
 
     function fmtCountdown(ms) {
@@ -449,6 +467,24 @@ export function hubPage(): string {
           row("Started", agent.startedAt ? new Date(agent.startedAt).toLocaleString() : "—") +
           '</div>';
 
+        if (agent.linePairing) {
+          const lp = agent.linePairing;
+          const codeAttr = escapeAttr(lp.code);
+          const codeHtml = escapeAttr(lp.code);
+          const portPart = lp.webhookPort ? ":" + lp.webhookPort : "";
+          const webhook = portPart + escapeAttr(lp.webhookPath || "");
+          detail +=
+            '<div class="panel"><h3>LINE Pairing</h3>' +
+            '<div class="row"><div class="label">Code</div>' +
+              '<div class="value pair-line">' +
+                '<code class="pair-code">' + codeHtml + '</code>' +
+                '<button class="copy-btn" data-act="copy-pair" data-id="' + agent.id + '" data-text="' + codeAttr + '">Copy</button>' +
+              '</div>' +
+            '</div>' +
+            (webhook ? row("Webhook", '<code>' + webhook + '</code>') : "") +
+            '</div>';
+        }
+
         if (agentState) {
           const sec = agentState.security ? agentState.security.level || agentState.security : "";
           const hb = agentState.heartbeat;
@@ -531,6 +567,14 @@ export function hubPage(): string {
 
     function row(label, value) {
       return '<div class="row"><div class="label">' + label + '</div><div class="value">' + value + '</div></div>';
+    }
+
+    function escapeAttr(s) {
+      return String(s)
+        .replace(/&/g, "&amp;")
+        .replace(/"/g, "&quot;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
     }
 
     if (state.token) refreshAgents();
