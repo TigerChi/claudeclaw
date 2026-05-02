@@ -102,6 +102,39 @@ function enqueue<T>(fn: () => Promise<T>, threadId?: string): Promise<T> {
   return task;
 }
 
+// --- Cancel registry: per-key in-flight AbortController ---
+// Lets channel handlers cancel an in-flight Claude run via /cancel.
+// Key: threadId for thread-bound runs, "global" for non-thread runs.
+const inflightAborts = new Map<string, AbortController>();
+
+function registerInflight(key: string, ac: AbortController) {
+  inflightAborts.set(key, ac);
+}
+
+function clearInflight(key: string, ac: AbortController) {
+  // Only clear if the registered controller is still ours (avoids races)
+  if (inflightAborts.get(key) === ac) inflightAborts.delete(key);
+}
+
+/**
+ * Cancel the in-flight Claude run for the given key (threadId or "global").
+ * Returns true if a run was cancelled, false if nothing was in-flight.
+ * Does NOT clear queued-but-not-yet-started runs after this one.
+ */
+export function cancelThread(threadId?: string): boolean {
+  const key = threadId ?? "global";
+  const ac = inflightAborts.get(key);
+  if (!ac) return false;
+  try { ac.abort(); } catch {}
+  inflightAborts.delete(key);
+  return true;
+}
+
+/** Whether a Claude run is currently in-flight for the given key. */
+export function isInflight(threadId?: string): boolean {
+  return inflightAborts.has(threadId ?? "global");
+}
+
 function extractRateLimitMessage(stdout: string, stderr: string): string | null {
   const candidates = [stdout, stderr];
   for (const text of candidates) {
@@ -149,7 +182,8 @@ async function runClaudeOnce(
   model: string,
   api: string,
   baseEnv: Record<string, string>,
-  timeoutMs: number = CLAUDE_TIMEOUT_MS
+  timeoutMs: number = CLAUDE_TIMEOUT_MS,
+  abortSignal?: AbortSignal
 ): Promise<{ rawStdout: string; stderr: string; exitCode: number }> {
   const args = [...baseArgs];
   const normalizedModel = model.trim().toLowerCase();
@@ -161,8 +195,22 @@ async function runClaudeOnce(
     env: buildChildEnv(baseEnv, model, api),
   });
 
+  // External cancel via /cancel: kill the subprocess
+  const onAbort = () => {
+    try { proc.kill("SIGTERM"); } catch {}
+    setTimeout(() => { try { proc.kill("SIGKILL"); } catch {} }, 2000);
+  };
+  if (abortSignal) {
+    if (abortSignal.aborted) onAbort();
+    else abortSignal.addEventListener("abort", onAbort, { once: true });
+  }
+
   const timeoutPromise = new Promise<never>((_, reject) => {
     setTimeout(() => reject(new Error(`Claude session timed out after ${timeoutMs / 1000}s`)), timeoutMs);
+  });
+  const abortPromise = new Promise<never>((_, reject) => {
+    if (!abortSignal) return;
+    abortSignal.addEventListener("abort", () => reject(new Error("Cancelled by user")), { once: true });
   });
 
   try {
@@ -172,6 +220,7 @@ async function runClaudeOnce(
         new Response(proc.stderr).text(),
       ]),
       timeoutPromise,
+      abortPromise,
     ]) as [string, string];
     await proc.exited;
 
@@ -191,8 +240,10 @@ async function runClaudeOnce(
     return {
       rawStdout: "",
       stderr: message,
-      exitCode: 124,
+      exitCode: abortSignal?.aborted ? 130 : 124,  // 130 = cancelled, 124 = timeout
     };
+  } finally {
+    if (abortSignal) abortSignal.removeEventListener("abort", onAbort);
   }
 }
 
@@ -369,6 +420,19 @@ export async function compactCurrentSession(): Promise<{ success: boolean; messa
 }
 
 async function execClaude(name: string, prompt: string, threadId?: string): Promise<RunResult> {
+  // Register abortController so /cancel can kill this run
+  const cancelKey = threadId ?? "global";
+  const abortController = new AbortController();
+  registerInflight(cancelKey, abortController);
+
+  try {
+    return await execClaudeImpl(name, prompt, threadId, abortController);
+  } finally {
+    clearInflight(cancelKey, abortController);
+  }
+}
+
+async function execClaudeImpl(name: string, prompt: string, threadId: string | undefined, abortController: AbortController): Promise<RunResult> {
   await mkdir(LOGS_DIR, { recursive: true });
 
   const existing = threadId
@@ -486,15 +550,15 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
   const { CLAUDECODE: _, ...cleanEnv } = process.env;
   const baseEnv = { ...cleanEnv } as Record<string, string>;
 
-  let exec = await runClaudeOnce(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs);
+  let exec = await runClaudeOnce(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs, abortController.signal);
   const primaryRateLimit = extractRateLimitMessage(exec.rawStdout, exec.stderr);
   let usedFallback = false;
 
-  if (primaryRateLimit && hasModelConfig(fallbackConfig) && !sameModelConfig(primaryConfig, fallbackConfig)) {
+  if (primaryRateLimit && hasModelConfig(fallbackConfig) && !sameModelConfig(primaryConfig, fallbackConfig) && !abortController.signal.aborted) {
     console.warn(
       `[${new Date().toLocaleTimeString()}] Claude limit reached; retrying with fallback${fallbackConfig.model ? ` (${fallbackConfig.model})` : ""}...`
     );
-    exec = await runClaudeOnce(args, fallbackConfig.model, fallbackConfig.api, baseEnv, timeoutMs);
+    exec = await runClaudeOnce(args, fallbackConfig.model, fallbackConfig.api, baseEnv, timeoutMs, abortController.signal);
     usedFallback = true;
   }
 
@@ -634,6 +698,8 @@ async function streamClaude(
   threadId?: string,
   onResult?: (text: string) => void,
 ): Promise<void> {
+  // Register this run's abortController so /cancel can stop it
+  const cancelKey = threadId ?? "global";
   await mkdir(LOGS_DIR, { recursive: true });
 
   const existing = threadId
@@ -700,10 +766,11 @@ async function streamClaude(
     sdkOptions.env = envOverrides;
   }
 
-  // Timeout via AbortController
+  // Timeout via AbortController (also used for /cancel)
   const abortController = new AbortController();
   const timeoutId = setTimeout(() => abortController.abort(), CLAUDE_TIMEOUT_MS);
   sdkOptions.abortController = abortController;
+  registerInflight(cancelKey, abortController);
 
   console.log(`[${new Date().toLocaleTimeString()}] Running: ${name} (SDK stream, session: ${existing?.sessionId?.slice(0, 8) ?? "new"})`);
 
@@ -779,6 +846,7 @@ async function streamClaude(
     }
   } finally {
     clearTimeout(timeoutId);
+    clearInflight(cancelKey, abortController);
   }
 
   maybeUnblock();

@@ -1,4 +1,5 @@
-import { ensureProjectClaudeMd, run, runUserMessage, compactCurrentSession } from "../runner";
+import { ensureProjectClaudeMd, run, runUserMessage, compactCurrentSession, cancelThread } from "../runner";
+import { isCancelCommand, CANCEL_CONFIRM_MESSAGE, CANCEL_NOTHING_MESSAGE } from "../cancel";
 import { getSettings, loadSettings } from "../config";
 import { resetSession, peekSession } from "../sessions";
 import { listThreadSessions, removeThreadSession, peekThreadSession } from "../sessionManager";
@@ -214,6 +215,22 @@ async function sendReaction(
     `${DISCORD_API}/channels/${channelId}/messages/${messageId}/reactions/${encoded}/@me`,
     {
       method: "PUT",
+      headers: { Authorization: `Bot ${token}` },
+    },
+  ).catch(() => {});
+}
+
+async function removeReaction(
+  token: string,
+  channelId: string,
+  messageId: string,
+  emoji: string,
+): Promise<void> {
+  const encoded = encodeURIComponent(emoji);
+  await fetch(
+    `${DISCORD_API}/channels/${channelId}/messages/${messageId}/reactions/${encoded}/@me`,
+    {
+      method: "DELETE",
       headers: { Authorization: `Bot ${token}` },
     },
   ).catch(() => {});
@@ -638,7 +655,21 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
     const prefixedPrompt = promptParts.join("\n");
     // Use thread-specific session if message is in a known thread
     const threadId = knownThreads.has(channelId) ? channelId : undefined;
+
+    // /cancel — abort in-flight Claude run for this thread
+    if (isCancelCommand(cleanContent)) {
+      const cancelled = cancelThread(threadId);
+      await sendMessage(config.token, channelId, cancelled ? CANCEL_CONFIRM_MESSAGE : CANCEL_NOTHING_MESSAGE);
+      return;
+    }
+
+    // Queue/processing feedback: ⏳ tells user "message received, working on it"
+    await sendReaction(config.token, channelId, message.id, "⏳").catch(() => {});
+
     const result = await runUserMessage("discord", prefixedPrompt, threadId);
+
+    // Always clear the ⏳ once the run completes (success or error)
+    await removeReaction(config.token, channelId, message.id, "⏳").catch(() => {});
 
     if (result.exitCode !== 0) {
       await sendMessage(config.token, channelId, `Error (exit ${result.exitCode}): ${result.stderr || result.stdout || "Unknown error"}`);

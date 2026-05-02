@@ -1,4 +1,5 @@
-import { ensureProjectClaudeMd, runUserMessage } from "../runner";
+import { ensureProjectClaudeMd, runUserMessage, cancelThread } from "../runner";
+import { isCancelCommand, CANCEL_CONFIRM_MESSAGE, CANCEL_NOTHING_MESSAGE } from "../cancel";
 import { addLineAllowedUser, getSettings, loadSettings } from "../config";
 import { peekThreadSession } from "../sessionManager";
 import { transcribeAudioToText } from "../whisper";
@@ -571,6 +572,13 @@ async function handleMessageEvent(event: LineMessageEvent): Promise<void> {
   console.log(
     `[${new Date().toLocaleTimeString()}] Line ${displayName}(${userId})${mediaSuffix} in ${channelType}: "${(messageText || "(media)").slice(0, 60)}"`,
   );
+
+  // /cancel — abort the in-flight Claude run for this LINE source
+  if (isCancelCommand(messageText)) {
+    const cancelled = cancelThread(sessionThreadId);
+    await sendText(chatId, cancelled ? CANCEL_CONFIRM_MESSAGE : CANCEL_NOTHING_MESSAGE, event.replyToken).catch(() => {});
+    return;
+  }
 
   try {
     // Start loading animation

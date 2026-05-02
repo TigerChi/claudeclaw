@@ -1,4 +1,5 @@
-import { ensureProjectClaudeMd, run, runUserMessage, compactCurrentSession } from "../runner";
+import { ensureProjectClaudeMd, run, runUserMessage, compactCurrentSession, cancelThread } from "../runner";
+import { CANCEL_CONFIRM_MESSAGE, CANCEL_NOTHING_MESSAGE } from "../cancel";
 import { addTelegramAllowedUser, getSettings, loadSettings } from "../config";
 import { resetSession, peekSession } from "../sessions";
 import { readFile } from "node:fs/promises";
@@ -657,6 +658,12 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     return;
   }
 
+  if (command === "/cancel") {
+    const cancelled = cancelThread(undefined);
+    await sendMessage(config.token, chatId, cancelled ? CANCEL_CONFIRM_MESSAGE : CANCEL_NOTHING_MESSAGE, threadId);
+    return;
+  }
+
   if (command === "/compact") {
     await sendMessage(config.token, chatId, "⏳ Compacting session...", threadId);
     const result = await compactCurrentSession();
@@ -865,17 +872,35 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
       );
     }
     const prefixedPrompt = promptParts.join("\n");
+
+    // Queue/processing feedback: ⏳ tells user "message received, working on it"
+    await sendReaction(config.token, chatId, message.message_id, "⏳").catch(() => {});
+
     const result = await runUserMessage("telegram", prefixedPrompt);
 
     if (result.exitCode !== 0) {
       await sendMessage(config.token, chatId, `Error (exit ${result.exitCode}): ${result.stderr || "Unknown error"}`, threadId);
+      // Clear the ⏳ reaction on error
+      await callApi(config.token, "setMessageReaction", {
+        chat_id: chatId,
+        message_id: message.message_id,
+        reaction: [],
+      }).catch(() => {});
     } else {
       const { cleanedText: afterReact, reactionEmoji } = extractReactionDirective(result.stdout || "");
       const { cleanedText, filePaths } = extractSendFileDirectives(afterReact);
       if (reactionEmoji) {
+        // Model-specified reaction overrides ⏳
         await sendReaction(config.token, chatId, message.message_id, reactionEmoji).catch((err) => {
           console.error(`[Telegram] Failed to send reaction for ${label}: ${err instanceof Error ? err.message : err}`);
         });
+      } else {
+        // No model reaction — clear the ⏳ so it doesn't stay stuck on completed messages
+        await callApi(config.token, "setMessageReaction", {
+          chat_id: chatId,
+          message_id: message.message_id,
+          reaction: [],
+        }).catch(() => {});
       }
       if (cleanedText) {
         await sendMessage(config.token, chatId, cleanedText, threadId);
@@ -948,6 +973,7 @@ async function registerBotCommands(token: string): Promise<void> {
     const commands = [
       { command: "start", description: "Show welcome message" },
       { command: "reset", description: "Reset session and start fresh" },
+      { command: "cancel", description: "Stop the current in-flight reply" },
       { command: "compact", description: "Compact session to reduce context size" },
       { command: "status", description: "Show current session status" },
       { command: "context", description: "Show context window usage" },
@@ -973,7 +999,7 @@ async function registerBotCommands(token: string): Promise<void> {
     } catch (regErr) {
       // Skill-generated commands may violate Telegram constraints; retry with built-in commands only
       console.warn(`[Telegram] Full command registration failed, retrying with built-in commands only: ${regErr instanceof Error ? regErr.message : regErr}`);
-      const builtinOnly = commands.filter((c) => ["start", "reset", "compact", "status", "context"].includes(c.command));
+      const builtinOnly = commands.filter((c) => ["start", "reset", "cancel", "compact", "status", "context"].includes(c.command));
       await callApi(token, "setMyCommands", { commands: builtinOnly });
       console.log(`  Commands registered (built-in only): ${builtinOnly.length}`);
     }

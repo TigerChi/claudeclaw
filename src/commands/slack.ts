@@ -1,4 +1,5 @@
-import { ensureProjectClaudeMd, runUserMessage, streamUserMessage, compactCurrentSession } from "../runner";
+import { ensureProjectClaudeMd, runUserMessage, streamUserMessage, compactCurrentSession, cancelThread } from "../runner";
+import { isCancelCommand, CANCEL_CONFIRM_MESSAGE, CANCEL_NOTHING_MESSAGE } from "../cancel";
 import { getSettings, loadSettings } from "../config";
 import { resetSession, peekSession } from "../sessions";
 import { listThreadSessions, peekThreadSession } from "../sessionManager";
@@ -938,6 +939,18 @@ async function handleMessage(event: SlackMessage): Promise<void> {
     const inThread = !!event.thread_ts;
     const replyThreadTs = event.thread_ts ?? event.ts; // reply in same thread
     const sessionThreadId = inThread ? slackThreadId(channelId, event.thread_ts!) : undefined;
+
+    // Handle /cancel — abort the in-flight Claude run for this thread/global key
+    if (isCancelCommand(cleanText)) {
+      const cancelled = cancelThread(sessionThreadId);
+      const reply = cancelled ? CANCEL_CONFIRM_MESSAGE : CANCEL_NOTHING_MESSAGE;
+      await sendMessage(config.botToken, channelId, reply, replyThreadTs);
+      // React on the user's /cancel message itself for visual feedback
+      if (cancelled) {
+        await sendReaction(config.botToken, channelId, event.ts, "octagonal_sign").catch(() => {});
+      }
+      return;
+    }
 
     // Recover lost thread from sessions.json if needed
     if (inThread && sessionThreadId) {
