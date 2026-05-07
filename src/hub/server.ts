@@ -24,7 +24,24 @@ export interface HubServerHandle {
 const PROXY_PREFIX = "/api/agents/";
 const PROXY_INFIX = "/proxy/";
 
-async function authorize(req: Request): Promise<{ ok: boolean; readOnly: boolean }> {
+type BunServerHandle = ReturnType<typeof Bun.serve>;
+
+function isLoopbackAddress(addr: string | undefined | null): boolean {
+  if (!addr) return false;
+  return addr === "127.0.0.1" || addr === "::1" || addr === "::ffff:127.0.0.1";
+}
+
+async function authorize(req: Request, server: BunServerHandle): Promise<{ ok: boolean; readOnly: boolean }> {
+  // Loopback bypass: requests from 127.0.0.1 / ::1 skip token auth so that
+  // local automation (scripts, agents on the same host) can call the Hub API
+  // without juggling a bearer token. The security boundary for loopback is
+  // the OS user — anyone with shell access can already kill/spawn daemons
+  // directly, so token auth on loopback only inconveniences automation.
+  const peer = server.requestIP(req);
+  if (isLoopbackAddress(peer?.address)) {
+    return { ok: true, readOnly: false };
+  }
+
   let token = extractBearer(req.headers.get("authorization"));
   if (!token) {
     // Fallback: cookie. The SPA writes this cookie before opening the
@@ -151,11 +168,7 @@ async function handleAgentAction(id: string, action: string): Promise<Response> 
 }
 
 export function startHubServer(opts: HubServerOptions): HubServerHandle {
-  const server = Bun.serve({
-    hostname: opts.host,
-    port: opts.port,
-    idleTimeout: 0,
-    fetch: async (req) => {
+  const handleRequest = async (req: Request, server: BunServerHandle): Promise<Response> => {
       const url = new URL(req.url);
 
       if (url.pathname === "/api/health") {
@@ -168,9 +181,9 @@ export function startHubServer(opts: HubServerOptions): HubServerHandle {
         });
       }
 
-      // All /api/* below this point require auth.
+      // All /api/* below this point require auth (loopback bypasses inside authorize()).
       if (url.pathname.startsWith("/api/")) {
-        const auth = await authorize(req);
+        const auth = await authorize(req, server);
         if (!auth.ok) return unauthorized();
       }
 
@@ -241,12 +254,49 @@ export function startHubServer(opts: HubServerOptions): HubServerHandle {
       }
 
       return notFound();
-    },
+  };
+
+  const mainServer = Bun.serve({
+    hostname: opts.host,
+    port: opts.port,
+    idleTimeout: 0,
+    fetch: handleRequest,
   });
 
+  // Secondary listener bound to 127.0.0.1 so local automation can hit the Hub
+  // API even when the main listener is bound to a non-loopback interface
+  // (e.g. tailnet IP). authorize() bypasses tokens for any source IP that
+  // arrives via loopback, regardless of which listener accepted it.
+  // Skipped when the main listener already covers loopback (wildcard or
+  // explicit 127.0.0.1 / ::1) — the second bind would just fail with EADDRINUSE.
+  const mainCoversLoopback =
+    opts.host === "127.0.0.1" ||
+    opts.host === "::1" ||
+    opts.host === "0.0.0.0" ||
+    opts.host === "::" ||
+    opts.host === "localhost";
+  let loopbackServer: BunServerHandle | null = null;
+  if (!mainCoversLoopback) {
+    try {
+      loopbackServer = Bun.serve({
+        hostname: "127.0.0.1",
+        port: opts.port,
+        idleTimeout: 0,
+        fetch: handleRequest,
+      });
+    } catch (err) {
+      console.warn(
+        `[Hub] could not bind loopback listener on 127.0.0.1:${opts.port} (continuing with main listener only): ${err instanceof Error ? err.message : err}`,
+      );
+    }
+  }
+
   return {
-    stop: () => server.stop(),
+    stop: () => {
+      mainServer.stop();
+      loopbackServer?.stop();
+    },
     host: opts.host,
-    port: server.port ?? opts.port,
+    port: mainServer.port ?? opts.port,
   };
 }
