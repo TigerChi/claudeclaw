@@ -670,16 +670,28 @@ async function execClaudeImpl(name: string, prompt: string, threadId: string | u
   return result;
 }
 
-export async function run(name: string, prompt: string, threadId?: string): Promise<RunResult> {
+export async function run(
+  name: string,
+  prompt: string,
+  threadId?: string,
+  replyToMsgId?: string,
+): Promise<RunResult> {
   const result = await enqueue(() => execClaude(name, prompt, threadId), threadId);
 
-  // Process [send-agent:] directives in output — works for all channels
+  // Process [send-agent:] directives in output — works for all channels.
+  // When this run is processing an incoming agent-bus message, `replyToMsgId`
+  // is the origin message id; we attach it to outgoing directives so senders
+  // that registered a pending listener can have their reply routed back.
   const agentBus: AgentBusConfig = (getSettings() as any).agentBus ?? { enabled: false, name: "" };
   if (agentBus.enabled && agentBus.name && result.stdout) {
     const { cleaned, directives } = extractAgentDirectives(result.stdout, agentBus.name);
     if (directives.length > 0) {
       for (const d of directives) {
-        sendToAgent(d.to, d.payload, { from: agentBus.name, type: "message" }).catch((err) => {
+        sendToAgent(d.to, d.payload, {
+          from: agentBus.name,
+          type: replyToMsgId ? "response" : "message",
+          replyTo: replyToMsgId,
+        }).catch((err) => {
           console.error(`[${new Date().toLocaleTimeString()}] Agent Bus: failed to send to "${d.to}":`, err);
         });
       }

@@ -21,6 +21,8 @@ import {
   sendToAgent,
   buildAgentMessagePrompt,
   updateHeartbeat,
+  consumePending,
+  gcPending,
   type AgentMessage,
 } from "../agent-bus";
 
@@ -777,6 +779,24 @@ export async function start(args: string[] = []) {
   if (currentSettings.heartbeat.enabled) scheduleHeartbeat();
 
   // --- Agent Bus init ---
+  /**
+   * If `msg` carries a `replyTo` matching a pending-reply registration the
+   * local agent made earlier, route the reply directly to the registered
+   * listener and skip global-session dispatch. Returns true if routed.
+   */
+  async function tryRouteAsPendingReply(busName: string, msg: AgentMessage): Promise<boolean> {
+    if (!msg.replyTo) return false;
+    const pending = await consumePending(busName, msg.replyTo);
+    if (!pending) return false;
+    try {
+      await writeFile(pending.listenerPath, JSON.stringify(msg, null, 2));
+      console.log(`[${ts()}] Agent Bus: routed reply ${msg.id} → listener for ${msg.replyTo}`);
+    } catch (err) {
+      console.error(`[${ts()}] Agent Bus: failed to write listener file:`, err);
+    }
+    return true;
+  }
+
   if (currentSettings.agentBus.enabled && currentSettings.agentBus.name) {
     const busName = currentSettings.agentBus.name;
     await registerAgent(busName, process.cwd(), process.pid, "online");
@@ -787,8 +807,11 @@ export async function start(args: string[] = []) {
         await handleSystemMessage(msg);
         return;
       }
+      // Pending-reply routing — short-circuits global session if matched.
+      if (await tryRouteAsPendingReply(busName, msg)) return;
+
       const prompt = buildAgentMessagePrompt([msg]);
-      const r = await run("agent-bus", prompt);
+      const r = await run("agent-bus", prompt, undefined, msg.id);
       // Forward non-empty results to messaging channels
       if (r.exitCode === 0 && r.stdout?.trim()) {
         forwardToTelegram("agent-bus", r);
@@ -889,14 +912,18 @@ export async function start(args: string[] = []) {
       if (currentSettings.agentBus.enabled && currentSettings.agentBus.name) {
         const busName = currentSettings.agentBus.name;
         await updateHeartbeat(busName);
+        await gcPending(busName).catch(() => {});
         const inboxMessages = await checkInbox(busName);
         for (const msg of inboxMessages) {
           if (msg.type === "system") {
             await handleSystemMessage(msg as any);
             continue;
           }
+          // Pending-reply routing — short-circuits global session if matched.
+          if (await tryRouteAsPendingReply(busName, msg)) continue;
+
           const prompt = buildAgentMessagePrompt([msg]);
-          const r = await run("agent-bus", prompt);
+          const r = await run("agent-bus", prompt, undefined, msg.id);
           if (r.exitCode === 0 && r.stdout?.trim()) {
             forwardToTelegram("agent-bus", r);
             forwardToDiscord("agent-bus", r);

@@ -51,6 +51,17 @@ export interface SystemMessage extends AgentMessage {
   reason?: string;
 }
 
+/**
+ * Pending-reply registration. Sender writes one of these before sending a
+ * message when it wants the reply routed back to a specific listener instead
+ * of being dispatched to the global agent-bus session.
+ */
+export interface PendingEntry {
+  messageId: string;
+  listenerPath: string;
+  expiresAt: string;
+}
+
 type MessageHandler = (msg: AgentMessage) => void | Promise<void>;
 
 // ── State ──────────────────────────────────────────────────────────────────
@@ -70,6 +81,10 @@ function inboxDir(agentName: string): string {
 
 function socketPath(agentName: string): string {
   return join(BUS_DIR, `${agentName}.sock`);
+}
+
+function pendingDir(senderName: string): string {
+  return join(BUS_DIR, senderName, "pending");
 }
 
 function generateMessageId(from: string): string {
@@ -228,6 +243,11 @@ export async function sendToAgent(
     replyTo?: string;
     action?: SystemAction;
     reason?: string;
+    /**
+     * Register a pending-reply listener so the daemon will route the matching
+     * reply to `listenerPath` instead of dispatching to the global session.
+     */
+    expectReply?: { listenerPath: string; ttlMs?: number };
   } = {},
 ): Promise<{ delivered: "socket" | "file"; messageId: string }> {
   const from = options.from ?? localAgentName ?? "unknown";
@@ -246,6 +266,16 @@ export async function sendToAgent(
 
   if (options.action) msg.action = options.action;
   if (options.reason) msg.reason = options.reason;
+
+  // Register pending entry before sending so the reply can never race ahead.
+  if (options.expectReply) {
+    const ttlMs = options.expectReply.ttlMs ?? 60_000;
+    await writePending(from, {
+      messageId,
+      listenerPath: options.expectReply.listenerPath,
+      expiresAt: new Date(Date.now() + ttlMs).toISOString(),
+    });
+  }
 
   const json = JSON.stringify(msg);
 
@@ -289,6 +319,96 @@ export async function sendToAgent(
   await writeFile(join(inboxDir(to), filename), json + "\n");
   console.log(`[${ts()}] Agent Bus: sent to "${to}" via file inbox`);
   return { delivered: "file", messageId };
+}
+
+// ── Pending-reply registry ─────────────────────────────────────────────────
+
+async function writePending(sender: string, entry: PendingEntry): Promise<void> {
+  await mkdir(pendingDir(sender), { recursive: true });
+  await writeFile(
+    join(pendingDir(sender), `${entry.messageId}.json`),
+    JSON.stringify(entry, null, 2),
+  );
+}
+
+/**
+ * Look up a pending entry without removing it. Returns null if missing or expired
+ * (expired entries are removed as a side effect).
+ */
+export async function lookupPending(sender: string, msgId: string): Promise<PendingEntry | null> {
+  const p = join(pendingDir(sender), `${msgId}.json`);
+  if (!existsSync(p)) return null;
+  try {
+    const entry: PendingEntry = JSON.parse(await readFile(p, "utf8"));
+    if (new Date(entry.expiresAt).getTime() < Date.now()) {
+      await unlink(p).catch(() => {});
+      return null;
+    }
+    return entry;
+  } catch {
+    return null;
+  }
+}
+
+/** Look up and atomically remove a pending entry. */
+export async function consumePending(sender: string, msgId: string): Promise<PendingEntry | null> {
+  const entry = await lookupPending(sender, msgId);
+  if (!entry) return null;
+  await unlink(join(pendingDir(sender), `${msgId}.json`)).catch(() => {});
+  return entry;
+}
+
+/** Remove all expired pending entries for one agent. Best-effort. */
+export async function gcPending(sender: string): Promise<number> {
+  const dir = pendingDir(sender);
+  if (!existsSync(dir)) return 0;
+  let removed = 0;
+  const now = Date.now();
+  let files: string[] = [];
+  try {
+    files = await readdir(dir);
+  } catch {
+    return 0;
+  }
+  for (const f of files) {
+    if (!f.endsWith(".json")) continue;
+    try {
+      const entry: PendingEntry = JSON.parse(await readFile(join(dir, f), "utf8"));
+      if (new Date(entry.expiresAt).getTime() < now) {
+        await unlink(join(dir, f));
+        removed++;
+      }
+    } catch {
+      // malformed → drop
+      await unlink(join(dir, f)).catch(() => {});
+    }
+  }
+  return removed;
+}
+
+/**
+ * Poll a listener path until a reply file appears or the timeout elapses.
+ * On hit, reads, deletes, and returns the parsed message.
+ */
+export async function waitForReply(
+  listenerPath: string,
+  timeoutMs: number = 60_000,
+  pollIntervalMs: number = 200,
+): Promise<AgentMessage | null> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (existsSync(listenerPath)) {
+      try {
+        const raw = await readFile(listenerPath, "utf8");
+        await unlink(listenerPath).catch(() => {});
+        return JSON.parse(raw) as AgentMessage;
+      } catch {
+        return null;
+      }
+    }
+    await new Promise((r) => setTimeout(r, pollIntervalMs));
+  }
+  return null;
 }
 
 // ── Check Inbox (file-based) ───────────────────────────────────────────────
