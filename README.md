@@ -106,6 +106,7 @@ See [docs/MULTI_SESSION.md](docs/MULTI_SESSION.md) for technical details.
 - **Single dashboard for many daemons.** One URL lists every ClaudeClaw agent registered on the host (alive or stopped) with start / stop / restart / "restart all" controls.
 - **Reverse proxy to per-daemon UIs.** Click an agent to see its full web UI without exposing each daemon's port.
 - **Bearer-token auth** (32-byte token, SHA-256 hashed at rest). Bind loopback by default; bind a Tailscale IP to share the dashboard with teammates.
+- **One-click URL login.** Open `http://<host>:4631/?token=<your-token>` and the SPA stores the token, strips it from the URL, and lands you on the dashboard. Bookmarkable.
 - **Mobile-friendly layout.**
 
 In Claude Code:
@@ -116,6 +117,13 @@ In Claude Code:
 ```
 
 See [docs/HUB-GUIDE.md](docs/HUB-GUIDE.md) for full usage and [docs/HUB-INTERNALS.md](docs/HUB-INTERNALS.md) for architecture.
+
+### Agent Bus
+- **Inter-agent messaging** over Unix sockets (real-time) with file-inbox fallback.
+- **Synchronous request/reply.** Senders register a pending listener; the daemon routes the matching reply directly to it instead of into the global agent session. Ad-hoc TUI sessions and one-off scripts can finally do `send → wait → read` without standing up their own daemon.
+- **`send-and-wait` CLI helper** for shell usage.
+
+See [docs/AGENT-BUS.md](docs/AGENT-BUS.md).
 
 ## FAQ
 

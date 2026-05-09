@@ -173,6 +173,21 @@ export function hubPage(): string {
   <div id="app"></div>
   <script>
   (function () {
+    // URL token bootstrap: if the page was opened with ?token=<plaintext>,
+    // promote it to localStorage and strip from the URL so it doesn't linger
+    // in browser history / referer headers. Pairs with the server's cookie+302
+    // path (in case localStorage is unavailable / cleared).
+    try {
+      const params = new URLSearchParams(location.search);
+      const urlToken = params.get("token");
+      if (urlToken) {
+        localStorage.setItem("claudeclaw_hub_token", urlToken);
+        params.delete("token");
+        const cleanQuery = params.toString();
+        history.replaceState({}, "", location.pathname + (cleanQuery ? "?" + cleanQuery : ""));
+      }
+    } catch (e) { /* private mode / no localStorage — fall through */ }
+
     const state = {
       token: localStorage.getItem("claudeclaw_hub_token") || "",
       agents: [],

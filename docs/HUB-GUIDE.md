@@ -32,6 +32,23 @@ claudeclaw hub start --detach
 
 Open `http://127.0.0.1:4631/`, paste the token, you're in.
 
+### Auto-login via URL token
+
+Skip the paste step by appending the token as a query parameter:
+
+```
+http://127.0.0.1:4631/?token=<your-token>
+```
+
+The SPA reads the `token` query on load, stores it in `localStorage`, then
+`history.replaceState`s the URL down to `/` so the token doesn't linger in
+browser history or referer headers. Subsequent visits to `/` use the saved
+token automatically. Bookmarkable, shareable to a private clipboard, and
+works across reverse-proxied hostnames (Tailscale IP, custom domain, etc.).
+
+If the URL is opened in private/incognito mode, the token does not persist
+beyond that session — paste-style login still works the same way.
+
 ## Commands
 
 The same actions are available two ways — pick whichever suits the moment.
