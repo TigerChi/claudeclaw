@@ -176,6 +176,20 @@ export function startHubServer(opts: HubServerOptions): HubServerHandle {
       }
 
       if (url.pathname === "/" || url.pathname === "/index.html") {
+        // Optional URL token (?token=<plaintext>): if valid, plant the auth
+        // cookie and redirect to a clean URL so the token doesn't linger in
+        // browser history / referer headers. Invalid tokens silently fall
+        // through to the SPA's login form (no leak about validity).
+        const queryToken = url.searchParams.get("token");
+        if (queryToken && (await verifyBearerToken(queryToken))) {
+          return new Response(null, {
+            status: 302,
+            headers: {
+              "Location": "/",
+              "Set-Cookie": `claudeclaw_hub_token=${encodeURIComponent(queryToken)}; Path=/; SameSite=Lax; Max-Age=2592000`,
+            },
+          });
+        }
         return new Response(hubPage(), {
           headers: { "Content-Type": "text/html; charset=utf-8" },
         });
