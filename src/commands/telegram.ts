@@ -784,6 +784,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     let imagePath: string | null = null;
     let voicePath: string | null = null;
     let voiceTranscript: string | null = null;
+    let voiceVocabHint = "";
     if (hasImage) {
       try {
         imagePath = await downloadImageFromMessage(config.token, message);
@@ -801,10 +802,14 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
       if (voicePath) {
         try {
           debugLog(`Voice file saved: path=${voicePath}`);
-          voiceTranscript = await transcribeAudioToText(voicePath, {
-            debug: telegramDebug,
-            log: (message) => debugLog(message),
-          });
+          {
+            const result = await transcribeAudioToText(voicePath, {
+              debug: telegramDebug,
+              log: (message) => debugLog(message),
+            });
+            voiceTranscript = result.text || null;
+            voiceVocabHint = result.vocabHint;
+          }
         } catch (err) {
           console.error(`[Telegram] Failed to transcribe voice for ${label}: ${err instanceof Error ? err.message : err}`);
         }
@@ -854,6 +859,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     }
     if (voiceTranscript) {
       promptParts.push(`Voice transcript: ${voiceTranscript}`);
+      if (voiceVocabHint) promptParts.push(voiceVocabHint);
       promptParts.push("The user attached voice audio. Use the transcript as their spoken message.");
     } else if (hasVoice) {
       promptParts.push(

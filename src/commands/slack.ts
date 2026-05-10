@@ -981,6 +981,7 @@ async function handleMessage(event: SlackMessage): Promise<void> {
 
     const imagePaths: string[] = [];
     const voiceTranscripts: string[] = [];
+    let voiceVocabHint = "";
     const docPaths: { path: string; name: string }[] = [];
 
     if (hasImage) {
@@ -1004,11 +1005,12 @@ async function handleMessage(event: SlackMessage): Promise<void> {
         }
         if (voicePath) {
           try {
-            const transcript = await transcribeAudioToText(voicePath, {
+            const result = await transcribeAudioToText(voicePath, {
               debug: slackDebug,
               log: (msg) => debugLog(msg),
             });
-            if (transcript) voiceTranscripts.push(transcript);
+            if (result.text) voiceTranscripts.push(result.text);
+            if (result.vocabHint) voiceVocabHint = result.vocabHint;
           } catch (err) {
             console.error(`[Slack] Failed to transcribe voice: ${err instanceof Error ? err.message : err}`);
           }
@@ -1073,11 +1075,13 @@ async function handleMessage(event: SlackMessage): Promise<void> {
     if (voiceTranscripts.length === 1) {
       promptParts.push(`Voice transcript: ${voiceTranscripts[0]}`);
       promptParts.push("The user attached voice audio. Use the transcript as their spoken message.");
+      if (voiceVocabHint) promptParts.push(voiceVocabHint);
     } else if (voiceTranscripts.length > 1) {
       voiceTranscripts.forEach((t, i) => {
         promptParts.push(`Voice transcript ${i + 1}: ${t}`);
       });
       promptParts.push("The user attached multiple voice clips. Treat the transcripts in order as their spoken messages.");
+      if (voiceVocabHint) promptParts.push(voiceVocabHint);
     } else if (hasVoice) {
       promptParts.push("The user attached voice audio, but it could not be transcribed. Ask them to resend a clearer clip.");
     }

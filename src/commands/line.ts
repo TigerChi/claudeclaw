@@ -481,6 +481,7 @@ async function handleMessageEvent(event: LineMessageEvent): Promise<void> {
   let imagePath: string | null = null;
   let voicePath: string | null = null;
   let voiceTranscript: string | null = null;
+  let voiceVocabHint = "";
   let filePath: string | null = null;
 
   switch (event.message.type) {
@@ -521,10 +522,14 @@ async function handleMessageEvent(event: LineMessageEvent): Promise<void> {
 
       if (voicePath) {
         try {
-          voiceTranscript = await transcribeAudioToText(voicePath, {
-            debug: lineDebug,
-            log: (msg) => debugLog(msg),
-          });
+          {
+            const result = await transcribeAudioToText(voicePath, {
+              debug: lineDebug,
+              log: (msg) => debugLog(msg),
+            });
+            voiceTranscript = result.text || null;
+            voiceVocabHint = result.vocabHint;
+          }
         } catch (err) {
           console.error(`[Line] Failed to transcribe audio: ${err instanceof Error ? err.message : err}`);
         }
@@ -598,6 +603,7 @@ async function handleMessageEvent(event: LineMessageEvent): Promise<void> {
     }
     if (voiceTranscript) {
       promptParts.push(`Voice transcript: ${voiceTranscript}`);
+      if (voiceVocabHint) promptParts.push(voiceVocabHint);
       promptParts.push("The user sent a voice message. Use the transcript as their spoken message.");
     } else if (voicePath) {
       promptParts.push("The user sent a voice message, but it could not be transcribed. Ask them to resend.");

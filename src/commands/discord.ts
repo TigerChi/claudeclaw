@@ -519,6 +519,7 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
     let imagePath: string | null = null;
     let voicePath: string | null = null;
     let voiceTranscript: string | null = null;
+    let voiceVocabHint = "";
 
     if (hasImage) {
       try {
@@ -538,10 +539,14 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
       if (voicePath) {
         try {
           debugLog(`Voice file saved: path=${voicePath}`);
-          voiceTranscript = await transcribeAudioToText(voicePath, {
-            debug: discordDebug,
-            log: (msg) => debugLog(msg),
-          });
+          {
+            const result = await transcribeAudioToText(voicePath, {
+              debug: discordDebug,
+              log: (msg) => debugLog(msg),
+            });
+            voiceTranscript = result.text || null;
+            voiceVocabHint = result.vocabHint;
+          }
         } catch (err) {
           console.error(`[Discord] Failed to transcribe voice for ${label}: ${err instanceof Error ? err.message : err}`);
         }
@@ -645,6 +650,7 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
     }
     if (voiceTranscript) {
       promptParts.push(`Voice transcript: ${voiceTranscript}`);
+      if (voiceVocabHint) promptParts.push(voiceVocabHint);
       promptParts.push("The user attached voice audio. Use the transcript as their spoken message.");
     } else if (hasVoice) {
       promptParts.push(

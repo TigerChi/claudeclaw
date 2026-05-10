@@ -86,6 +86,7 @@ const DEFAULT_SETTINGS: Settings = {
   security: { level: "moderate", allowedTools: [], disallowedTools: [] },
   web: { enabled: false, host: "127.0.0.1", port: 4632 },
   stt: { baseUrl: "", model: "" },
+  whisper: { engine: "auto", model: "large-v3-turbo", language: "" },
   agentBus: { enabled: false, name: "" },
 };
 
@@ -203,6 +204,7 @@ export interface Settings {
   security: SecurityConfig;
   web: WebConfig;
   stt: SttConfig;
+  whisper: WhisperConfig;
   agentBus: AgentBusConfig;
 }
 
@@ -239,6 +241,19 @@ export interface SttConfig {
   model: string;
 }
 
+export type WhisperEngineKind = "auto" | "mlx" | "whispercpp" | "api";
+
+export interface WhisperConfig {
+  /** "auto" picks per-platform: api (if stt.baseUrl) > mlx (mac arm64) > whispercpp.
+   *  Set explicitly to force a specific engine. */
+  engine: WhisperEngineKind;
+  /** Engine-specific model identifier. For mlx: tiny / base / small / medium /
+   *  large-v3 / large-v3-turbo (default). Ignored by api / whispercpp v1. */
+  model: string;
+  /** ISO 639-1 code (zh / en / ja / ...). Empty = auto-detect. */
+  language: string;
+}
+
 export interface AgentBusConfig {
   /** Enable Agent Bus inter-agent communication (default: false) */
   enabled: boolean;
@@ -264,6 +279,20 @@ const VALID_LEVELS = new Set<SecurityLevel>([
   "moderate",
   "unrestricted",
 ]);
+
+const VALID_WHISPER_ENGINES = new Set<WhisperEngineKind>(["auto", "mlx", "whispercpp", "api"]);
+
+function parseWhisperConfig(raw: any): WhisperConfig {
+  const engineRaw = typeof raw?.engine === "string" ? raw.engine.trim() : "auto";
+  const engine = (VALID_WHISPER_ENGINES.has(engineRaw as WhisperEngineKind)
+    ? engineRaw
+    : "auto") as WhisperEngineKind;
+  return {
+    engine,
+    model: typeof raw?.model === "string" && raw.model.trim() ? raw.model.trim() : "large-v3-turbo",
+    language: typeof raw?.language === "string" ? raw.language.trim() : "",
+  };
+}
 
 function parseAgenticMode(raw: any): AgenticMode | null {
   if (!raw || typeof raw !== "object") return null;
@@ -430,6 +459,7 @@ function parseSettings(raw: Record<string, any>): Settings {
       baseUrl: typeof raw.stt?.baseUrl === "string" ? raw.stt.baseUrl.trim() : "",
       model: typeof raw.stt?.model === "string" ? raw.stt.model.trim() : "",
     },
+    whisper: parseWhisperConfig(raw.whisper),
     agentBus: {
       enabled: raw.agentBus?.enabled ?? false,
       name: typeof raw.agentBus?.name === "string" ? raw.agentBus.name.trim() : "",
