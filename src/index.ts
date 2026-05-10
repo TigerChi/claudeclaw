@@ -1,3 +1,12 @@
+import { ensurePathEntries } from "./agent-env";
+
+// When the hub is launched by launchd / systemd, it inherits a minimal
+// PATH (`/usr/bin:/bin:/usr/sbin:/sbin`). Daemons spawned by the hub
+// inherit the same minimal PATH and then fail to locate `claude`,
+// `node`, `ffmpeg`, etc. when shelling out. Backfill at entry so every
+// downstream spawn sees a usable PATH.
+process.env.PATH = ensurePathEntries(process.env.PATH);
+
 import { start } from "./commands/start";
 import { stop, stopAll, restart } from "./commands/stop";
 import { clear } from "./commands/clear";

@@ -12,6 +12,7 @@ import { getSettings, type ModelConfig, type SecurityConfig, type AgentBusConfig
 import { buildClockPromptPrefix } from "./timezone";
 import { selectModel } from "./model-router";
 import { listAgents, extractAgentDirectives, sendToAgent } from "./agent-bus";
+import { loadAgentEnv, withDaemonSafeEnv } from "./agent-env";
 import { query as sdkQuery } from "@anthropic-ai/claude-agent-sdk";
 import { execSync } from "child_process";
 import { homedir } from "os";
@@ -402,7 +403,10 @@ export async function compactCurrentSession(): Promise<{ success: boolean; messa
   const settings = getSettings();
   const securityArgs = buildSecurityArgs(settings.security);
   const { CLAUDECODE: _, ...cleanEnv } = process.env;
-  const baseEnv = { ...cleanEnv } as Record<string, string>;
+  const baseEnv = {
+    ...withDaemonSafeEnv(cleanEnv as NodeJS.ProcessEnv),
+    ...loadAgentEnv(process.cwd()),
+  } as Record<string, string>;
   const timeoutMs = (settings as any).sessionTimeoutMs || CLAUDE_TIMEOUT_MS;
 
   const ok = await runCompact(
@@ -546,9 +550,13 @@ async function execClaudeImpl(name: string, prompt: string, threadId: string | u
     args.push("--append-system-prompt", appendParts.join("\n\n"));
   }
 
-  // Strip CLAUDECODE env var so child claude processes don't think they're nested
+  // Strip CLAUDECODE env var so child claude processes don't think they're nested,
+  // strip leaky globals (e.g. global OP token), and layer per-agent env on top.
   const { CLAUDECODE: _, ...cleanEnv } = process.env;
-  const baseEnv = { ...cleanEnv } as Record<string, string>;
+  const baseEnv = {
+    ...withDaemonSafeEnv(cleanEnv as NodeJS.ProcessEnv),
+    ...loadAgentEnv(process.cwd()),
+  } as Record<string, string>;
 
   let exec = await runClaudeOnce(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs, abortController.signal);
   const primaryRateLimit = extractRateLimitMessage(exec.rawStdout, exec.stderr);
@@ -767,16 +775,22 @@ async function streamClaude(
     sdkOptions.disallowedTools = security.disallowedTools;
   }
 
-  // Environment overrides
+  // Environment for SDK-spawned claude child. The SDK replaces (does not
+  // merge) process.env with whatever we set here, so we must build a full
+  // env: daemon-safe baseline (with PATH backfill) + per-agent overrides
+  // + API/model overrides.
   const envOverrides: Record<string, string> = {};
   if (api.trim()) envOverrides.ANTHROPIC_AUTH_TOKEN = api.trim();
   if (normalizedModel === "glm") {
     envOverrides.ANTHROPIC_BASE_URL = "https://api.z.ai/api/anthropic";
     envOverrides.API_TIMEOUT_MS = "3000000";
   }
-  if (Object.keys(envOverrides).length > 0) {
-    sdkOptions.env = envOverrides;
-  }
+  const { CLAUDECODE: _sdkClaudecode, ...sdkCleanEnv } = process.env;
+  sdkOptions.env = {
+    ...withDaemonSafeEnv(sdkCleanEnv as NodeJS.ProcessEnv),
+    ...loadAgentEnv(process.cwd()),
+    ...envOverrides,
+  };
 
   // Timeout via AbortController (also used for /cancel)
   const abortController = new AbortController();

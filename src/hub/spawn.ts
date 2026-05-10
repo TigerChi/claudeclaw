@@ -2,6 +2,7 @@ import { mkdir } from "fs/promises";
 import { openSync } from "fs";
 import { join } from "path";
 import { fileURLToPath } from "url";
+import { buildAgentSpawnEnv } from "../agent-env";
 
 const ENTRY_SCRIPT = fileURLToPath(new URL("../index.ts", import.meta.url));
 
@@ -36,7 +37,7 @@ export async function spawnDetachedDaemon(
     stdin: "ignore",
     stdout: logFd,
     stderr: logFd,
-    env: { ...process.env, CLAUDECLAW_DETACHED: "1" },
+    env: buildAgentSpawnEnv(projectPath, process.env, { CLAUDECLAW_DETACHED: "1" }),
   });
   proc.unref();
   return { pid: proc.pid, logPath };
