@@ -2,13 +2,76 @@ import { ensureProjectClaudeMd, run, runUserMessage, compactCurrentSession, canc
 import { CANCEL_CONFIRM_MESSAGE, CANCEL_NOTHING_MESSAGE } from "../cancel";
 import { addTelegramAllowedUser, getSettings, loadSettings } from "../config";
 import { resetSession, peekSession } from "../sessions";
-import { readFile } from "node:fs/promises";
+import { readFile, mkdir, appendFile, stat } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { transcribeAudioToText } from "../whisper";
 import { resolveSkillPrompt, listSkills } from "../skills";
-import { mkdir } from "node:fs/promises";
 import { extname, join } from "node:path";
+
+// --- TEMP DIAGNOSTIC (2026-05-24): record TG spawn failures ---
+// Hypothesis: Eleven's session has 2098 turns / 21MB jsonl; resume fails fast
+// with exit 1 and empty stderr, so users see only "Error (exit 1): Unknown error".
+// Remove this block once auto-compact-on-failure is in place.
+async function recordSpawnFailure(ctx: {
+  userId: number | undefined;
+  chatId: number;
+  username: string;
+  messageText: string;
+  prefixedPrompt: string;
+  exitCode: number;
+  stderr: string;
+  stdoutSample: string;
+}): Promise<void> {
+  try {
+    const session = await peekSession();
+    const cwd = process.cwd();
+    const encodedCwd = cwd.replace(/[\/\s]/g, "-");
+    const jsonlPath = session
+      ? join(homedir(), ".claude", "projects", encodedCwd, `${session.sessionId}.jsonl`)
+      : null;
+    let jsonlSize: number | null = null;
+    let jsonlMtime: string | null = null;
+    if (jsonlPath && existsSync(jsonlPath)) {
+      const st = await stat(jsonlPath);
+      jsonlSize = st.size;
+      jsonlMtime = st.mtime.toISOString();
+    }
+    const entry = {
+      ts: new Date().toISOString(),
+      source: "telegram",
+      userId: ctx.userId,
+      chatId: ctx.chatId,
+      username: ctx.username,
+      messageText: (ctx.messageText || "").slice(0, 500),
+      promptPreview: ctx.prefixedPrompt.slice(0, 500),
+      exitCode: ctx.exitCode,
+      stderr: ctx.stderr.slice(0, 2000),
+      stdoutSample: ctx.stdoutSample.slice(0, 500),
+      session: session
+        ? {
+            sessionId: session.sessionId,
+            turnCount: session.turnCount,
+            compactWarned: session.compactWarned,
+            createdAt: session.createdAt,
+            lastUsedAt: session.lastUsedAt,
+          }
+        : null,
+      jsonlPath,
+      jsonlSize,
+      jsonlMtime,
+    };
+    const logDir = join(cwd, ".claude/claudeclaw/logs");
+    await mkdir(logDir, { recursive: true });
+    await appendFile(join(logDir, "spawn-failures.log"), JSON.stringify(entry) + "\n");
+    console.error(
+      `[Telegram] spawn failure recorded: exit=${ctx.exitCode} session=${session?.sessionId.slice(0, 8) ?? "none"} turns=${session?.turnCount ?? "?"} jsonl=${jsonlSize ?? "?"}B`
+    );
+  } catch (err) {
+    console.error(`[Telegram] Failed to record spawn failure: ${err instanceof Error ? err.message : err}`);
+  }
+}
+// --- /TEMP DIAGNOSTIC ---
 
 // --- Markdown → Telegram HTML conversion (ported from nanobot) ---
 
@@ -885,6 +948,17 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     const result = await runUserMessage("telegram", prefixedPrompt);
 
     if (result.exitCode !== 0) {
+      // TEMP DIAGNOSTIC (2026-05-24): capture full failure context before replying
+      await recordSpawnFailure({
+        userId,
+        chatId,
+        username: label,
+        messageText: text ?? "",
+        prefixedPrompt,
+        exitCode: result.exitCode,
+        stderr: result.stderr ?? "",
+        stdoutSample: result.stdout ?? "",
+      });
       await sendMessage(config.token, chatId, `Error (exit ${result.exitCode}): ${result.stderr || "Unknown error"}`, threadId);
       // Clear the ⏳ reaction on error
       await callApi(config.token, "setMessageReaction", {
