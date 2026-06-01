@@ -9,6 +9,9 @@ export interface DaemonRegistryEntry {
   path: string;
   pid: number;
   startedAt: number;
+  /** Plugin source ("v1" / "v3"). Absent on entries written by daemons that
+   *  don't set it — hub treats missing as "v1" for back-compat. */
+  version?: string;
 }
 
 export function agentIdForPath(path: string): string {
@@ -64,6 +67,7 @@ export async function listRegisteredDaemons(): Promise<DaemonRegistryEntry[]> {
         path: parsed.path,
         pid: parsed.pid,
         startedAt: typeof parsed.startedAt === "number" ? parsed.startedAt : 0,
+        version: typeof parsed.version === "string" ? parsed.version : undefined,
       });
     } catch {
       try { await unlink(filePath); } catch {}
