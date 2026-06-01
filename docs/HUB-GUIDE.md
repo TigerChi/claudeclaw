@@ -134,7 +134,7 @@ public internet.
 ```
 ~/.claude/claudeclaw/hub/
   auth.json     SHA-256 hash of the token (mode 0600)
-  config.json   Persisted host/port settings
+  config.json   Persisted host/port/autostart settings — see HUB-CONFIG.md
   hub.pid       Running hub PID (cleared on stop)
   hub.port      Bound port (cleared on stop)
   hub.log       Detached-mode stdout/stderr
@@ -145,7 +145,8 @@ public internet.
 
 The `daemons/` directory is the source of truth for what the hub lists; see
 [HUB-INTERNALS.md](HUB-INTERNALS.md) for why this exists and how registration
-works.
+works. For every settable field in `config.json` (host, port, proxy autostart,
+per-agent daemon autostart) see [HUB-CONFIG.md](HUB-CONFIG.md).
 
 ## Troubleshooting
 

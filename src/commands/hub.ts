@@ -1,6 +1,10 @@
 import { openSync } from "fs";
+import { join } from "path";
+import { homedir } from "os";
+import { fileURLToPath } from "url";
 import { createInterface } from "readline";
 import { startHubServer } from "../hub/server";
+import { isProxyRunning, readProxyPid } from "./proxy";
 import {
   HUB_LOG_FILE,
   cleanupHubPid,
@@ -13,6 +17,7 @@ import {
 } from "../hub/paths";
 import { hasAuth, initAuth, rotateAuth } from "../hub/auth";
 import { listAgents, findAgentById, findAgentByPath } from "../hub/registry";
+import type { HubConfig } from "../hub/paths";
 import { spawnDetachedDaemon } from "../hub/spawn";
 import { stopByPath } from "./stop";
 import {
@@ -62,6 +67,55 @@ function isProcessAlive(pid: number): boolean {
   } catch {
     return false;
   }
+}
+
+const PROXY_LOG_FILE = join(homedir(), ".claude", "claudeclaw", "proxy.log");
+const ENTRY_SCRIPT = fileURLToPath(new URL("../index.ts", import.meta.url));
+
+async function maybeAutostartDaemons(cfg: HubConfig): Promise<void> {
+  const agents = await listAgents();
+  const opts = cfg.daemonAutostart;
+  let started = 0;
+  let skipped = 0;
+  for (const agent of agents) {
+    if (agent.alive) continue;
+    if (opts[agent.path] === false) {
+      skipped++;
+      continue;
+    }
+    try {
+      const spawned = await spawnDetachedDaemon(agent.path);
+      console.log(`  Daemon autostart: ${agent.path} (PID ${spawned.pid})`);
+      started++;
+    } catch (err) {
+      console.error(`  Daemon autostart FAILED: ${agent.path} — ${err instanceof Error ? err.message : err}`);
+    }
+  }
+  if (started === 0 && skipped === 0) {
+    console.log("  Daemon autostart: nothing to start (all alive or none registered)");
+  } else if (started === 0) {
+    console.log(`  Daemon autostart: ${skipped} skipped via config`);
+  }
+}
+
+async function maybeAutostartProxy(): Promise<void> {
+  // Survives hub restart on purpose — proxy lives independently with its own
+  // pid file at ~/.claude/claudeclaw/proxy.pid. We only spawn when nothing is
+  // already listening.
+  if (await isProxyRunning()) {
+    const pid = readProxyPid();
+    console.log(`  LINE Proxy: already running${pid ? ` (PID ${pid})` : ""}`);
+    return;
+  }
+  const logFd = openSync(PROXY_LOG_FILE, "a");
+  const proc = Bun.spawn([process.execPath, "run", ENTRY_SCRIPT, "proxy", "start"], {
+    stdin: "ignore",
+    stdout: logFd,
+    stderr: logFd,
+    env: process.env,
+  });
+  proc.unref();
+  console.log(`  LINE Proxy: autostart spawned (PID ${proc.pid}, logs: ${PROXY_LOG_FILE})`);
 }
 
 async function promptYesNo(question: string): Promise<boolean> {
@@ -162,7 +216,7 @@ async function cmdStart(args: string[]) {
   const finalPort = port ?? cfg.port;
 
   if (host !== null || port !== null) {
-    await writeHubConfig({ host: finalHost, port: finalPort });
+    await writeHubConfig({ ...cfg, host: finalHost, port: finalPort });
   }
 
   // Auto-init bearer token on first ever run.
@@ -215,6 +269,12 @@ async function cmdStart(args: string[]) {
 
   console.log(`ClaudeClaw Hub listening on http://${handle.host}:${handle.port}`);
   console.log(`  PID: ${process.pid}`);
+
+  if (cfg.autostartProxy) {
+    await maybeAutostartProxy();
+  }
+
+  await maybeAutostartDaemons(cfg);
 }
 
 async function cmdStop() {

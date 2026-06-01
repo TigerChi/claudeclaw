@@ -12,11 +12,20 @@ export const HUB_LOG_FILE = join(HUB_DIR, "hub.log");
 export interface HubConfig {
   host: string;
   port: number;
+  autostartProxy: boolean;
+  /**
+   * Per-agent opt-out for daemon autostart on hub start. Missing key (or
+   * missing field entirely) means "yes, autostart" — newly registered agents
+   * are picked up automatically. Set a path to `false` to skip it.
+   */
+  daemonAutostart: Record<string, boolean>;
 }
 
 export const DEFAULT_HUB_CONFIG: HubConfig = {
   host: "127.0.0.1",
   port: 4631,
+  autostartProxy: false,
+  daemonAutostart: {},
 };
 
 export async function ensureHubDir(): Promise<void> {
@@ -28,9 +37,17 @@ export async function readHubConfig(): Promise<HubConfig> {
   try {
     const raw = await readFile(HUB_CONFIG_FILE, "utf-8");
     const parsed = JSON.parse(raw);
+    const daemonAutostart: Record<string, boolean> = {};
+    if (parsed.daemonAutostart && typeof parsed.daemonAutostart === "object" && !Array.isArray(parsed.daemonAutostart)) {
+      for (const [k, v] of Object.entries(parsed.daemonAutostart)) {
+        if (typeof v === "boolean") daemonAutostart[k] = v;
+      }
+    }
     return {
       host: typeof parsed.host === "string" && parsed.host.trim() ? parsed.host.trim() : DEFAULT_HUB_CONFIG.host,
       port: Number.isFinite(parsed.port) ? Number(parsed.port) : DEFAULT_HUB_CONFIG.port,
+      autostartProxy: typeof parsed.autostartProxy === "boolean" ? parsed.autostartProxy : DEFAULT_HUB_CONFIG.autostartProxy,
+      daemonAutostart,
     };
   } catch {
     return { ...DEFAULT_HUB_CONFIG };
