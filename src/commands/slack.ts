@@ -936,18 +936,23 @@ async function handleMessage(event: SlackMessage): Promise<void> {
     // event.thread_ts is set when the message is inside a thread.
     // For the root message of a thread it equals event.ts.
     //
-    // DM (im):      sessionThreadId = slk:<dmChannelId>  → own per-DM session.
-    //               The DM channel id (D...) is stable per user, so every message
-    //               in this DM resumes the same session, and each user's DM is
-    //               isolated from every other DM and from global.
-    // Channel in-thread:  sessionThreadId = slk:<channelId>:<thread_ts>
-    // Channel top-level:  sessionThreadId = undefined → global (v1 default; A1
-    //                                                  promotes this to per-thread later).
+    // Per-thread sessions for ALL channel messages (not just thread replies):
+    //   DM (im):                    sessionThreadId = slk:<dmChannelId>  → own per-DM session.
+    //                                  The DM channel id (D...) is stable per user.
+    //   non-DM top-level (no thread): use the message's OWN ts as the thread anchor.
+    //                                  Bot replies in that thread (replyThreadTs = event.ts),
+    //                                  follow-ups will have event.thread_ts = anchor → same session.
+    //   non-DM in-thread:           use event.thread_ts as the anchor (unchanged).
+    //
+    // Effect: a brand-new channel message starts its own per-thread Claude session
+    // (clean isolation) instead of dumping into global where TG DMs / cron jobs /
+    // other channels' first messages all mix.
     const inThread = !!event.thread_ts;
     const replyThreadTs = event.thread_ts ?? event.ts; // reply in same thread
+    const threadAnchor = event.thread_ts ?? event.ts;  // session anchor (own ts for new threads)
     const sessionThreadId = isDirectMessage
       ? `slk:${channelId}`
-      : inThread ? slackThreadId(channelId, event.thread_ts!) : undefined;
+      : slackThreadId(channelId, threadAnchor);
 
     // Handle /cancel — abort the in-flight Claude run for this thread/global key
     if (isCancelCommand(cleanText)) {
