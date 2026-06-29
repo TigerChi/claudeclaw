@@ -264,6 +264,47 @@ async function setAssistantSuggestedPrompts(
 // Track channels that are assistant threads (no @mention needed)
 const assistantThreadChannels = new Set<string>();
 
+// --- Markdown → Slack mrkdwn ---
+
+/**
+ * Claude tends to emit standard markdown (**bold**, [label](url), # Header),
+ * but Slack only renders its own mrkdwn syntax. Convert before sending so
+ * users see formatted output instead of literal asterisks etc.
+ *
+ * Code blocks and inline code are stashed first so transformations don't
+ * touch their contents.
+ */
+function markdownToSlackMrkdwn(text: string): string {
+  if (!text) return text;
+  const stashed: string[] = [];
+  const stash = (s: string): string => {
+    stashed.push(s);
+    return `\x00STASH${stashed.length - 1}\x00`;
+  };
+  let s = text;
+  // Stash code so transformations don't touch them
+  s = s.replace(/```[\s\S]*?```/g, (m) => stash(m));
+  s = s.replace(/`[^`\n]*`/g, (m) => stash(m));
+  // Links
+  s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_m, label, url) => `<${url}|${label}>`);
+  // Bold-italic FIRST (more specific): ***X*** / ___X___ -> *_X_*
+  s = s.replace(/\*\*\*([^*\n]+?)\*\*\*/g, "*_$1_*");
+  s = s.replace(/___([^_\n]+?)___/g, "*_$1_*");
+  // Italic BEFORE bold so single * doesn't get mistaken for downgraded bold.
+  // Lookbehind/ahead avoids ** boundaries and inside-word matches.
+  s = s.replace(/(?<![*\w])\*([^*\n]+?)\*(?![*\w])/g, "_$1_");
+  // Bold: **X** / __X__ -> *X*
+  s = s.replace(/\*\*([^*\n]+?)\*\*/g, "*$1*");
+  s = s.replace(/__([^_\n]+?)__/g, "*$1*");
+  // Strikethrough: ~~X~~ -> ~X~
+  s = s.replace(/~~([^~\n]+?)~~/g, "~$1~");
+  // Headers LAST: '# X' / '## X' etc at line start -> '*X*'
+  s = s.replace(/^#{1,6}\s+(.+?)$/gm, "*$1*");
+  // Restore stashed code
+  s = s.replace(/\x00STASH(\d+)\x00/g, (_m, i) => stashed[Number(i)] ?? "");
+  return s;
+}
+
 // --- Message sending ---
 
 async function sendMessage(
@@ -275,11 +316,12 @@ async function sendMessage(
   // Strip [react:...] directives before sending
   const normalized = text.replace(/\[react:[^\]\r\n]+\]/gi, "").trim();
   if (!normalized) return;
+  const mrkdwn = markdownToSlackMrkdwn(normalized);
 
   // Slack max message length is 40000 chars, chunk at 3800 for mrkdwn block limits
   const MAX_LEN = 3800;
-  for (let i = 0; i < normalized.length; i += MAX_LEN) {
-    const chunk = normalized.slice(i, i + MAX_LEN);
+  for (let i = 0; i < mrkdwn.length; i += MAX_LEN) {
+    const chunk = mrkdwn.slice(i, i + MAX_LEN);
     const params: Record<string, unknown> = {
       channel: channelId,
       text: chunk,
@@ -333,7 +375,7 @@ async function updateMessage(
   await slackApi(token, "chat.update", {
     channel: channelId,
     ts: messageTs,
-    text,
+    text: markdownToSlackMrkdwn(text),
   }).catch((err) => {
     debugLog(`chat.update failed: ${err instanceof Error ? err.message : err}`);
   });
@@ -360,7 +402,7 @@ async function postMessage(
 ): Promise<string | null> {
   const params: Record<string, unknown> = {
     channel: channelId,
-    text,
+    text: markdownToSlackMrkdwn(text),
   };
   if (threadTs) params.thread_ts = threadTs;
   const data = await slackApi<{ ts: string }>(token, "chat.postMessage", params).catch((err) => {
@@ -457,7 +499,7 @@ async function sendBlockKitMessage(
   if (text) {
     blocks.push({
       type: "section",
-      text: { type: "mrkdwn", text },
+      text: { type: "mrkdwn", text: markdownToSlackMrkdwn(text) },
     });
   }
 
