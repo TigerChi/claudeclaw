@@ -635,6 +635,10 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
   const userId = message.from?.id;
   const chatId = message.chat.id;
   const threadId = message.message_thread_id;
+  // Per-chat session key: DM (private chat), group, and supergroup each get their
+  // own session keyed by chat id; forum topics split further by message_thread_id.
+  // Without this, every Telegram chat funnels into the global session.
+  const tgSessionId = `tg:${chatId}${threadId ? `:${threadId}` : ""}`;
   const { text } = getMessageTextAndEntities(message);
   const chatType = message.chat.type;
   const isPrivate = chatType === "private";
@@ -722,7 +726,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
   }
 
   if (command === "/cancel") {
-    const cancelled = cancelThread(undefined);
+    const cancelled = cancelThread(tgSessionId);
     await sendMessage(config.token, chatId, cancelled ? CANCEL_CONFIRM_MESSAGE : CANCEL_NOTHING_MESSAGE, threadId);
     return;
   }
@@ -945,7 +949,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     // Queue/processing feedback: ⏳ tells user "message received, working on it"
     await sendReaction(config.token, chatId, message.message_id, "⏳").catch(() => {});
 
-    const result = await runUserMessage("telegram", prefixedPrompt);
+    const result = await runUserMessage("telegram", prefixedPrompt, tgSessionId);
 
     if (result.exitCode !== 0) {
       // TEMP DIAGNOSTIC (2026-05-24): capture full failure context before replying
