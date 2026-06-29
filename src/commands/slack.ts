@@ -950,9 +950,17 @@ async function handleMessage(event: SlackMessage): Promise<void> {
     const inThread = !!event.thread_ts;
     const replyThreadTs = event.thread_ts ?? event.ts; // reply in same thread
     const threadAnchor = event.thread_ts ?? event.ts;  // session anchor (own ts for new threads)
+    // Channel-message session key honours the configured granularity:
+    //   "channel" → all threads in this channel share one session (slk:<channelId>)
+    //   "thread"  → each thread its own session (slk:<channelId>:<threadAnchor>; default)
+    // Per-channel override wins over the agent-wide default. DMs are always per-user.
+    const channelGranularity =
+      config.sessionChannelOverrides?.[channelId] ?? config.sessionGranularity ?? "thread";
     const sessionThreadId = isDirectMessage
       ? `slk:${channelId}`
-      : slackThreadId(channelId, threadAnchor);
+      : channelGranularity === "channel"
+        ? `slk:${channelId}`
+        : slackThreadId(channelId, threadAnchor);
 
     // Handle /cancel — abort the in-flight Claude run for this thread/global key
     if (isCancelCommand(cleanText)) {
