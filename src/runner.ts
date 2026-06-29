@@ -172,6 +172,11 @@ function buildChildEnv(baseEnv: Record<string, string>, model: string, api: stri
     childEnv.API_TIMEOUT_MS = "3000000";
   }
 
+  // Mark this spawn as daemon-originated so the SessionStart hook
+  // (inject-usage.sh) knows USAGE.md is already in --append-system-prompt
+  // and can skip re-injecting.
+  childEnv.CLAUDECLAW_DAEMON = "1";
+
   return childEnv;
 }
 
@@ -335,6 +340,7 @@ async function loadPrompts(): Promise<string> {
     join(PROMPTS_DIR, "IDENTITY.md"),
     join(PROMPTS_DIR, "USER.md"),
     join(PROMPTS_DIR, "SOUL.md"),
+    join(PROMPTS_DIR, "USAGE.md"),
   ];
   const parts: string[] = [];
 
@@ -785,6 +791,8 @@ async function streamClaude(
     envOverrides.ANTHROPIC_BASE_URL = "https://api.z.ai/api/anthropic";
     envOverrides.API_TIMEOUT_MS = "3000000";
   }
+  // Mark daemon-originated spawn (see buildChildEnv comment).
+  envOverrides.CLAUDECLAW_DAEMON = "1";
   const { CLAUDECODE: _sdkClaudecode, ...sdkCleanEnv } = process.env;
   sdkOptions.env = {
     ...withDaemonSafeEnv(sdkCleanEnv as NodeJS.ProcessEnv),
