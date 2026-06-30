@@ -161,8 +161,12 @@ function botMessageKey(channelId: string, threadTs?: string): string {
   return threadTs ? `${channelId}:${threadTs}` : channelId;
 }
 
-// #5: Track threads where history has already been loaded
-const threadHistoryLoaded = new Set<string>();
+// Last event.ts this agent has processed for each thread session. Used to
+// inject only NEW messages from the thread on each subsequent turn (so the
+// agent can see what other agents — or the user — wrote in the thread between
+// the agent's own turns). Per-process memory only; daemon restart re-loads
+// the full window on the next message.
+const lastThreadTsSeen = new Map<string, string>();
 
 function isDuplicate(channelId: string, ts: string): boolean {
   const key = `${channelId}:${ts}`;
@@ -663,7 +667,7 @@ async function fetchThreadHistory(
   channelId: string,
   threadTs: string,
   limit: number = 20,
-): Promise<{ role: string; text: string; user?: string; ts: string }[]> {
+): Promise<{ role: string; text: string; user?: string; botId?: string; username?: string; ts: string }[]> {
   // conversations.replies uses GET-style params — pass as query string via fetch
   const params = new URLSearchParams({
     channel: channelId,
@@ -682,6 +686,7 @@ async function fetchThreadHistory(
       text: string;
       user?: string;
       bot_id?: string;
+      username?: string;
       ts: string;
     }>;
   };
@@ -693,18 +698,28 @@ async function fetchThreadHistory(
     role: msg.bot_id ? "assistant" : "user",
     text: msg.text,
     user: msg.user,
+    botId: msg.bot_id,
+    username: msg.username,
     ts: msg.ts,
   }));
 }
 
 function formatThreadHistoryAsContext(
-  messages: { role: string; text: string; user?: string; ts: string }[],
+  messages: { role: string; text: string; user?: string; botId?: string; username?: string; ts: string }[],
 ): string {
   if (messages.length === 0) return "";
 
   const lines = ["--- Thread History (previous messages) ---"];
   for (const msg of messages) {
-    const sender = msg.role === "assistant" ? "Bot" : `User ${msg.user ?? "unknown"}`;
+    // Identify the sender as precisely as possible so multi-agent threads can
+    // tell whose reply was whose: prefer username (some bots set it), else
+    // bot_id (distinguishes different bot apps), else the user id.
+    let sender: string;
+    if (msg.role === "assistant") {
+      sender = msg.username ? `Bot ${msg.username}` : `Bot ${msg.botId ?? "unknown"}`;
+    } else {
+      sender = `User ${msg.user ?? "unknown"}`;
+    }
     lines.push(`[${sender}]: ${msg.text}`);
   }
   lines.push("--- End of Thread History ---");
@@ -1024,23 +1039,31 @@ async function handleMessage(event: SlackMessage): Promise<void> {
       }
     }
 
-    // #5: Load thread history for new thread sessions
+    // Load thread history on every in-thread turn, but inject only messages
+    // that arrived after this agent's last processed event.ts. Lets the agent
+    // see other agents' / the user's intervening replies between its own turns.
+    //
+    // First time this thread is seen in this process: lastTs is undefined →
+    // all earlier messages (full window) get injected. Subsequent turns only
+    // pick up the delta. Slack ts strings are fixed-width "<10>.<6>" digits so
+    // lexicographic > equals chronological >.
     let threadHistoryContext = "";
-    if (inThread && sessionThreadId && !threadHistoryLoaded.has(sessionThreadId)) {
-      const existingSession = await peekThreadSession(sessionThreadId);
-      if (!existingSession) {
-        try {
-          const history = await fetchThreadHistory(config.botToken, channelId, event.thread_ts!, 20);
-          const pastMessages = history.filter((m) => m.ts !== event.ts);
-          if (pastMessages.length > 0) {
-            threadHistoryContext = formatThreadHistoryAsContext(pastMessages);
-            debugLog(`Loaded ${pastMessages.length} thread history messages for ${sessionThreadId}`);
-          }
-        } catch (err) {
-          debugLog(`Failed to load thread history: ${err instanceof Error ? err.message : err}`);
+    if (inThread && sessionThreadId) {
+      try {
+        const history = await fetchThreadHistory(config.botToken, channelId, event.thread_ts!, 50);
+        const lastTs = lastThreadTsSeen.get(sessionThreadId);
+        const newMessages = history.filter((m) =>
+          m.ts !== event.ts && (!lastTs || m.ts > lastTs)
+        );
+        if (newMessages.length > 0) {
+          threadHistoryContext = formatThreadHistoryAsContext(newMessages);
+          debugLog(`Loaded ${newMessages.length} new thread message(s) for ${sessionThreadId}` +
+                   (lastTs ? ` since ${lastTs}` : " (first time)"));
         }
+      } catch (err) {
+        debugLog(`Failed to load thread history: ${err instanceof Error ? err.message : err}`);
       }
-      threadHistoryLoaded.add(sessionThreadId);
+      lastThreadTsSeen.set(sessionThreadId, event.ts);
     }
 
     const imagePaths: string[] = [];
