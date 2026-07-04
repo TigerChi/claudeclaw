@@ -1,6 +1,7 @@
 import { ensureProjectClaudeMd, runUserMessage, streamUserMessage, compactCurrentSession, cancelThread } from "../runner";
 import { isCancelCommand, CANCEL_CONFIRM_MESSAGE, CANCEL_NOTHING_MESSAGE } from "../cancel";
 import { getSettings, loadSettings } from "../config";
+import { recordSeen, harvestAgentName, getNotifyDispatcher } from "../contacts";
 import { resetSession, peekSession } from "../sessions";
 import { listThreadSessions, peekThreadSession } from "../sessionManager";
 import { transcribeAudioToText } from "../whisper";
@@ -965,6 +966,12 @@ async function handleMessage(event: SlackMessage): Promise<void> {
     return;
   }
 
+  // Contact harvest — feed the shared candidate pool (contacts/seen/).
+  // Slack events don't carry display names; ids are enough to promote later.
+  void recordSeen(harvestAgentName(getSettings().agentBus.name), isDirectMessage
+    ? { platform: "slack", id: userId, kind: "user" }
+    : { platform: "slack", id: channelId, kind: "channel" });
+
   // Strip mention from text
   let cleanText = event.text;
   if (botUserId) {
@@ -1260,8 +1267,21 @@ async function handleMessage(event: SlackMessage): Promise<void> {
         if (sentTs) lastBotMessageTs.set(botMessageKey(channelId, replyThreadTs), sentTs);
       }
     } else {
+      // Deliver [notify:] directives first (dispatcher registered by the daemon;
+      // strips the blocks so the remaining text posts to this conversation as usual)
+      let afterNotify = responseText;
+      const notifyDispatch = getNotifyDispatcher();
+      if (notifyDispatch && /\[notify:/i.test(responseText)) {
+        try {
+          const { cleaned, hadNotify } = await notifyDispatch("slack", responseText);
+          if (hadNotify) afterNotify = cleaned.trim() || "✓ 已送出通知";
+        } catch (err) {
+          debugLog(`notify dispatch failed: ${err instanceof Error ? err.message : err}`);
+        }
+      }
+
       // Extract all directives
-      const { cleanedText: afterReact, reactionEmoji } = extractReactionDirective(responseText);
+      const { cleanedText: afterReact, reactionEmoji } = extractReactionDirective(afterNotify);
       const { cleanedText: afterEdit, editContent, deleteCount, deleteMatches } = extractEditDirective(afterReact);
       const { cleanedText: afterUpload, uploads } = extractUploadDirectives(afterEdit);
       const { cleanedText: afterChannelRead, channelReads } = extractChannelReadDirectives(afterUpload);

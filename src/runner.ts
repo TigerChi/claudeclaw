@@ -523,6 +523,12 @@ async function execClaudeImpl(name: string, prompt: string, threadId: string | u
         .map(([name, entry]) => `  - ${name} (${entry.status}, project: ${entry.projectDir})`)
         .join("\n");
 
+      const notifyMode: "legacy" | "explicit" =
+        (settings as any).notify?.mode === "explicit" ? "explicit" : "legacy";
+      const plainTextBehavior = notifyMode === "explicit"
+        ? "- When you receive an Agent Bus message, your plain text reply is NOT forwarded to any user. To reach a user or group, you MUST use a [notify:<target>] directive (see below). Plain text without [notify:] stays private between agents."
+        : "- When you receive an Agent Bus message, your plain text reply (anything NOT inside a directive) will be automatically forwarded to the user on all active messaging channels (LINE, Telegram, Slack, Discord). If your reply contains any [notify:] directive, ONLY the [notify:] parts are delivered (to their targets) and the remaining plain text stays private.";
+
       const busPrompt = [
         "## Agent Bus — Inter-Agent Communication",
         "",
@@ -536,10 +542,18 @@ async function execClaudeImpl(name: string, prompt: string, threadId: string | u
         "  [send-agent:alice] Please check the latest deployment status",
         "",
         "### How Agent Bus messages work:",
-        "- When you receive an Agent Bus message, your plain text reply (anything NOT inside a [send-agent:] directive) will be automatically forwarded to the user on all active messaging channels (LINE, Telegram, Slack, Discord).",
+        plainTextBehavior,
         "- [send-agent:] directives in your reply are extracted and sent to that agent. They are NOT shown to the user.",
-        "- So if you want to talk to the user: write plain text. If you want to talk to another agent: use [send-agent:].",
-        "- You can do BOTH in the same reply — plain text goes to the user, directives go to agents.",
+        "",
+        "### Targeted user notification — [notify:]:",
+        "To send a message to a specific user or group on a specific platform, wrap it in a notify block:",
+        "  [notify:<target>]message here[/notify]",
+        "Target forms:",
+        "  - A recipient name or alias from the shared contacts book (~/.claude/claudeclaw/contacts/book.json), e.g. [notify:boss]...[/notify] — delivers to that recipient's default platforms.",
+        "  - name@platform to pin one platform, e.g. [notify:boss@slack]...[/notify]",
+        "  - Direct addressing: [notify:telegram:123456]...[/notify], [notify:slack:C0123ABC]...[/notify], [notify:slack:C0123ABC:1699999999.000100]...[/notify] (thread)",
+        "Notify content is plain text only — platform directives inside it are not interpreted.",
+        "Only notify users when the task genuinely calls for it; failed deliveries are logged to contacts/dead-letter.jsonl.",
         "",
         "### Rules:",
         "- Only use [send-agent:] when the user explicitly asks you to contact another agent, or when the task clearly requires another agent's help.",

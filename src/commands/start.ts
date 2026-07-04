@@ -25,6 +25,14 @@ import {
   gcPending,
   type AgentMessage,
 } from "../agent-bus";
+import {
+  extractNotifyDirectives,
+  resolveNotifyTarget,
+  loadBook,
+  recordDeadLetter,
+  setNotifyDispatcher,
+  type NotifyDelivery,
+} from "../contacts";
 
 const CLAUDE_DIR = join(process.cwd(), ".claude");
 const HEARTBEAT_DIR = join(CLAUDE_DIR, "claudeclaw");
@@ -641,9 +649,11 @@ export async function start(args: string[] = []) {
 
   function forwardToTelegram(label: string, result: { exitCode: number; stdout: string; stderr: string }) {
     if (!telegramSend || currentSettings.telegram.allowedUserIds.length === 0) return;
-    const text = result.exitCode === 0
-      ? `${label ? `[${label}]\n` : ""}${result.stdout || "(empty)"}`
-      : `${label ? `[${label}] ` : ""}error (exit ${result.exitCode}): ${result.stderr || "Unknown"}`;
+    const body = result.exitCode === 0
+      ? (result.stdout || "(empty)")
+      : `error (exit ${result.exitCode}): ${result.stderr || "Unknown"}`;
+    // Label goes at the END so push-notification previews show content first.
+    const text = label ? `${body}\n[${label}]` : body;
     for (const userId of currentSettings.telegram.allowedUserIds) {
       telegramSend(userId, text).catch((err) =>
         console.error(`[Telegram] Failed to forward to ${userId}: ${err}`)
@@ -653,9 +663,11 @@ export async function start(args: string[] = []) {
 
   function forwardToDiscord(label: string, result: { exitCode: number; stdout: string; stderr: string }) {
     if (!discordSendToUser || currentSettings.discord.allowedUserIds.length === 0) return;
-    const text = result.exitCode === 0
-      ? `${label ? `[${label}]\n` : ""}${result.stdout || "(empty)"}`
-      : `${label ? `[${label}] ` : ""}error (exit ${result.exitCode}): ${result.stderr || "Unknown"}`;
+    const body = result.exitCode === 0
+      ? (result.stdout || "(empty)")
+      : `error (exit ${result.exitCode}): ${result.stderr || "Unknown"}`;
+    // Label goes at the END so push-notification previews show content first.
+    const text = label ? `${body}\n[${label}]` : body;
     for (const userId of currentSettings.discord.allowedUserIds) {
       discordSendToUser(userId, text).catch((err) =>
         console.error(`[Discord] Failed to forward to ${userId}: ${err}`)
@@ -668,9 +680,11 @@ export async function start(args: string[] = []) {
     result: { exitCode: number; stdout: string; stderr: string },
     target?: string,
   ) {
-    const text = result.exitCode === 0
-      ? `${label ? `[${label}]\n` : ""}${result.stdout || "(empty)"}`
-      : `${label ? `[${label}] ` : ""}error (exit ${result.exitCode}): ${result.stderr || "Unknown"}`;
+    const body = result.exitCode === 0
+      ? (result.stdout || "(empty)")
+      : `error (exit ${result.exitCode}): ${result.stderr || "Unknown"}`;
+    // Label goes at the END so push-notification previews show content first.
+    const text = label ? `${body}\n[${label}]` : body;
     // Explicit channel/thread target (cron job slackTarget / heartbeat slackTarget):
     // post once to that target instead of broadcasting to each allowed user's DM.
     if (target && slackSendToTarget) {
@@ -691,15 +705,135 @@ export async function start(args: string[] = []) {
     if (!lineSendToUser) return;
     const targets = lineForwardTargets();
     if (targets.length === 0) return;
-    const text = result.exitCode === 0
-      ? `${label ? `[${label}]\n` : ""}${result.stdout || "(empty)"}`
-      : `${label ? `[${label}] ` : ""}error (exit ${result.exitCode}): ${result.stderr || "Unknown"}`;
+    const body = result.exitCode === 0
+      ? (result.stdout || "(empty)")
+      : `error (exit ${result.exitCode}): ${result.stderr || "Unknown"}`;
+    // Label goes at the END so push-notification previews show content first.
+    const text = label ? `${body}\n[${label}]` : body;
     for (const userId of targets) {
       lineSendToUser(userId, text).catch((err) =>
         console.error(`[LINE] Failed to forward to ${userId}: ${err}`)
       );
     }
   }
+
+  // --- Targeted notify ([notify:<target>]...[/notify] directives) ---
+
+  /** True when this agent has the platform initialized and can send on it. */
+  function isPlatformConfigured(platform: NotifyDelivery["platform"]): boolean {
+    switch (platform) {
+      case "telegram": return !!telegramSend;
+      case "slack": return !!slackSendToUser && !!slackSendToTarget;
+      case "line": return !!lineSendToUser;
+      case "discord": return !!discordSendToUser || !!discordToken;
+    }
+  }
+
+  /** Send one resolved delivery through the matching platform sender. Throws on failure. */
+  async function sendNotifyDelivery(d: NotifyDelivery, text: string): Promise<void> {
+    switch (d.platform) {
+      case "telegram": {
+        if (!telegramSend) throw new Error("telegram not configured on this agent");
+        await telegramSend(Number(d.id), text);
+        return;
+      }
+      case "slack": {
+        if (d.kind === "user") {
+          if (!slackSendToUser) throw new Error("slack not configured on this agent");
+          await slackSendToUser(d.id, text);
+        } else {
+          if (!slackSendToTarget) throw new Error("slack not configured on this agent");
+          await slackSendToTarget(d.threadTs ? `${d.id}:${d.threadTs}` : d.id, text);
+        }
+        return;
+      }
+      case "line": {
+        // LINE push API accepts user (U…), group (C…), and room (R…) ids alike.
+        if (!lineSendToUser) throw new Error("line not configured on this agent");
+        await lineSendToUser(d.id, text);
+        return;
+      }
+      case "discord": {
+        if (d.kind === "user") {
+          if (!discordSendToUser) throw new Error("discord not configured on this agent");
+          await discordSendToUser(d.id, text);
+        } else {
+          if (!discordToken) throw new Error("discord not configured on this agent");
+          const { sendMessage: discordSendToChannel } = await import("./discord");
+          await discordSendToChannel(discordToken, d.id, text);
+        }
+        return;
+      }
+    }
+  }
+
+  /**
+   * Extract and deliver [notify:] directives from a run's output.
+   * Returns the output with directives stripped, and whether any were present.
+   * Failures land in contacts/dead-letter.jsonl — never thrown to the caller.
+   * `[notify:reply]` has no meaning in daemon-triggered runs (bus/cron/heartbeat)
+   * and is dead-lettered rather than guessed at.
+   */
+  async function dispatchNotifies(
+    source: string,
+    stdout: string,
+  ): Promise<{ cleaned: string; hadNotify: boolean }> {
+    const { cleaned, directives } = extractNotifyDirectives(stdout);
+    if (directives.length === 0) return { cleaned: stdout, hadNotify: false };
+
+    const book = await loadBook();
+    for (const dir of directives) {
+      const preview = dir.payload.slice(0, 200);
+      const resolved = resolveNotifyTarget(dir.target, book);
+      if (!resolved.ok) {
+        console.error(`[${ts()}] notify(${source}): ${resolved.error}`);
+        await recordDeadLetter({ at: new Date().toISOString(), source, target: dir.target, error: resolved.error, preview });
+        continue;
+      }
+      if (resolved.kind === "reply") {
+        const error = `[notify:reply] is not available in ${source} runs (no originating platform message)`;
+        console.error(`[${ts()}] notify(${source}): ${error}`);
+        await recordDeadLetter({ at: new Date().toISOString(), source, target: dir.target, error, preview });
+        continue;
+      }
+      // Default fan-out (bare recipient name): platforms this agent can't send
+      // on are skipped quietly — the book is shared across agents with
+      // different tokens. Dead-letter only if nothing was deliverable at all.
+      // Pinned (@platform) and direct targets keep hard failures.
+      const attempted = resolved.softSkipUnconfigured
+        ? resolved.deliveries.filter((d) => {
+            if (isPlatformConfigured(d.platform)) return true;
+            console.log(`[${ts()}] notify(${source}): skipping ${d.platform} for "${dir.target}" (not configured on this agent)`);
+            return false;
+          })
+        : resolved.deliveries;
+      if (attempted.length === 0) {
+        const error = `none of "${dir.target}"'s default platforms are configured on this agent`;
+        console.error(`[${ts()}] notify(${source}): ${error}`);
+        await recordDeadLetter({ at: new Date().toISOString(), source, target: dir.target, error, preview });
+        continue;
+      }
+      // Append the sender/source tag (bus sender agent, cron job name,
+      // "heartbeat") so recipients can tell who a targeted message came from.
+      // It goes at the END so push-notification previews show content first.
+      const outText = source ? `${dir.payload}\n[${source}]` : dir.payload;
+      for (const d of attempted) {
+        try {
+          await sendNotifyDelivery(d, outText);
+          console.log(`[${ts()}] notify(${source}): sent to ${dir.target} via ${d.platform}:${d.id}`);
+        } catch (err) {
+          const error = err instanceof Error ? err.message : String(err);
+          console.error(`[${ts()}] notify(${source}): delivery to ${d.platform}:${d.id} failed — ${error}`);
+          await recordDeadLetter({ at: new Date().toISOString(), source, target: `${d.platform}:${d.id}`, error, preview });
+        }
+      }
+    }
+    return { cleaned, hadNotify: true };
+  }
+
+  // Let platform reply pipelines (slack/telegram/...) honor [notify:] too —
+  // they run inside their own modules and can't reach this closure directly.
+  setNotifyDispatcher(dispatchNotifies);
 
   // --- Heartbeat scheduling ---
   function scheduleHeartbeat() {
@@ -744,8 +878,15 @@ export async function start(args: string[] = []) {
           if (!mergedPrompt) return null;
           return run("heartbeat", mergedPrompt);
         })
-        .then((r) => {
+        .then(async (r) => {
           if (!r) return;
+          if (r.exitCode === 0 && r.stdout?.trim()) {
+            const { cleaned, hadNotify } = await dispatchNotifies("heartbeat", r.stdout);
+            r.stdout = cleaned;
+            // Output containing [notify:] is delivered ONLY via those targets —
+            // the remainder is not broadcast.
+            if (hadNotify) return;
+          }
           const shouldForward = currentSettings.heartbeat.forwardToTelegram || !r.stdout.trim().startsWith("HEARTBEAT_OK");
           if (shouldForward) {
             forwardToTelegram("", r);
@@ -812,6 +953,33 @@ export async function start(args: string[] = []) {
     return true;
   }
 
+  /**
+   * Deliver an agent-bus run's user-facing output.
+   * [notify:] directives are always honored. What happens to the remaining
+   * plain text depends on settings.notify.mode:
+   *   "legacy"   — broadcast to every allowed user on all channels (old behavior)
+   *   "explicit" — kept private; only [notify:] output reaches users
+   */
+  async function forwardBusResult(
+    r: { exitCode: number; stdout: string; stderr: string },
+    from: string,
+  ): Promise<void> {
+    if (r.exitCode !== 0 || !r.stdout?.trim()) return;
+    // Label shows WHO the incoming bus message came from, e.g. [dev]
+    const label = from;
+    const { cleaned, hadNotify } = await dispatchNotifies(label, r.stdout);
+    r.stdout = cleaned;
+    if (hadNotify || !cleaned.trim()) return;
+    if (currentSettings.notify.mode === "explicit") {
+      console.log(`[${ts()}] Agent Bus: reply kept private (notify mode: explicit, no [notify:] directive)`);
+      return;
+    }
+    forwardToTelegram(label, r);
+    forwardToDiscord(label, r);
+    forwardToSlack(label, r);
+    forwardToLine(label, r);
+  }
+
   if (currentSettings.agentBus.enabled && currentSettings.agentBus.name) {
     const busName = currentSettings.agentBus.name;
     await registerAgent(busName, process.cwd(), process.pid, "online");
@@ -827,16 +995,10 @@ export async function start(args: string[] = []) {
 
       const prompt = buildAgentMessagePrompt([msg]);
       const r = await run("agent-bus", prompt, undefined, msg.id);
-      // Forward non-empty results to messaging channels
-      if (r.exitCode === 0 && r.stdout?.trim()) {
-        forwardToTelegram("agent-bus", r);
-        forwardToDiscord("agent-bus", r);
-        forwardToSlack("agent-bus", r);
-        forwardToLine("agent-bus", r);
-      }
+      await forwardBusResult(r, msg.from);
     });
 
-    console.log(`[${ts()}] Agent Bus: enabled as "${busName}"`);
+    console.log(`[${ts()}] Agent Bus: enabled as "${busName}" (notify mode: ${currentSettings.notify.mode})`);
   }
 
   async function handleSystemMessage(msg: AgentMessage & { action?: string; reason?: string }) {
@@ -939,12 +1101,7 @@ export async function start(args: string[] = []) {
 
           const prompt = buildAgentMessagePrompt([msg]);
           const r = await run("agent-bus", prompt, undefined, msg.id);
-          if (r.exitCode === 0 && r.stdout?.trim()) {
-            forwardToTelegram("agent-bus", r);
-            forwardToDiscord("agent-bus", r);
-            forwardToSlack("agent-bus", r);
-            forwardToLine("agent-bus", r);
-          }
+          await forwardBusResult(r, msg.from);
         }
       }
     } catch (err) {
@@ -986,8 +1143,17 @@ export async function start(args: string[] = []) {
       if (cronMatches(job.schedule, now, currentSettings.timezoneOffsetMinutes)) {
         resolvePrompt(job.prompt)
           .then((prompt) => run(job.name, prompt))
-          .then((r) => {
-              if (job.notify === false) return;
+          .then(async (r) => {
+            // [notify:] directives are honored regardless of the job's notify
+            // setting — an explicit target in the output is an explicit intent.
+            if (r.exitCode === 0 && r.stdout.trim()) {
+              const { cleaned, hadNotify } = await dispatchNotifies(job.name, r.stdout);
+              r.stdout = cleaned;
+              // Output containing [notify:] is delivered ONLY via those
+              // targets — skip the channels/slackTarget broadcast entirely.
+              if (hadNotify) return;
+            }
+            if (job.notify === false) return;
             if (job.notify === "error" && r.exitCode === 0) return;
             // Empty stdout on success = the job chose to stay silent (e.g. a
             // threshold monitor under its alert level). Don't forward "(empty)".

@@ -1,6 +1,7 @@
 import { ensureProjectClaudeMd, run, runUserMessage, compactCurrentSession, cancelThread } from "../runner";
 import { CANCEL_CONFIRM_MESSAGE, CANCEL_NOTHING_MESSAGE } from "../cancel";
 import { addTelegramAllowedUser, getSettings, loadSettings } from "../config";
+import { recordSeen, harvestAgentName } from "../contacts";
 import { resetSession, peekSession } from "../sessions";
 import { readFile, mkdir, appendFile, stat } from "node:fs/promises";
 import { existsSync } from "node:fs";
@@ -162,7 +163,7 @@ interface TelegramMessage {
   message_id: number;
   from?: TelegramUser;
   reply_to_message?: { message_id?: number; from?: TelegramUser };
-  chat: { id: number; type: string };
+  chat: { id: number; type: string; title?: string };
   message_thread_id?: number;
   text?: string;
   caption?: string;
@@ -622,6 +623,14 @@ async function handleMyChatMember(update: TelegramMyChatMemberUpdate): Promise<v
   const chatName = chat.title ?? String(chat.id);
   console.log(`[Telegram] Added to ${chat.type}: ${chatName} (${chat.id}) by ${update.from.id}`);
 
+  // Contact harvest — being added to a group is the primary way group ids enter the candidate pool.
+  void recordSeen(harvestAgentName(getSettings().agentBus.name), {
+    platform: "telegram",
+    id: String(chat.id),
+    kind: "group",
+    name: chat.title,
+  });
+
   const addedBy = update.from.username ?? `${update.from.first_name} (${update.from.id})`;
   const eventPrompt =
     `[Telegram system event] I was added to a ${chat.type}.\n` +
@@ -717,6 +726,17 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     }
     return;
   }
+
+  // Contact harvest — feed the shared candidate pool (contacts/seen/) so chats
+  // can later be promoted into the contacts book by name.
+  void recordSeen(harvestAgentName(getSettings().agentBus.name), {
+    platform: "telegram",
+    id: String(chatId),
+    kind: isGroup ? "group" : "user",
+    name: isGroup
+      ? message.chat.title
+      : message.from?.username ?? message.from?.first_name,
+  });
 
   if (!text.trim() && !hasImage && !hasVoice && !hasDocument) {
     debugLog(`Skip message chat=${chatId} from=${userId ?? "unknown"} reason=empty_text`);

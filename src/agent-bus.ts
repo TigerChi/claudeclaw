@@ -483,20 +483,27 @@ export function extractAgentDirectives(
     });
   }
 
-  // Extract payload for each directive
+  // Extract payload for each directive. An optional [/send-agent] closing tag
+  // ends the payload — without handling it, the closer leaks into the payload
+  // AND leaves "[/send-agent]" residue in the cleaned output (which legacy
+  // mode then broadcasts to users as a near-empty message).
   for (let i = 0; i < matches.length; i++) {
     const m = matches[i];
     const payloadEnd = i + 1 < matches.length ? matches[i + 1].start : text.length;
-    const payload = text.slice(m.end, payloadEnd).trim();
+    let payload = text.slice(m.end, payloadEnd);
+    const closerIdx = payload.search(/\[\/send-agent\]/i);
+    if (closerIdx >= 0) payload = payload.slice(0, closerIdx);
+    payload = payload.trim();
     if (payload) {
       directives.push({ to: m.to, payload });
     }
   }
 
-  // Remove directives from output
+  // Remove directives (and any stray closing tags) from output
   if (directives.length > 0) {
-    cleaned = text.replace(/\[send-agent:[^\]\r\n]+\][^\[]*/gi, "").trim();
+    cleaned = text.replace(/\[send-agent:[^\]\r\n]+\][^\[]*/gi, "");
   }
+  cleaned = cleaned.replace(/\[\/send-agent\]/gi, "").trim();
 
   return { cleaned, directives };
 }

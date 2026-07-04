@@ -40,6 +40,20 @@ queues an outgoing bus message. The runner automatically attaches
 `replyTo = <incoming msg.id>` so the original sender's reply-routing
 registration (if any) can match.
 
+## User-facing output of bus runs
+
+What happens to the plain text (non-directive) part of a bus reply depends on
+the agent's `notify.mode` setting (`settings.json`):
+
+- `"explicit"` (default) — never forwarded; the agent must use a
+  `[notify:<target>]...[/notify]` directive to reach a user or group.
+- `"legacy"` — broadcast to every allowed user on all active channels
+  (LINE / Telegram / Slack / Discord); opt-in only.
+
+In both modes, `[notify:]` blocks are extracted and delivered to their
+targets, and when any are present the remaining plain text is NOT broadcast.
+See `docs/NOTIFY.md` for the directive syntax and the shared contacts book.
+
 ## Synchronous request/reply (pending-reply registry)
 
 By default an incoming reply is dispatched to the daemon's global agent-bus

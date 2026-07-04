@@ -99,6 +99,8 @@ Your prompt here. Claude will run this at the scheduled time.
 
 **`channels`**: comma-separated list of `telegram`, `discord`, `slack`, `line`. Omit (or `all`) to broadcast to every enabled channel — the legacy default. Use this to keep noisy jobs out of channels they don't belong in.
 
+**Targeted delivery**: if the job's *output* contains `[notify:<target>]message[/notify]` directives, ONLY those targets receive messages for that run — the `channels`/`slackTarget` broadcast is skipped. Targets resolve against the shared contacts book; see `docs/NOTIFY.md`. Use this when a job should message one person or one group instead of broadcasting.
+
 **Cron syntax**: `minute hour day-of-month month day-of-week`
 
 **Timezone-aware**: All cron times are evaluated in the configured `timezone` from `settings.json`. E.g. `0 9 * * *` with `timezone: "UTC+2"` fires at 9:00 AM local time.

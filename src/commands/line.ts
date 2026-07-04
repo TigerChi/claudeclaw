@@ -1,6 +1,7 @@
 import { ensureProjectClaudeMd, runUserMessage, cancelThread } from "../runner";
 import { isCancelCommand, CANCEL_CONFIRM_MESSAGE, CANCEL_NOTHING_MESSAGE } from "../cancel";
 import { addLineAllowedUser, getSettings, loadSettings } from "../config";
+import { recordSeen, harvestAgentName } from "../contacts";
 import { peekThreadSession } from "../sessionManager";
 import { transcribeAudioToText } from "../whisper";
 import { mkdir } from "node:fs/promises";
@@ -270,6 +271,26 @@ async function getDisplayName(userId: string): Promise<string> {
   return profile?.displayName ?? userId;
 }
 
+/** Group display names for contact harvest — LINE only exposes them via a
+ *  separate summary endpoint (rooms have no such API and return undefined). */
+const groupNameCache = new Map<string, string>();
+
+async function getGroupName(groupId: string): Promise<string | undefined> {
+  if (!groupId.startsWith("C")) return undefined;
+  const cached = groupNameCache.get(groupId);
+  if (cached) return cached;
+  try {
+    const summary = await lineApi<{ groupName?: string }>("GET", `/bot/group/${groupId}/summary`);
+    if (summary?.groupName) {
+      groupNameCache.set(groupId, summary.groupName);
+      return summary.groupName;
+    }
+  } catch (err) {
+    debugLog(`Failed to get group summary for ${groupId}: ${err instanceof Error ? err.message : err}`);
+  }
+  return undefined;
+}
+
 // --- Message sending ---
 
 async function replyMessage(
@@ -496,6 +517,17 @@ async function handleMessageEvent(event: LineMessageEvent): Promise<void> {
 
   const chatId = getChatId(event.source);
   const sessionThreadId = lineSessionId(event.source);
+
+  // Contact harvest — feed the shared candidate pool (contacts/seen/). Runs
+  // async and never blocks or fails the message path.
+  void (async () => {
+    const agent = harvestAgentName(getSettings().agentBus.name);
+    if (isGroup) {
+      await recordSeen(agent, { platform: "line", id: chatId, kind: "group", name: await getGroupName(chatId) });
+    } else {
+      await recordSeen(agent, { platform: "line", id: userId, kind: "user", name: await getDisplayName(userId) });
+    }
+  })();
 
   // In groups, check requireMention policy (per-group override falls back to global default)
   if (isGroup && event.message.type === "text") {

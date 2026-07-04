@@ -1,6 +1,7 @@
 import { ensureProjectClaudeMd, run, runUserMessage, compactCurrentSession, cancelThread } from "../runner";
 import { isCancelCommand, CANCEL_CONFIRM_MESSAGE, CANCEL_NOTHING_MESSAGE } from "../cancel";
 import { getSettings, loadSettings } from "../config";
+import { recordSeen, harvestAgentName } from "../contacts";
 import { resetSession, peekSession } from "../sessions";
 import { listThreadSessions, removeThreadSession, peekThreadSession } from "../sessionManager";
 import { readFile } from "node:fs/promises";
@@ -503,6 +504,11 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
     }
     return;
   }
+
+  // Contact harvest — feed the shared candidate pool (contacts/seen/).
+  void recordSeen(harvestAgentName(getSettings().agentBus.name), isDM
+    ? { platform: "discord", id: userId, kind: "user", name: message.author.username }
+    : { platform: "discord", id: channelId, kind: "channel" });
 
   // Detect attachments
   const imageAttachments = message.attachments.filter(isImageAttachment);

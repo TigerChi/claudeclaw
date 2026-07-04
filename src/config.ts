@@ -88,6 +88,7 @@ const DEFAULT_SETTINGS: Settings = {
   stt: { baseUrl: "", model: "" },
   whisper: { engine: "auto", model: "large-v3-turbo", language: "" },
   agentBus: { enabled: false, name: "" },
+  notify: { mode: "explicit" },
 };
 
 export interface HeartbeatExcludeWindow {
@@ -221,6 +222,7 @@ export interface Settings {
   stt: SttConfig;
   whisper: WhisperConfig;
   agentBus: AgentBusConfig;
+  notify: NotifyConfig;
 }
 
 export interface AgenticMode {
@@ -274,6 +276,18 @@ export interface AgentBusConfig {
   enabled: boolean;
   /** This agent's name — used for registry, inbox folder, and socket file */
   name: string;
+}
+
+export interface NotifyConfig {
+  /**
+   * How agent-bus (and heartbeat) output reaches users:
+   *   "legacy"   — plain-text output is broadcast to every allowed user on all
+   *                active channels (historical behavior).
+   *   "explicit" — nothing is forwarded unless the output contains a
+   *                [notify:<target>]...[/notify] directive.
+   * [notify:] directives are honored in both modes. Default: "explicit".
+   */
+  mode: "legacy" | "explicit";
 }
 
 let cached: Settings | null = null;
@@ -491,6 +505,9 @@ function parseSettings(raw: Record<string, any>): Settings {
     agentBus: {
       enabled: raw.agentBus?.enabled ?? false,
       name: typeof raw.agentBus?.name === "string" ? raw.agentBus.name.trim() : "",
+    },
+    notify: {
+      mode: raw.notify?.mode === "legacy" ? "legacy" : "explicit",
     },
   };
 }
