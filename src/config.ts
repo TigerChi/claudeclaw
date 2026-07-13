@@ -203,6 +203,10 @@ export interface SecurityConfig {
   level: SecurityLevel;
   allowedTools: string[];
   disallowedTools: string[];
+  /** Optional directory to scope prompt-level restrictions to. Absolute path or
+   *  relative to project root. When unset, defaults to the project root (cwd).
+   *  Has no effect when level is "unrestricted". */
+  scopeDir?: string;
 }
 
 export interface Settings {
@@ -491,6 +495,10 @@ function parseSettings(raw: Record<string, any>): Settings {
       disallowedTools: Array.isArray(raw.security?.disallowedTools)
         ? raw.security.disallowedTools
         : [],
+      scopeDir:
+        typeof raw.security?.scopeDir === "string" && raw.security.scopeDir.trim()
+          ? raw.security.scopeDir.trim()
+          : undefined,
     },
     web: {
       enabled: raw.web?.enabled ?? false,

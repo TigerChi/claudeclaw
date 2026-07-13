@@ -1,5 +1,5 @@
 import { mkdir, readFile, writeFile } from "fs/promises";
-import { join } from "path";
+import { isAbsolute, join } from "path";
 import { existsSync } from "fs";
 import { getSession, createSession, incrementTurn, markCompactWarned } from "./sessions";
 import {
@@ -255,12 +255,20 @@ async function runClaudeOnce(
 
 const PROJECT_DIR = process.cwd();
 
-const DIR_SCOPE_PROMPT = [
-  `CRITICAL SECURITY CONSTRAINT: You are scoped to the project directory: ${PROJECT_DIR}`,
-  "You MUST NOT read, write, edit, or delete any file outside this directory.",
-  "You MUST NOT run bash commands that modify anything outside this directory (no cd /, no /etc, no ~/, no ../.. escapes).",
-  "If a request requires accessing files outside the project, refuse and explain why.",
-].join("\n");
+function resolveScopeDir(security: SecurityConfig): string {
+  const raw = security.scopeDir?.trim();
+  if (!raw) return PROJECT_DIR;
+  return isAbsolute(raw) ? raw : join(PROJECT_DIR, raw);
+}
+
+function buildDirScopePrompt(scopeDir: string): string {
+  return [
+    `CRITICAL SECURITY CONSTRAINT: You are scoped to the directory: ${scopeDir}`,
+    "You MUST NOT read, write, edit, or delete any file outside this directory.",
+    "You MUST NOT run bash commands that modify anything outside this directory (no cd /, no /etc, no ~/, no ../.. escapes).",
+    "If a request requires accessing files outside this directory, refuse and explain why.",
+  ].join("\n");
+}
 
 export async function ensureProjectClaudeMd(): Promise<void> {
   // Preflight-only initialization: never rewrite an existing project CLAUDE.md.
@@ -511,7 +519,7 @@ async function execClaudeImpl(name: string, prompt: string, threadId: string | u
     }
   }
 
-  if (security.level !== "unrestricted") appendParts.push(DIR_SCOPE_PROMPT);
+  if (security.level !== "unrestricted") appendParts.push(buildDirScopePrompt(resolveScopeDir(security)));
 
   // Agent Bus: inject inter-agent communication instructions when enabled
   const agentBus: AgentBusConfig = (settings as any).agentBus ?? { enabled: false, name: "" };
@@ -759,7 +767,7 @@ async function streamClaude(
     } catch {}
   }
 
-  if (security.level !== "unrestricted") appendParts.push(DIR_SCOPE_PROMPT);
+  if (security.level !== "unrestricted") appendParts.push(buildDirScopePrompt(resolveScopeDir(security)));
 
   // Build SDK options
   const sdkOptions: Record<string, unknown> = {
