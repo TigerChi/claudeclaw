@@ -421,7 +421,7 @@ export async function compactCurrentSession(): Promise<{ success: boolean; messa
     ...withDaemonSafeEnv(cleanEnv as NodeJS.ProcessEnv),
     ...loadAgentEnv(process.cwd()),
   } as Record<string, string>;
-  const timeoutMs = (settings as any).sessionTimeoutMs || CLAUDE_TIMEOUT_MS;
+  const timeoutMs = settings.sessionTimeoutMs ?? CLAUDE_TIMEOUT_MS;
 
   const ok = await runCompact(
     existing.sessionId,
@@ -485,7 +485,7 @@ async function execClaudeImpl(name: string, prompt: string, threadId: string | u
     api: fallback?.api ?? "",
   };
   const securityArgs = buildSecurityArgs(security);
-  const timeoutMs = (settings as any).sessionTimeoutMs || CLAUDE_TIMEOUT_MS;
+  const timeoutMs = settings.sessionTimeoutMs ?? CLAUDE_TIMEOUT_MS;
 
   console.log(
     `[${new Date().toLocaleTimeString()}] Running: ${name} (${isNew ? "new session" : `resume ${existing.sessionId.slice(0, 8)}`}, security: ${security.level})`
@@ -753,7 +753,8 @@ async function streamClaude(
   const existing = threadId
     ? await getThreadSession(threadId)
     : await getSession();
-  const { security, model, api } = getSettings();
+  const { security, model, api, sessionTimeoutMs } = getSettings();
+  const timeoutMs = sessionTimeoutMs ?? CLAUDE_TIMEOUT_MS;
 
   // Build system prompt (same components as execClaude)
   const promptContent = await loadPrompts();
@@ -824,7 +825,7 @@ async function streamClaude(
 
   // Timeout via AbortController (also used for /cancel)
   const abortController = new AbortController();
-  const timeoutId = setTimeout(() => abortController.abort(), CLAUDE_TIMEOUT_MS);
+  const timeoutId = setTimeout(() => abortController.abort(), timeoutMs);
   sdkOptions.abortController = abortController;
   registerInflight(cancelKey, abortController);
 

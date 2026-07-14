@@ -1,5 +1,5 @@
 import { join } from "path";
-import { readFile } from "fs/promises";
+import { readFile, writeFile } from "fs/promises";
 import { listRegisteredDaemons, agentIdForPath } from "../daemon-registry";
 
 export interface LinePairingInfo {
@@ -21,6 +21,8 @@ export interface AgentRecord {
   version: string;
   /** LLM model from the agent's settings.json — null = Claude Code default. */
   model: string | null;
+  /** Per-invocation Claude timeout (ms) from settings.json — null = runner default (15 min). */
+  sessionTimeoutMs: number | null;
 }
 
 export { agentIdForPath };
@@ -32,13 +34,17 @@ interface ParsedState {
 
 async function readAgentSettings(
   projectPath: string,
-): Promise<{ linePairing: LinePairingInfo | null; model: string | null }> {
+): Promise<{ linePairing: LinePairingInfo | null; model: string | null; sessionTimeoutMs: number | null }> {
   const settingsFile = join(projectPath, ".claude", "claudeclaw", "settings.json");
   try {
     const raw = await readFile(settingsFile, "utf-8");
     const parsed = JSON.parse(raw);
     const model =
       typeof parsed?.model === "string" && parsed.model.trim() ? parsed.model.trim() : null;
+    const sessionTimeoutMs =
+      Number.isFinite(parsed?.sessionTimeoutMs) && Number(parsed.sessionTimeoutMs) > 0
+        ? Number(parsed.sessionTimeoutMs)
+        : null;
     const line = parsed?.line;
     const pairing = line?.pairing;
     const linePairing =
@@ -49,9 +55,9 @@ async function readAgentSettings(
             webhookPort: Number.isFinite(line.webhookPort) ? Number(line.webhookPort) : 0,
           }
         : null;
-    return { linePairing, model };
+    return { linePairing, model, sessionTimeoutMs };
   } catch {
-    return { linePairing: null, model: null };
+    return { linePairing: null, model: null, sessionTimeoutMs: null };
   }
 }
 
@@ -106,6 +112,7 @@ export async function listAgents(): Promise<AgentRecord[]> {
       linePairing: settings.linePairing,
       version: d.version ?? "v1",
       model: settings.model,
+      sessionTimeoutMs: settings.sessionTimeoutMs,
     });
   }
 
@@ -121,4 +128,19 @@ export async function findAgentById(id: string): Promise<AgentRecord | null> {
 export async function findAgentByPath(path: string): Promise<AgentRecord | null> {
   const all = await listAgents();
   return all.find((a) => a.path === path) ?? null;
+}
+
+/** Set (or clear, with null) the agent's sessionTimeoutMs in its settings.json.
+ *  Reads the raw JSON and rewrites only this field so every other setting is
+ *  preserved exactly as written. The daemon's 30s hot-reload loop picks the
+ *  change up without a restart; it applies from the next Claude invocation. */
+export async function setAgentSessionTimeout(
+  projectPath: string,
+  sessionTimeoutMs: number | null,
+): Promise<void> {
+  const settingsFile = join(projectPath, ".claude", "claudeclaw", "settings.json");
+  const raw = JSON.parse(await readFile(settingsFile, "utf-8"));
+  if (sessionTimeoutMs == null) delete raw.sessionTimeoutMs;
+  else raw.sessionTimeoutMs = sessionTimeoutMs;
+  await writeFile(settingsFile, JSON.stringify(raw, null, 2) + "\n");
 }

@@ -227,6 +227,10 @@ export interface Settings {
   whisper: WhisperConfig;
   agentBus: AgentBusConfig;
   notify: NotifyConfig;
+  /** Per-agent override for the single-invocation Claude timeout, in ms.
+   *  Unset = runner default (15 minutes). Hot-reloaded every 30s, so an agent
+   *  can raise it before a long task and revert afterwards. */
+  sessionTimeoutMs?: number;
 }
 
 export interface AgenticMode {
@@ -517,6 +521,10 @@ function parseSettings(raw: Record<string, any>): Settings {
     notify: {
       mode: raw.notify?.mode === "legacy" ? "legacy" : "explicit",
     },
+    sessionTimeoutMs:
+      Number.isFinite(raw.sessionTimeoutMs) && Number(raw.sessionTimeoutMs) > 0
+        ? Number(raw.sessionTimeoutMs)
+        : undefined,
   };
 }
 

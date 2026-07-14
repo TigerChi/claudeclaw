@@ -280,6 +280,43 @@ export function hubPage(): string {
         await copyText(text, "✓ Pair code copied", "Copy your LINE pair code:");
         return;
       }
+      if (action === "edit-timeout") {
+        // window.prompt keeps this dead simple and immune to the 5s re-render
+        // (JS is blocked while the prompt is open, so no redraw wipes the input).
+        const curMs = btn ? Number(btn.getAttribute("data-ms")) : 0;
+        const cur = curMs > 0 ? String(Math.round(curMs / 60000)) : "";
+        const input = window.prompt("Claude timeout for this agent, in minutes (1–1440).\\nLeave empty to reset to the default (15 min).", cur);
+        if (input === null) return; // cancelled
+        const trimmed = input.trim();
+        let payload = null;
+        if (trimmed !== "") {
+          const mins = Number(trimmed);
+          if (!Number.isFinite(mins) || mins < 1 || mins > 1440) {
+            showActionMsg("✗ Enter 1–1440 minutes, or leave empty for default", "error");
+            return;
+          }
+          payload = Math.round(mins * 60000);
+        }
+        try {
+          const res = await api("/api/agents/" + id + "/settings", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ sessionTimeoutMs: payload }),
+          });
+          const data = await res.json().catch(() => ({}));
+          if (res.ok && data.ok) {
+            showActionMsg(payload == null
+              ? "✓ Timeout reset to default (15m)"
+              : "✓ Timeout set to " + Math.round(payload / 60000) + "m — applies from the next run (hot-reload ≤30s)", "ok");
+            await refreshAgents();
+          } else {
+            showActionMsg("✗ " + (data.error || "failed"), "error");
+          }
+        } catch (e) {
+          showActionMsg("✗ Failed: " + (e && e.message ? e.message : e), "error");
+        }
+        return;
+      }
       const verb = action === "stop" ? "Stopping…" : action === "start" ? "Starting…" : "Restarting…";
       const orig = btn ? btn.textContent : "";
       // Disable all toolbar buttons while one is in flight
@@ -497,6 +534,8 @@ export function hubPage(): string {
           row("ID", agent.id) +
           row("Version", agent.version || "v1") +
           row("Model", agent.model ? escapeAttr(agent.model) : "default") +
+          row("Timeout", fmtTimeout(agent.sessionTimeoutMs) +
+            ' <button class="copy-btn" data-act="edit-timeout" data-id="' + agent.id + '" data-ms="' + (agent.sessionTimeoutMs || "") + '">Edit</button>') +
           row("Status", agent.alive ? "running" : "stopped") +
           row("PID", agent.pid != null ? String(agent.pid) : "—") +
           row("Web", agent.web ? agent.web.host + ":" + agent.web.port : "—") +
@@ -608,6 +647,11 @@ export function hubPage(): string {
     // "claude-fable-5" → "fable-5"; aliases like "opus" pass through
     function fmtModel(m) {
       return String(m).replace(/^claude-/, "");
+    }
+
+    function fmtTimeout(ms) {
+      if (!ms) return "15m (default)";
+      return Math.round(ms / 60000) + "m";
     }
 
     function escapeAttr(s) {
