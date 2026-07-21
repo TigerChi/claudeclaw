@@ -745,7 +745,8 @@ async function streamClaude(
   const existing = threadId
     ? await getThreadSession(threadId)
     : await getSession();
-  const { security, model, api } = getSettings();
+  const streamSettings = getSettings();
+  const { security, model, api } = streamSettings;
 
   // Build system prompt (same components as execClaude)
   const promptContent = await loadPrompts();
@@ -816,7 +817,12 @@ async function streamClaude(
 
   // Timeout via AbortController (also used for /cancel)
   const abortController = new AbortController();
-  const timeoutId = setTimeout(() => abortController.abort(), CLAUDE_TIMEOUT_MS);
+  const streamTimeoutMs = (streamSettings as any).sessionTimeoutMs || CLAUDE_TIMEOUT_MS;
+  let timedOut = false;
+  const timeoutId = setTimeout(() => {
+    timedOut = true;
+    abortController.abort();
+  }, streamTimeoutMs);
   sdkOptions.abortController = abortController;
   registerInflight(cancelKey, abortController);
 
@@ -892,6 +898,15 @@ async function streamClaude(
         maybeUnblock();
       }
     }
+  } catch (err) {
+    // The SDK reports any abort as "aborted by user" — distinguish our own timeout.
+    if (timedOut) {
+      throw new Error(
+        `Run exceeded the ${Math.round(streamTimeoutMs / 60000)} min limit and was stopped. ` +
+          `Raise "sessionTimeoutMs" in settings.json, or split the task into smaller requests.`,
+      );
+    }
+    throw err;
   } finally {
     clearTimeout(timeoutId);
     clearInflight(cancelKey, abortController);
