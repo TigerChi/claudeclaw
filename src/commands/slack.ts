@@ -204,6 +204,34 @@ let healthSince = 0;
 let lastConnectedAt = 0;
 let outageAlerted = false;
 
+/**
+ * Flap detection.
+ *
+ * The outage alert keys off consecutive *failures*, and reconnectAttempts resets
+ * to 0 every time a connection lasts >30s. So a socket that connects, survives a
+ * minute, drops, and reconnects — forever — never trips it: the counter keeps
+ * resetting, health reads "connected", and Slack is quietly losing messages the
+ * whole time. This watches disconnect *frequency* instead, which that pattern
+ * cannot hide from.
+ *
+ * Healthy traffic is ~1 disconnect per 29 min (the proactive rotation), so a
+ * window of 30 min sees at most 2. Six is unambiguously wrong.
+ */
+const FLAP_WINDOW_MS = 30 * 60_000;
+const FLAP_THRESHOLD = 6;
+const FLAP_ALERT_COOLDOWN_MS = 60 * 60_000;
+
+let recentDisconnects: number[] = [];
+let lastFlapAlertAt = 0;
+
+/** Record a disconnect and return how many happened inside the window. */
+function recordDisconnect(): number {
+  const now = Date.now();
+  recentDisconnects.push(now);
+  recentDisconnects = recentDisconnects.filter((t) => now - t < FLAP_WINDOW_MS);
+  return recentDisconnects.length;
+}
+
 const HEALTH_FILE = join(process.cwd(), ".claude", "claudeclaw", "slack-health.json");
 
 async function writeHealth(detail?: string): Promise<void> {
@@ -215,6 +243,7 @@ async function writeHealth(detail?: string): Promise<void> {
       lastConnectedAt,
       lastEventAt,
       connectionCount,
+      disconnectsInWindow: recentDisconnects.length,
       detail: detail ?? null,
       updatedAt: Date.now(),
     }, null, 2));
@@ -2139,6 +2168,18 @@ async function socketLoop(appToken: string, signal: AbortSignal): Promise<Socket
         continue;
       }
 
+      // Frequency-based check — catches the "always reconnects, never stays up"
+      // pattern that the consecutive-failure counter structurally cannot see.
+      const flaps = recordDisconnect();
+      if (flaps >= FLAP_THRESHOLD && Date.now() - lastFlapAlertAt > FLAP_ALERT_COOLDOWN_MS) {
+        lastFlapAlertAt = Date.now();
+        await alertSlackHealth(
+          `Slack 連線不穩定：過去 ${Math.round(FLAP_WINDOW_MS / 60_000)} 分鐘內斷線 ${flaps} 次。`
+          + `每次都有重連成功，所以不會觸發「連線中斷」告警，但訊息可能間歇性遺漏。`
+          + `建議檢查網路品質或該 Slack app 狀態。`,
+        );
+      }
+
       reconnectAttempts++;
       if (!wasStable) setHealth("reconnecting", `disconnect ${disconnect.reason || disconnect.event}`);
       await noteOutage(`斷線後重連失敗（${disconnect.reason || disconnect.event}）`);
@@ -2259,6 +2300,8 @@ export function startSlack(debug = false): void {
   const signal = abortController.signal;
   connectionCount = 0;
   lastEventAt = 0;
+  recentDisconnects = [];
+  lastFlapAlertAt = 0;
 
   console.log("Slack bot started (Socket Mode)");
   console.log(`  Allowed users: ${config.allowedUserIds.length === 0 ? "all" : config.allowedUserIds.join(", ")}`);
@@ -2373,5 +2416,7 @@ export async function slack(): Promise<void> {
   abortController = new AbortController();
   connectionCount = 0;
   lastEventAt = 0;
+  recentDisconnects = [];
+  lastFlapAlertAt = 0;
   await superviseSocketLoop(config.appToken, abortController.signal);
 }
