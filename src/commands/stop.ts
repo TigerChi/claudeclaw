@@ -145,7 +145,11 @@ export async function stopAll() {
 
   let stopped = 0;
   for (const d of daemons) {
-    const result = await stopByPath(d.path, 0);
+    // Wait for the process to actually exit. With waitMs=0 we returned before
+    // the daemon's shutdown handler could flush Slack's close frame, so the
+    // Slack server kept the socket slot and the next start hit
+    // too_many_websockets. The hub's stop/restart paths already wait 4s.
+    const result = await stopByPath(d.path, 4000);
     if (result.ok) {
       stopped++;
       console.log(`\x1b[33m■ Stopped\x1b[0m PID ${result.pid} — ${d.path}`);
