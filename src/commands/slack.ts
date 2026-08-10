@@ -6,6 +6,7 @@ import { resetSession, peekSession } from "../sessions";
 import { listThreadSessions, peekThreadSession } from "../sessionManager";
 import { transcribeAudioToText } from "../whisper";
 import { resolveSkillPrompt } from "../skills";
+import { sendToAgent, listAgents as listBusAgents } from "../agent-bus";
 import { mkdir } from "node:fs/promises";
 import { extname, join } from "node:path";
 import { existsSync } from "node:fs";
@@ -94,13 +95,36 @@ const RECONNECT_POLICY: BackoffPolicy = {
   maxMs: 30_000,
   factor: 1.8,
   jitter: 0.25,
+  // NOT a give-up threshold. Transient failures (network down, DNS, Slack 5xx)
+  // are ALWAYS retried — a temporary outage must never permanently kill the
+  // listener. This is only the point where we stop escalating backoff, settle
+  // into LONG_RETRY_MS, and raise an alert. (See issue #4 / 2026-08-10.)
   maxAttempts: 12,
 };
+
+/** Consecutive failures before we alert and drop to slow steady retry. */
+const ALERT_AFTER_ATTEMPTS = 12;
+/** Steady retry interval once an outage is considered "long". */
+const LONG_RETRY_MS = 5 * 60_000;
+const LONG_RETRY_JITTER_MS = 60_000;
 
 function computeBackoff(policy: BackoffPolicy, attempt: number): number {
   const base = policy.initialMs * policy.factor ** Math.max(attempt - 1, 0);
   const jitter = base * policy.jitter * Math.random();
   return Math.min(policy.maxMs, Math.round(base + jitter));
+}
+
+/**
+ * Delay before the next reconnect attempt. Escalates exponentially, then flattens
+ * to a slow steady poll so a multi-day outage doesn't hammer Slack — but never
+ * stops. Unbounded retry is the whole point: the previous code gave up after 12
+ * attempts and the listener stayed dead until someone restarted the daemon.
+ */
+function reconnectDelay(attempt: number): number {
+  if (attempt >= ALERT_AFTER_ATTEMPTS) {
+    return LONG_RETRY_MS + Math.round(Math.random() * LONG_RETRY_JITTER_MS);
+  }
+  return computeBackoff(RECONNECT_POLICY, attempt);
 }
 
 /**
@@ -150,6 +174,84 @@ let proactiveTimer: ReturnType<typeof setTimeout> | null = null;
 // Health tracking
 let lastEventAt = 0;
 let connectionCount = 0;
+
+// --- Listener health / alerting (issue #4, 2026-08-10) ---
+//
+// Before this existed, a dead Slack listener was invisible: the daemon stayed
+// alive, cron kept running, and the only trace was one line in daemon.log.
+// Outages went unnoticed for 3 and 5 days. Health state is now written to disk
+// (machine-readable, for the hub) and escalated over the Agent Bus to a sibling
+// agent, because the one channel we cannot use to report a dead Slack socket is
+// that same Slack socket.
+
+type SlackHealthState = "connected" | "reconnecting" | "auth-error" | "stopped";
+
+/** Why socketLoop returned — decides whether the supervisor re-enters it. */
+type SocketLoopExit = "aborted" | "auth-error" | "link-disabled" | "unexpected";
+
+/** Supervisor re-entry delay after the loop exits for a non-abort reason. */
+const SUPERVISOR_RETRY_MS = 60_000;
+/**
+ * Auth failures and link_disabled are config problems, not network blips, so we
+ * back off hard — but still retry. A rotated token or a re-enabled Socket Mode
+ * toggle then heals the agent on its own instead of waiting for someone to
+ * notice. CEO.Bot sat dead on invalid_auth for 18 days for exactly this reason.
+ */
+const CONFIG_ERROR_RETRY_MS = 30 * 60_000;
+
+let healthState: SlackHealthState = "stopped";
+let healthSince = 0;
+let lastConnectedAt = 0;
+let outageAlerted = false;
+
+const HEALTH_FILE = join(process.cwd(), ".claude", "claudeclaw", "slack-health.json");
+
+async function writeHealth(detail?: string): Promise<void> {
+  try {
+    await mkdir(join(process.cwd(), ".claude", "claudeclaw"), { recursive: true });
+    await Bun.write(HEALTH_FILE, JSON.stringify({
+      state: healthState,
+      since: healthSince,
+      lastConnectedAt,
+      lastEventAt,
+      connectionCount,
+      detail: detail ?? null,
+      updatedAt: Date.now(),
+    }, null, 2));
+  } catch { /* health reporting must never break the socket loop */ }
+}
+
+function setHealth(state: SlackHealthState, detail?: string): void {
+  if (healthState !== state) {
+    healthState = state;
+    healthSince = Date.now();
+  }
+  void writeHealth(detail);
+}
+
+/**
+ * Raise a visible alert about the Slack listener. Best-effort on every channel
+ * and never throws — an alert failure must not take down the loop it reports on.
+ */
+async function alertSlackHealth(message: string): Promise<void> {
+  console.error(`[Slack][ALERT] ${message}`);
+  try {
+    const settings = getSettings();
+    const selfName = settings.agentBus?.name;
+    if (!settings.agentBus?.enabled || !selfName) return;
+
+    // Route through a sibling agent — our own Slack is what's broken.
+    const registry = await listBusAgents();
+    const peers = Object.keys(registry).filter((n) => n !== selfName);
+    if (peers.length === 0) return;
+
+    const payload = `[Slack 連線告警] Agent "${selfName}" 的 Slack listener 異常：${message}\n`
+      + `請將此訊息轉達給 Tiger（Slack DM），並附上 agent 名稱與時間。`;
+    for (const peer of peers.slice(0, 2)) {
+      await sendToAgent(peer, payload, { from: selfName, type: "message" }).catch(() => {});
+    }
+  } catch { /* best-effort */ }
+}
 
 // Dedup: track recently processed message timestamps to avoid handling both message + app_mention
 const recentlyProcessed = new Map<string, number>();
@@ -1790,6 +1892,20 @@ async function handleSocketPayload(
 
 const PROACTIVE_RECONNECT_MS = 29 * 60 * 1000; // 29 min — before Slack's 30-min forced rotation
 
+/**
+ * Absolute ceiling on how long a single socket may occupy the loop.
+ *
+ * The proactive timer above only *requests* a close (`ws.close()` sends a close
+ * frame and waits for the peer's reply). On a half-open TCP connection — the
+ * normal result of laptop sleep or a WiFi switch — that reply never arrives,
+ * `onclose` never fires, and openSocket's promise never settles. socketLoop then
+ * blocks forever with no log output at all, which no supervisor can detect
+ * because the loop never returns. This deadline force-settles the promise and
+ * abandons the socket. (See issue #4, 2026-08-10.)
+ */
+const SOCKET_HARD_DEADLINE_MS = PROACTIVE_RECONNECT_MS + 2 * 60_000; // 31 min
+const WATCHDOG_CLOSE_CODE = 4999;
+
 /** Fetch a fresh Socket Mode WebSocket URL from Slack. */
 async function fetchSocketUrl(appToken: string): Promise<string> {
   const res = await fetch(`${SLACK_API}/apps.connections.open`, {
@@ -1829,20 +1945,47 @@ function openSocket(url: string, appToken: string, signal: AbortSignal): Promise
     }
 
     ws = new WebSocket(url);
+    // Identity of *this* socket. Handlers below must only mutate the shared `ws`
+    // slot while it still points at them: a watchdog-abandoned socket can fire
+    // `onclose` long after a replacement is live, and blindly doing `ws = null`
+    // would silently detach the healthy new connection.
+    const self = ws;
     let resolved = false;
+    let hardDeadlineTimer: ReturnType<typeof setTimeout> | null = null;
 
     const resolveOnce = (value: { event: "close" | "error"; code?: number; reason?: string; error?: unknown; openedAt?: number }) => {
       if (resolved) return;
       resolved = true;
       // Clean up proactive timer
       if (proactiveTimer) { clearTimeout(proactiveTimer); proactiveTimer = null; }
+      if (hardDeadlineTimer) { clearTimeout(hardDeadlineTimer); hardDeadlineTimer = null; }
       signal.removeEventListener("abort", onAbort);
       resolve(value);
     };
 
+    // Watchdog: force-settle if this socket outlives the proactive rotation.
+    // Reaching this means ws.close() did not produce an onclose event — i.e. the
+    // connection is half-open. Abandon it rather than block the loop forever.
+    hardDeadlineTimer = setTimeout(() => {
+      hardDeadlineTimer = null;
+      if (resolved || signal.aborted) return;
+      const aliveMin = Math.round((Date.now() - openedAt) / 60_000);
+      console.error(`[Slack] Watchdog: socket alive ${aliveMin}min with no close event — abandoning and reconnecting`);
+      try {
+        self.onclose = null;
+        self.onerror = null;
+        self.onmessage = null;
+        self.close(WATCHDOG_CLOSE_CODE, "watchdog");
+      } catch { /* best-effort */ }
+      if (ws === self) ws = null;
+      resolveOnce({ event: "close", code: WATCHDOG_CLOSE_CODE, reason: "watchdog-timeout", openedAt });
+    }, SOCKET_HARD_DEADLINE_MS);
+
     ws.onopen = () => {
       connectionCount++;
       lastEventAt = Date.now();
+      lastConnectedAt = lastEventAt;
+      setHealth("connected");
       debugLog(`WebSocket opened (connection #${connectionCount})`);
     };
 
@@ -1864,7 +2007,7 @@ function openSocket(url: string, appToken: string, signal: AbortSignal): Promise
 
     ws.onclose = (event) => {
       debugLog(`WebSocket closed: code=${event.code} reason=${event.reason}`);
-      ws = null;
+      if (ws === self) ws = null;
       resolveOnce({ event: "close", code: event.code, reason: event.reason, openedAt });
     };
 
@@ -1878,17 +2021,17 @@ function openSocket(url: string, appToken: string, signal: AbortSignal): Promise
     if (proactiveTimer) clearTimeout(proactiveTimer);
     proactiveTimer = setTimeout(() => {
       proactiveTimer = null;
-      if (signal.aborted) return;
+      if (resolved || signal.aborted) return;
       debugLog("Proactive reconnect (29-min rotation)");
-      ws?.close(1000, "Proactive reconnect");
+      // Close *this* socket, not whatever currently occupies the shared slot.
+      try { self.close(1000, "Proactive reconnect"); } catch { /* best-effort */ }
     }, PROACTIVE_RECONNECT_MS);
 
     // Abort handler — external stop request
     function onAbort() {
       if (proactiveTimer) { clearTimeout(proactiveTimer); proactiveTimer = null; }
-      if (ws) {
-        try { ws.close(1000, "Stop requested"); } catch { /* best-effort */ }
-      }
+      if (hardDeadlineTimer) { clearTimeout(hardDeadlineTimer); hardDeadlineTimer = null; }
+      try { self.close(1000, "Stop requested"); } catch { /* best-effort */ }
       resolveOnce({ event: "close", code: 1000, reason: "Stop requested", openedAt });
     }
     signal.addEventListener("abort", onAbort, { once: true });
@@ -1900,8 +2043,19 @@ function openSocket(url: string, appToken: string, signal: AbortSignal): Promise
  * Modeled after OpenClaw's monitorSlackProvider pattern:
  * while-loop + exponential backoff + auth error detection.
  */
-async function socketLoop(appToken: string, signal: AbortSignal): Promise<void> {
+async function socketLoop(appToken: string, signal: AbortSignal): Promise<SocketLoopExit> {
   let reconnectAttempts = 0;
+
+  /** Log + alert once when an outage crosses the "this is not a blip" line. */
+  const noteOutage = async (what: string) => {
+    if (reconnectAttempts === ALERT_AFTER_ATTEMPTS && !outageAlerted) {
+      outageAlerted = true;
+      await alertSlackHealth(
+        `連線中斷已重試 ${reconnectAttempts} 次仍失敗（${what}）。`
+        + `已切換為每 ${Math.round(LONG_RETRY_MS / 60_000)} 分鐘重試一次，會持續嘗試直到恢復。`,
+      );
+    }
+  };
 
   while (!signal.aborted) {
     // Phase 1: get a WebSocket URL
@@ -1913,18 +2067,18 @@ async function socketLoop(appToken: string, signal: AbortSignal): Promise<void> 
       if (signal.aborted) break;
 
       if (isNonRecoverableAuthError(err)) {
-        console.error(`[Slack] Non-recoverable auth error — stopping: ${err instanceof Error ? err.message : err}`);
-        break;
+        console.error(`[Slack] Non-recoverable auth error: ${err instanceof Error ? err.message : err}`);
+        return "auth-error";
       }
 
+      // Transient (network down, DNS, Slack 5xx). NEVER give up — the outage
+      // will end, and when it does we must still be trying.
       reconnectAttempts++;
-      if (RECONNECT_POLICY.maxAttempts > 0 && reconnectAttempts >= RECONNECT_POLICY.maxAttempts) {
-        console.error(`[Slack] Max reconnect attempts (${RECONNECT_POLICY.maxAttempts}) reached, giving up`);
-        break;
-      }
+      setHealth("reconnecting", `fetchSocketUrl failed (attempt ${reconnectAttempts})`);
+      await noteOutage("無法取得 socket URL");
 
-      const delayMs = computeBackoff(RECONNECT_POLICY, reconnectAttempts);
-      console.error(`[Slack] Failed to fetch socket URL, retry ${reconnectAttempts}/${RECONNECT_POLICY.maxAttempts} in ${Math.round(delayMs / 1000)}s: ${err instanceof Error ? err.message : err}`);
+      const delayMs = reconnectDelay(reconnectAttempts);
+      console.error(`[Slack] Failed to fetch socket URL, retry #${reconnectAttempts} in ${Math.round(delayMs / 1000)}s: ${err instanceof Error ? err.message : err}`);
 
       try { await sleepWithAbort(delayMs, signal); } catch { break; }
       continue;
@@ -1937,14 +2091,14 @@ async function socketLoop(appToken: string, signal: AbortSignal): Promise<void> 
       if (signal.aborted) break;
 
       if (disconnect.error && isNonRecoverableAuthError(disconnect.error)) {
-        console.error(`[Slack] Non-recoverable auth error during connection — stopping`);
-        break;
+        console.error(`[Slack] Non-recoverable auth error during connection`);
+        return "auth-error";
       }
 
-      // link_disabled — Socket Mode turned off, no point retrying
+      // link_disabled — Socket Mode turned off in the app config
       if (disconnect.code === 4100) {
-        console.error(`[Slack] Socket Mode disabled (link_disabled) — stopping`);
-        break;
+        console.error(`[Slack] Socket Mode disabled (link_disabled)`);
+        return "link-disabled";
       }
 
       // Only reset attempts if the connection was stable (>30s alive)
@@ -1953,6 +2107,12 @@ async function socketLoop(appToken: string, signal: AbortSignal): Promise<void> 
 
       if (disconnect.code === 1000 && wasStable) {
         reconnectAttempts = 0;
+      }
+
+      if (wasStable) {
+        // The socket genuinely worked — clear the latch so a future incident
+        // alerts again instead of being swallowed by the previous one.
+        outageAlerted = false;
       }
 
       // too_many_websockets: Slack server still tracks a stale socket from us.
@@ -1971,19 +2131,17 @@ async function socketLoop(appToken: string, signal: AbortSignal): Promise<void> 
       }
 
       reconnectAttempts++;
-      if (RECONNECT_POLICY.maxAttempts > 0 && reconnectAttempts >= RECONNECT_POLICY.maxAttempts) {
-        console.error(`[Slack] Max reconnect attempts (${RECONNECT_POLICY.maxAttempts}) reached, giving up`);
-        break;
-      }
+      if (!wasStable) setHealth("reconnecting", `disconnect ${disconnect.reason || disconnect.event}`);
+      await noteOutage(`斷線後重連失敗（${disconnect.reason || disconnect.event}）`);
 
       // Quick reconnect only for proactive rotation (code 1000 + stable)
-      // Everything else uses exponential backoff
+      // Everything else uses escalating backoff — capped, but never terminal.
       const delayMs = (disconnect.code === 1000 && wasStable)
         ? Math.round(1000 + Math.random() * 2000)
-        : computeBackoff(RECONNECT_POLICY, reconnectAttempts);
+        : reconnectDelay(reconnectAttempts);
 
       const reason = disconnect.reason || disconnect.event;
-      console.log(`[Slack] Disconnected (${reason}), reconnecting in ${Math.round(delayMs / 1000)}s (attempt ${reconnectAttempts}/${RECONNECT_POLICY.maxAttempts}, alive ${Math.round(connectionDuration / 1000)}s)`);
+      console.log(`[Slack] Disconnected (${reason}), reconnecting in ${Math.round(delayMs / 1000)}s (attempt #${reconnectAttempts}, alive ${Math.round(connectionDuration / 1000)}s)`);
 
       // Ensure previous ws is fully closed before opening a new one
       await waitForWsClosed();
@@ -1992,7 +2150,9 @@ async function socketLoop(appToken: string, signal: AbortSignal): Promise<void> 
       if (signal.aborted) break;
       console.error(`[Slack] Unexpected error in socket loop: ${err instanceof Error ? err.message : err}`);
       reconnectAttempts++;
-      const delayMs = computeBackoff(RECONNECT_POLICY, reconnectAttempts);
+      setHealth("reconnecting", "unexpected loop error");
+      await noteOutage("socket loop 例外");
+      const delayMs = reconnectDelay(reconnectAttempts);
       try { await sleepWithAbort(delayMs, signal); } catch { break; }
     }
   }
@@ -2004,6 +2164,7 @@ async function socketLoop(appToken: string, signal: AbortSignal): Promise<void> 
     ws = null;
   }
   debugLog("Socket loop ended");
+  return signal.aborted ? "aborted" : "unexpected";
 }
 
 // --- Exports ---
@@ -2074,6 +2235,7 @@ export async function stopSlackGraceful(timeoutMs = 2_000): Promise<void> {
   if (proactiveTimer) { clearTimeout(proactiveTimer); proactiveTimer = null; }
   await waitForWsClosed(timeoutMs);
   ws = null;
+  setHealth("stopped", "graceful stop");
 }
 
 export function startSlack(debug = false): void {
@@ -2113,13 +2275,57 @@ export function startSlack(debug = false): void {
       console.error(`[Slack] auth.test failed: ${err instanceof Error ? err.message : err}`);
     }
 
-    // Enter the main socket loop (blocks until aborted or max attempts)
-    await socketLoop(config.appToken, signal);
+    // Supervisor: socketLoop must never be a one-shot. Whatever reason it
+    // returns for — an unexpected exit, a bad token, Socket Mode switched off —
+    // we wait and re-enter. The only exit that stops us is an explicit abort.
+    await superviseSocketLoop(config.appToken, signal);
   })().catch((err) => {
     if (!signal.aborted) {
       console.error(`[Slack] Fatal: ${err}`);
     }
   });
+}
+
+/**
+ * Keeps socketLoop running for as long as the listener is supposed to be up.
+ *
+ * socketLoop used to be called exactly once, so any exit from it — including the
+ * "gave up after 12 attempts" path — left the daemon alive with a permanently
+ * dead Slack listener and no way back except a manual restart. That is what took
+ * seven agents offline for five days on 2026-08-05. (See issue #4.)
+ */
+async function superviseSocketLoop(appToken: string, signal: AbortSignal): Promise<void> {
+  let configErrorAlerted = false;
+
+  while (!signal.aborted) {
+    const exit = await socketLoop(appToken, signal);
+    if (signal.aborted || exit === "aborted") break;
+
+    if (exit === "auth-error" || exit === "link-disabled") {
+      setHealth("auth-error", exit);
+      if (!configErrorAlerted) {
+        configErrorAlerted = true;
+        await alertSlackHealth(
+          exit === "auth-error"
+            ? "Slack token 驗證失敗（invalid_auth 之類），listener 已停。需要重新產生 token；"
+              + `系統會每 ${Math.round(CONFIG_ERROR_RETRY_MS / 60_000)} 分鐘自動重試，token 修好後會自行恢復。`
+            : "Slack Socket Mode 被關閉（link_disabled）。請到 Slack app 設定重新開啟；"
+              + `系統會每 ${Math.round(CONFIG_ERROR_RETRY_MS / 60_000)} 分鐘自動重試。`,
+        );
+      }
+      try { await sleepWithAbort(CONFIG_ERROR_RETRY_MS, signal); } catch { break; }
+      continue;
+    }
+
+    // Unexpected exit — should not happen now that the loop never gives up,
+    // but if it ever does, come back rather than dying silently.
+    console.error(`[Slack] Socket loop exited unexpectedly — restarting in ${Math.round(SUPERVISOR_RETRY_MS / 1000)}s`);
+    setHealth("reconnecting", "supervisor restart");
+    await alertSlackHealth("socket loop 非預期退出，supervisor 將自動重啟 listener。");
+    try { await sleepWithAbort(SUPERVISOR_RETRY_MS, signal); } catch { break; }
+  }
+
+  setHealth("stopped");
 }
 
 // Standalone-mode shutdown: graceful close so Slack server releases the slot
@@ -2158,5 +2364,5 @@ export async function slack(): Promise<void> {
   abortController = new AbortController();
   connectionCount = 0;
   lastEventAt = 0;
-  await socketLoop(config.appToken, abortController.signal);
+  await superviseSocketLoop(config.appToken, abortController.signal);
 }
