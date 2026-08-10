@@ -235,6 +235,15 @@ function setHealth(state: SlackHealthState, detail?: string): void {
  */
 async function alertSlackHealth(message: string): Promise<void> {
   console.error(`[Slack][ALERT] ${message}`);
+  // Hard ceiling: this runs inside the reconnect loop, so a slow bus socket or a
+  // stalled filesystem must never delay the next reconnect attempt.
+  await Promise.race([
+    deliverAlert(message),
+    new Promise<void>((r) => setTimeout(r, 5_000)),
+  ]).catch(() => { /* alerting is best-effort by definition */ });
+}
+
+async function deliverAlert(message: string): Promise<void> {
   try {
     const settings = getSettings();
     const selfName = settings.agentBus?.name;
