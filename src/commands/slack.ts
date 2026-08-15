@@ -1,4 +1,4 @@
-import { ensureProjectClaudeMd, runUserMessage, streamUserMessage, compactCurrentSession, cancelThread } from "../runner";
+import { ensureProjectClaudeMd, runUserMessage, streamUserMessage, dispatchAgentDirectives, compactCurrentSession, cancelThread } from "../runner";
 import { isCancelCommand, CANCEL_CONFIRM_MESSAGE, CANCEL_NOTHING_MESSAGE } from "../cancel";
 import { getSettings, loadSettings } from "../config";
 import { recordSeen, harvestAgentName, getNotifyDispatcher } from "../contacts";
@@ -312,28 +312,40 @@ function markdownToSlackMrkdwn(text: string): string {
 
 // --- Message sending ---
 
+// Slack max message length is 40000 chars; we chunk at 3800 to stay under the
+// mrkdwn section-block limit. Anything longer must be split across messages or
+// Slack rejects the send outright.
+const SLACK_MSG_LIMIT = 3800;
+
+// Chunked send that always posts the full text (splitting as needed) and returns
+// the ts of the last chunk. Never throws: a failed chunk is logged and skipped so
+// callers can rely on it as a delivery fallback.
 async function sendMessage(
   token: string,
   channelId: string,
   text: string,
   threadTs?: string,
-): Promise<void> {
+): Promise<string | null> {
   // Strip [react:...] directives before sending
   const normalized = text.replace(/\[react:[^\]\r\n]+\]/gi, "").trim();
-  if (!normalized) return;
+  if (!normalized) return null;
   const mrkdwn = markdownToSlackMrkdwn(normalized);
 
-  // Slack max message length is 40000 chars, chunk at 3800 for mrkdwn block limits
-  const MAX_LEN = 3800;
-  for (let i = 0; i < mrkdwn.length; i += MAX_LEN) {
-    const chunk = mrkdwn.slice(i, i + MAX_LEN);
+  let lastTs: string | null = null;
+  for (let i = 0; i < mrkdwn.length; i += SLACK_MSG_LIMIT) {
+    const chunk = mrkdwn.slice(i, i + SLACK_MSG_LIMIT);
     const params: Record<string, unknown> = {
       channel: channelId,
       text: chunk,
     };
     if (threadTs) params.thread_ts = threadTs;
-    await slackApi(token, "chat.postMessage", params);
+    const data = await slackApi<{ ts: string }>(token, "chat.postMessage", params).catch((err) => {
+      debugLog(`sendMessage chunk failed: ${err instanceof Error ? err.message : err}`);
+      return null;
+    });
+    if (data?.ts) lastTs = data.ts;
   }
+  return lastTs;
 }
 
 async function sendReaction(
@@ -371,19 +383,25 @@ async function removeReaction(
 
 // --- Message update (for streaming) ---
 
+// Returns true on success, false if Slack rejected the edit (e.g. body too long).
+// Callers use the result to decide whether to fall back to a fresh chunked send.
 async function updateMessage(
   token: string,
   channelId: string,
   messageTs: string,
   text: string,
-): Promise<void> {
-  await slackApi(token, "chat.update", {
-    channel: channelId,
-    ts: messageTs,
-    text: markdownToSlackMrkdwn(text),
-  }).catch((err) => {
+): Promise<boolean> {
+  try {
+    await slackApi(token, "chat.update", {
+      channel: channelId,
+      ts: messageTs,
+      text: markdownToSlackMrkdwn(text),
+    });
+    return true;
+  } catch (err) {
     debugLog(`chat.update failed: ${err instanceof Error ? err.message : err}`);
-  });
+    return false;
+  }
 }
 
 async function deleteMessage(
@@ -415,6 +433,32 @@ async function postMessage(
     return null;
   });
   return data?.ts ?? null;
+}
+
+// Guarantee a streamed reply is fully delivered. Edits the live streaming message
+// in place when the text fits and the edit succeeds; otherwise drops the partial
+// message and resends via the chunked sender. This closes the "log says Done but
+// nothing landed" gap: an oversized body, a failed edit, or a missing stream
+// message can no longer silently swallow the reply. Returns the ts to track for
+// later edit/delete directives, or null if every send attempt failed.
+async function finalizeStreamedReply(
+  token: string,
+  channelId: string,
+  streamMsgTs: string | null,
+  finalText: string,
+  threadTs?: string,
+): Promise<string | null> {
+  if (streamMsgTs && finalText.length <= SLACK_MSG_LIMIT) {
+    // Fits in one message — try to reuse the live message.
+    if (await updateMessage(token, channelId, streamMsgTs, finalText)) return streamMsgTs;
+    // Edit rejected — remove the (possibly half-streamed) message and resend fresh.
+    await deleteMessage(token, channelId, streamMsgTs);
+  } else if (streamMsgTs) {
+    // Too long for a single message — drop the partial and resend chunked.
+    await deleteMessage(token, channelId, streamMsgTs);
+  }
+  // Fallback: chunked send that always posts the full text.
+  return await sendMessage(token, channelId, finalText, threadTs);
 }
 
 // Streaming: send initial message then update it as chunks arrive
@@ -1219,13 +1263,15 @@ async function handleMessage(event: SlackMessage): Promise<void> {
           const now = Date.now();
 
           if (!streamMsgPromise) {
-            // First chunk — post the message with real text (no placeholder)
-            streamMsgPromise = postMessage(config.botToken, channelId, streamText, replyThreadTs);
+            // First chunk — post the message with real text (no placeholder).
+            // Cap the live preview at the single-message limit; the full text is
+            // delivered (chunked if needed) by finalizeStreamedReply at the end.
+            streamMsgPromise = postMessage(config.botToken, channelId, streamText.slice(0, SLACK_MSG_LIMIT), replyThreadTs);
             streamMsgPromise.then(ts => { streamMsgTs = ts; }).catch(() => {});
             lastStreamUpdate = now;
           } else if (streamMsgTs && now - lastStreamUpdate >= STREAM_UPDATE_INTERVAL_MS) {
             lastStreamUpdate = now;
-            updateMessage(config.botToken, channelId, streamMsgTs, streamText).catch(() => {});
+            updateMessage(config.botToken, channelId, streamMsgTs, streamText.slice(0, SLACK_MSG_LIMIT)).catch(() => {});
           }
         },
         () => { /* onUnblock */ },
@@ -1253,7 +1299,10 @@ async function handleMessage(event: SlackMessage): Promise<void> {
     // Stop refreshing status
     clearInterval(statusRefreshInterval);
 
-    const responseText = finalResultText ?? streamText;
+    // Slack streams via streamUserMessage, which bypasses run() — dispatch
+    // [send-agent:] here so inter-agent messages aren't dropped (and don't
+    // leak to the user as raw markup).
+    const responseText = dispatchAgentDirectives(finalResultText ?? streamText);
 
     if (!responseText) {
       // Empty response
@@ -1372,29 +1421,17 @@ async function handleMessage(event: SlackMessage): Promise<void> {
         }
       }
 
-      // Finalize response — update streaming message or replace with Block Kit
+      // Finalize response — guarantee delivery (chunked fallback if the live edit
+      // fails or the body is too long), or replace with Block Kit.
       if (finalText) {
         if (buttons || select) {
           // Block Kit needs a fresh message; remove streaming message
           if (streamMsgTs) await deleteMessage(config.botToken, channelId, streamMsgTs);
           const sentTs = await sendBlockKitMessage(config.botToken, channelId, finalText, buttons, select, replyThreadTs);
           if (sentTs) lastBotMessageTs.set(msgKey, sentTs);
-        } else if (finalText.length > 3800) {
-          // Update streaming message with first chunk, post remaining chunks
-          if (streamMsgTs) {
-            await updateMessage(config.botToken, channelId, streamMsgTs, finalText.slice(0, 3800));
-            lastBotMessageTs.set(msgKey, streamMsgTs);
-          }
-          for (let i = 3800; i < finalText.length; i += 3800) {
-            const chunkTs = await postMessage(config.botToken, channelId, finalText.slice(i, i + 3800), replyThreadTs);
-            if (chunkTs) lastBotMessageTs.set(msgKey, chunkTs);
-          }
         } else {
-          // Simple case — update streaming message with final cleaned text
-          if (streamMsgTs) {
-            await updateMessage(config.botToken, channelId, streamMsgTs, finalText);
-            lastBotMessageTs.set(msgKey, streamMsgTs);
-          }
+          const sentTs = await finalizeStreamedReply(config.botToken, channelId, streamMsgTs, finalText, replyThreadTs);
+          if (sentTs) lastBotMessageTs.set(msgKey, sentTs);
         }
       } else if (streamMsgTs && !editContent && deleteCount === 0 && uploads.length === 0 && channelReads.length === 0) {
         // No text, no directives — show empty
@@ -1532,12 +1569,14 @@ async function handleBlockAction(payload: any): Promise<void> {
         streamText = text;
         const now = Date.now();
         if (!streamMsgPromise) {
-          streamMsgPromise = postMessage(config.botToken, channelId, streamText, replyThreadTs);
+          // Cap live preview at the single-message limit; finalizeStreamedReply
+          // delivers the full text (chunked if needed) at the end.
+          streamMsgPromise = postMessage(config.botToken, channelId, streamText.slice(0, SLACK_MSG_LIMIT), replyThreadTs);
           streamMsgPromise.then(ts => { streamMsgTs = ts; }).catch(() => {});
           lastStreamUpdate = now;
         } else if (streamMsgTs && now - lastStreamUpdate >= STREAM_UPDATE_INTERVAL_MS) {
           lastStreamUpdate = now;
-          updateMessage(config.botToken, channelId, streamMsgTs, streamText).catch(() => {});
+          updateMessage(config.botToken, channelId, streamMsgTs, streamText.slice(0, SLACK_MSG_LIMIT)).catch(() => {});
         }
       },
       () => {},
@@ -1561,7 +1600,7 @@ async function handleBlockAction(payload: any): Promise<void> {
   if (streamMsgPromise) streamMsgTs = await streamMsgPromise;
   if (statusRefreshInterval) clearInterval(statusRefreshInterval);
 
-  const responseText = finalResultText ?? streamText;
+  const responseText = dispatchAgentDirectives(finalResultText ?? streamText);
   if (responseText) {
     const { cleanedText } = extractReactionDirective(responseText);
     const { cleanedText: finalText, buttons, select } = extractBlockKitDirectives(cleanedText);
@@ -1573,10 +1612,8 @@ async function handleBlockAction(payload: any): Promise<void> {
         const sentTs = await sendBlockKitMessage(config.botToken, channelId, finalText, buttons, select, replyThreadTs);
         if (sentTs) lastBotMessageTs.set(msgKey, sentTs);
       } else {
-        if (streamMsgTs) {
-          await updateMessage(config.botToken, channelId, streamMsgTs, finalText);
-          lastBotMessageTs.set(msgKey, streamMsgTs);
-        }
+        const sentTs = await finalizeStreamedReply(config.botToken, channelId, streamMsgTs, finalText, replyThreadTs);
+        if (sentTs) lastBotMessageTs.set(msgKey, sentTs);
       }
     } else if (streamMsgTs) {
       await deleteMessage(config.botToken, channelId, streamMsgTs);
