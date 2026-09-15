@@ -266,7 +266,46 @@ async function getUserProfile(userId: string): Promise<LineProfile | null> {
   }
 }
 
-async function getDisplayName(userId: string): Promise<string> {
+/** Resolve a member of a group/room. Unlike `/bot/profile/{userId}` (which only
+ *  returns a profile when the user has added the bot as a friend), the member
+ *  endpoint resolves anyone currently in a group/room the bot belongs to — so
+ *  non-friend group members get a real name instead of falling back to raw id.
+ *  Rooms have their own member endpoint; only groups also expose `/summary`. */
+async function getMemberProfile(
+  source: LineMessageEvent["source"],
+  userId: string,
+): Promise<LineProfile | null> {
+  const path = source.groupId
+    ? `/bot/group/${source.groupId}/member/${userId}`
+    : source.roomId
+      ? `/bot/room/${source.roomId}/member/${userId}`
+      : null;
+  if (!path) return null;
+  const cached = profileCache.get(userId);
+  if (cached && Date.now() - cached.fetchedAt < PROFILE_TTL_MS) {
+    return cached.profile;
+  }
+  try {
+    const profile = await lineApi<LineProfile>("GET", path);
+    profileCache.set(userId, { profile, fetchedAt: Date.now() });
+    return profile;
+  } catch (err) {
+    debugLog(`Failed to get member profile for ${userId} in ${getChatId(source)}: ${err instanceof Error ? err.message : err}`);
+    return null;
+  }
+}
+
+async function getDisplayName(
+  userId: string,
+  source?: LineMessageEvent["source"],
+): Promise<string> {
+  // In a group/room, resolve via the member endpoint first: the 1:1 friend
+  // endpoint returns nothing for members who have not added the bot, which is
+  // why unpaired group members otherwise show up as raw user ids.
+  if (source && (source.groupId || source.roomId)) {
+    const member = await getMemberProfile(source, userId);
+    if (member?.displayName) return member.displayName;
+  }
   const profile = await getUserProfile(userId);
   return profile?.displayName ?? userId;
 }
@@ -525,7 +564,7 @@ async function handleMessageEvent(event: LineMessageEvent): Promise<void> {
     if (isGroup) {
       await recordSeen(agent, { platform: "line", id: chatId, kind: "group", name: await getGroupName(chatId) });
     } else {
-      await recordSeen(agent, { platform: "line", id: userId, kind: "user", name: await getDisplayName(userId) });
+      await recordSeen(agent, { platform: "line", id: userId, kind: "user", name: await getDisplayName(userId, event.source) });
     }
   })();
 
@@ -539,7 +578,7 @@ async function handleMessageEvent(event: LineMessageEvent): Promise<void> {
     }
   }
 
-  const displayName = await getDisplayName(userId);
+  const displayName = await getDisplayName(userId, event.source);
   const channelType = isGroup ? (event.source.groupId ? "group" : "room") : "DM";
 
   let messageText = "";
@@ -714,7 +753,7 @@ async function handlePostbackEvent(event: LinePostbackEvent): Promise<void> {
 
   const chatId = getChatId(event.source);
   const sessionThreadId = lineSessionId(event.source);
-  const displayName = await getDisplayName(userId);
+  const displayName = await getDisplayName(userId, event.source);
 
   console.log(
     `[${new Date().toLocaleTimeString()}] Line ${displayName} [postback]: "${event.postback.data}"`,
