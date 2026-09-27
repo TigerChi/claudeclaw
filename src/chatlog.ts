@@ -46,6 +46,10 @@ export interface ChatLogEntry {
   mediaPath?: string;
   /** True when the speaker was not on the allowlist (overheard, never answered). */
   unpaired?: boolean;
+  /** Message id this entry refers to. Used by machine-generated follow-ups (e.g.
+   *  an audio transcript appended after the original voice entry) to link back
+   *  to the source message instead of rewriting the original (append-only). */
+  refId?: string;
 }
 
 export interface ChatLogConfig {

@@ -549,26 +549,148 @@ function isBotMentioned(text: string): boolean {
 // Bounded per chat and dropped oldest-first: a chatty group must never grow the
 // prompt without limit, and stale context is worth less than recent context.
 const PASSIVE_BUFFER_LIMIT = 40;
-const passiveBuffers = new Map<string, string[]>();
 
-function recordPassiveMessage(chatId: string, speaker: string, text: string): void {
-  const trimmed = text.trim();
-  if (!trimmed) return;
+interface PassiveEntry {
+  speaker: string;
+  body: string;
+  /** Source message id — links to a transcription job for audio. */
+  messageId?: string;
+  /** True while `body` is an audio placeholder awaiting transcription. */
+  audioPending?: boolean;
+}
+const passiveBuffers = new Map<string, PassiveEntry[]>();
+
+/** Max wall-clock a woken prompt waits for a still-pending transcript that lands
+ *  in its drained window. Matches the loading-animation cadence; on timeout the
+ *  placeholder is injected as-is (the transcript still reaches the chat log). */
+const TRANSCRIBE_WAIT_MS = 15_000;
+
+function recordPassiveEntry(chatId: string, entry: PassiveEntry): void {
   const buffer = passiveBuffers.get(chatId) ?? [];
-  buffer.push(`${speaker}: ${trimmed}`);
+  buffer.push(entry);
   if (buffer.length > PASSIVE_BUFFER_LIMIT) buffer.splice(0, buffer.length - PASSIVE_BUFFER_LIMIT);
   passiveBuffers.set(chatId, buffer);
 }
 
-/** Called on the unauthorized-user paths. Text is kept as context; media is
- *  deliberately ignored — downloading files for someone we will never answer is
- *  not worth the cost. */
+function recordPassiveMessage(chatId: string, speaker: string, text: string): void {
+  const trimmed = text.trim();
+  if (!trimmed) return;
+  recordPassiveEntry(chatId, { speaker, body: trimmed });
+}
+
+// --- Async transcription registry ---
+//
+// Voice that arrives without waking the agent is transcribed in the background
+// (never blocks message handling). Keyed by message id so the woken path and
+// the passive path share one job. On completion the transcript is appended to
+// the chat log as a NEW entry (append-only; the original voice entry is never
+// rewritten) linked back via refId.
+interface TranscriptionJob {
+  status: "pending" | "done" | "failed";
+  text: string | null;
+  promise: Promise<string | null>;
+}
+const transcriptions = new Map<string, TranscriptionJob>();
+
+function ensureTranscription(
+  messageId: string,
+  audioPath: string,
+  onDone?: (text: string | null) => Promise<void> | void,
+): TranscriptionJob {
+  const existing = transcriptions.get(messageId);
+  if (existing) return existing;
+  const job: TranscriptionJob = { status: "pending", text: null, promise: Promise.resolve(null) };
+  job.promise = (async () => {
+    try {
+      const result = await transcribeAudioToText(audioPath, { debug: lineDebug, log: (m) => debugLog(m) });
+      job.text = result.text || null;
+      job.status = "done";
+    } catch (err) {
+      job.status = "failed";
+      debugLog(`Transcription failed for ${messageId}: ${err instanceof Error ? err.message : err}`);
+    }
+    if (onDone) {
+      try { await onDone(job.text); } catch (err) {
+        debugLog(`Transcription onDone failed for ${messageId}: ${err instanceof Error ? err.message : err}`);
+      }
+    }
+    return job.text;
+  })();
+  transcriptions.set(messageId, job);
+  return job;
+}
+
+/** Capture a message the agent was NOT woken by, so its content is not lost:
+ *  record a passive entry (drained into the next woken prompt) and, for audio,
+ *  kick off background transcription. Media is downloaded (memoized) so a later
+ *  "@bot handle that file" can reach it. Gated by the caller on chatLog. */
+async function captureSkippedMedia(
+  event: LineMessageEvent,
+  userId: string,
+  displayName: string,
+  chatId: string,
+  kind: "group" | "room" | "user",
+  conversationName: string | undefined,
+): Promise<void> {
+  const speaker = `${displayName}(${userId})`;
+  const type = event.message.type;
+  if (!DOWNLOADABLE.has(type)) {
+    // sticker / location: a text description is the whole record.
+    recordPassiveMessage(chatId, speaker, describeMessage(event.message));
+    return;
+  }
+
+  let path: string | null = null;
+  try {
+    path = await downloadLineContentOnce(event.message.id, type as "image" | "video" | "audio" | "file", event.message.fileName);
+  } catch (err) {
+    console.error(`[Line] Failed to download skipped ${type} ${event.message.id}: ${err instanceof Error ? err.message : err}`);
+  }
+  const fileTag = path ? ` (檔案: ${path})` : "";
+
+  if (type === "audio") {
+    recordPassiveEntry(chatId, {
+      speaker,
+      messageId: event.message.id,
+      audioPending: true,
+      body: `[語音轉文字 轉錄中…]${fileTag}`,
+    });
+    if (path) {
+      ensureTranscription(event.message.id, path, async (text) => {
+        await appendChatLog(conversationKey(kind, chatId), kind, conversationName, {
+          ts: new Date().toISOString(),
+          role: "user",
+          userId,
+          name: displayName,
+          kind: "transcript",
+          refId: event.message.id,
+          text: text ? `[語音轉文字] ${text}` : "[語音轉文字失敗]",
+        });
+      });
+    }
+    return;
+  }
+
+  const label = type === "image" ? "[圖片]" : type === "video" ? "[影片]" : "[檔案]";
+  recordPassiveEntry(chatId, { speaker, messageId: event.message.id, body: `${label}${fileTag}` });
+}
+
+/** Called on the unauthorized-user paths (group/room only). Text is always kept
+ *  as context; media is captured (download + transcription) only when this
+ *  conversation's chat log is on, matching the log's cost/gating. */
 async function capturePassive(event: LineMessageEvent, userId: string, isGroup: boolean): Promise<void> {
-  if (!isGroup || event.message.type !== "text") return;
+  if (!isGroup) return;
   const chatId = getChatId(event.source);
   const speaker = await getDisplayName(userId, event.source);
-  recordPassiveMessage(chatId, `${speaker}(${userId})`, event.message.text ?? "");
-  debugLog(`Passive listen captured from ${userId} in ${chatId}`);
+  if (event.message.type === "text") {
+    recordPassiveMessage(chatId, `${speaker}(${userId})`, event.message.text ?? "");
+    debugLog(`Passive listen captured from ${userId} in ${chatId}`);
+    return;
+  }
+  const config = getSettings().line;
+  if (!(config.groups[chatId]?.chatLog ?? config.chatLog.enabled)) return;
+  const kind = event.source.groupId ? "group" : "room";
+  await captureSkippedMedia(event, userId, speaker, chatId, kind, await getGroupName(chatId));
 }
 
 // --- Durable chat log ---
@@ -670,7 +792,7 @@ async function logOutbound(source: LineMessageEvent["source"], text: string): Pr
 
 /** Take everything buffered for this chat and clear it, so the same lines are
  *  never replayed into a second prompt. */
-function drainPassiveMessages(chatId: string): string[] {
+function drainPassiveMessages(chatId: string): PassiveEntry[] {
   const buffer = passiveBuffers.get(chatId);
   if (!buffer || buffer.length === 0) return [];
   passiveBuffers.delete(chatId);
@@ -770,12 +892,16 @@ async function handleMessageEvent(event: LineMessageEvent): Promise<void> {
     const requireMention = groupOverride !== undefined ? groupOverride : config.requireMention;
     const isText = event.message.type === "text";
     if (requireMention && !(isText && isBotMentioned(event.message.text ?? ""))) {
-      // Always buffer the text so the context the agent eventually sees has no
-      // holes where a member spoke without mentioning the bot. Drained (and
-      // cleared) into the next woken prompt. (Media is not buffered: the chat
-      // log covers it.)
+      // Buffer what was said so the next woken prompt has no holes. Text is
+      // always kept; media is downloaded + (audio) transcribed only when this
+      // conversation's chat log is on, so a later "@bot handle that file/voice"
+      // can reach it. Drained (and cleared) into the next woken prompt.
+      const speaker = await getDisplayName(userId, event.source);
       if (isText) {
-        recordPassiveMessage(chatId, `${await getDisplayName(userId, event.source)}(${userId})`, event.message.text ?? "");
+        recordPassiveMessage(chatId, `${speaker}(${userId})`, event.message.text ?? "");
+      } else if (config.groups[chatId]?.chatLog ?? config.chatLog.enabled) {
+        const kind = event.source.groupId ? "group" : "room";
+        await captureSkippedMedia(event, userId, speaker, chatId, kind, await getGroupName(chatId));
       }
       debugLog(`Skip group ${event.message.type} message (mention required): ${chatId}`);
       return;
@@ -852,6 +978,20 @@ async function handleMessageEvent(event: LineMessageEvent): Promise<void> {
           }
         } catch (err) {
           console.error(`[Line] Failed to transcribe audio: ${err instanceof Error ? err.message : err}`);
+        }
+        // Unify with the passive path: persist the transcript to the chat log as
+        // a new entry linked to the source (append-only; original is untouched).
+        if (voiceTranscript && (config.groups[chatId]?.chatLog ?? config.chatLog.enabled)) {
+          const kind = isGroup ? (event.source.groupId ? "group" : "room") : "user";
+          void appendChatLog(conversationKey(kind, chatId), kind, isGroup ? await getGroupName(chatId) : displayName, {
+            ts: new Date().toISOString(),
+            role: "user",
+            userId,
+            name: displayName,
+            kind: "transcript",
+            refId: event.message.id,
+            text: `[語音轉文字] ${voiceTranscript}`,
+          });
         }
       }
       break;
@@ -949,10 +1089,27 @@ async function handleMessageEvent(event: LineMessageEvent): Promise<void> {
     // agent last spoke, drained and cleared so nothing is replayed twice.
     const overheard = drainPassiveMessages(chatId);
     if (overheard.length > 0) {
+      // If a still-pending voice transcript sits in this window, wait for it
+      // (bounded) so its text lands in the prompt rather than a placeholder.
+      const pending = overheard
+        .filter((e) => e.audioPending && e.messageId && transcriptions.get(e.messageId)?.status === "pending")
+        .map((e) => transcriptions.get(e.messageId!)!.promise);
+      if (pending.length > 0) {
+        await Promise.race([
+          Promise.all(pending),
+          new Promise((resolve) => setTimeout(resolve, TRANSCRIBE_WAIT_MS)),
+        ]);
+      }
+      const lines = overheard.map((e) => {
+        let body = e.body;
+        if (e.audioPending && e.messageId) {
+          const job = transcriptions.get(e.messageId);
+          if (job?.text) body = `[語音轉文字] ${job.text}`;
+        }
+        return sanitizeUserInput(`${e.speaker}: ${body}`);
+      });
       promptParts.push(
-        `--- Overheard in this group since you last spoke (${overheard.length} message(s), context only — do not reply to these) ---\n${overheard
-          .map((line) => sanitizeUserInput(line))
-          .join("\n")}\n--- End of overheard messages ---`,
+        `--- Overheard in this group since you last spoke (${lines.length} message(s), context only — do not reply to these) ---\n${lines.join("\n")}\n--- End of overheard messages ---`,
       );
     }
 

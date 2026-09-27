@@ -250,11 +250,13 @@ daemon 啟動會自動偵測 Proxy 並印出 `LINE: proxy detected, using intern
 |---|---|
 | 文字 | 直接作為 prompt |
 | 圖片 | 下載到 `inbox/line/`，Claude 用 Read 查看 |
-| 語音 | 下載後 Whisper 轉文字（見 §9） |
+| 語音 | 下載後 Whisper 轉文字（見 §9）；逐字稿標記 `[語音轉文字]`（機器轉、可能有誤），並寫進 chatLog |
 | 影片 | 下載，告知 Claude 有影片檔 |
 | 檔案 | 下載，Claude 用 Read 讀取 |
 | 貼圖 | 轉文字描述（sticker keywords） |
 | 位置 | 轉文字（地名、地址、座標） |
+
+> **沒喚醒 Agent 的 media 也會捕捉**（chatLog 開的對話）：在 `requireMention` 群組裡沒 @ bot 的圖片/影片/語音/檔案，一樣下載暫存並在旁聽緩衝記一筆（帶檔名），語音另在背景轉文字。之後 @bot「處理剛剛那份檔案/語音」就抓得到。轉錄**非同步**、不阻塞；喚醒時若剛好等到的視窗內有語音還在轉，最多等 15 秒，逾時先放「轉錄中」佔位（逐字稿仍會補進 chatLog）。gating：只在該對話 `chatLog` 開時才下載/轉錄。
 
 ### 6.2 回覆格式
 
@@ -411,10 +413,11 @@ chatlog/
 |---|---|
 | 文字 | 原文 |
 | 圖片/影片/語音/檔案 | 下載到 `inbox/line/<messageId>.<ext>`，`mediaPath` 指向它 |
+| 語音逐字稿 | **另存一筆** `kind:"transcript"` entry，`text` 前綴 `[語音轉文字]`、`refId` 指回原語音的 message id（append-only，不改寫原始 entry） |
 | 貼圖 | `[sticker: 關鍵字 — package <id>/<id>]`（LINE 不提供貼圖下載，關鍵字+id 是唯一可留的） |
 | 位置 | `[location: 名稱 地址 (緯度, 經度)]` |
 
-附件在**授權檢查之前**就下載，未配對者傳的檔案同樣落地；下載按 message id 記憶化。
+附件在**授權檢查之前**就下載，未配對者傳的檔案同樣落地；下載按 message id 記憶化。語音逐字稿是**機器轉錄、可能有誤**，reader/LLM 可據 `[語音轉文字]` 標記判斷是否需校正。
 
 注意：
 - **不自動裁切內容**：輪替只是換檔，不刪舊資料。磁碟成長主要來自附件，保留多久由運維決定。
