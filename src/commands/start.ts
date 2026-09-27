@@ -510,12 +510,11 @@ export async function start(args: string[] = []) {
 
   // --- LINE ---
   let lineSendToUser: ((userId: string, text: string) => Promise<void>) | null = null;
-  let lineForwardTargets: () => string[] = () => [];
   let lineAccessToken = "";
 
   async function initLine(accessToken: string) {
     if (accessToken && accessToken !== lineAccessToken) {
-      const { startLine, sendMessageToUser: lineSend, stopLine, getLineForwardTargets } = await import("./line");
+      const { startLine, sendMessageToUser: lineSend, stopLine } = await import("./line");
       if (lineAccessToken) stopLine();
 
       // Check if LINE proxy is running — if so, daemon connects via proxy (no port conflict)
@@ -528,14 +527,12 @@ export async function start(args: string[] = []) {
       startLine(debugFlag);
       lineStop = stopLine;
       lineSendToUser = (userId, text) => lineSend(userId, text);
-      lineForwardTargets = getLineForwardTargets;
       lineAccessToken = accessToken;
       console.log(`[${ts()}] LINE: enabled${proxyActive ? " (via proxy)" : ""}`);
     } else if (!accessToken && lineAccessToken) {
       if (lineStop) lineStop();
       lineStop = null;
       lineSendToUser = null;
-      lineForwardTargets = () => [];
       lineAccessToken = "";
       console.log(`[${ts()}] LINE: disabled`);
     }
@@ -713,20 +710,6 @@ export async function start(args: string[] = []) {
     }
   }
 
-  function forwardToLine(label: string, result: { exitCode: number; stdout: string; stderr: string }) {
-    if (!lineSendToUser) return;
-    const targets = lineForwardTargets();
-    if (targets.length === 0) return;
-    const body = forwardBody(result);
-    if (body === null) return;
-    // Label goes at the END so push-notification previews show content first.
-    const text = label ? `${body}\n[${label}]` : body;
-    for (const userId of targets) {
-      lineSendToUser(userId, text).catch((err) =>
-        console.error(`[LINE] Failed to forward to ${userId}: ${err}`)
-      );
-    }
-  }
 
   // --- Targeted notify ([notify:<target>]...[/notify] directives) ---
 
@@ -866,7 +849,6 @@ export async function start(args: string[] = []) {
       forwardToTelegram("", result);
       forwardToDiscord("", result);
       forwardToSlack("", result, currentSettings.heartbeat.slackTarget);
-      forwardToLine("", result);
       return;
     }
 
@@ -876,7 +858,6 @@ export async function start(args: string[] = []) {
         case "telegram": forwardToTelegram("", result); break;
         case "discord": forwardToDiscord("", result); break;
         case "slack": forwardToSlack("", result, currentSettings.heartbeat.slackTarget); break;
-        case "line": forwardToLine("", result); break;
         default: notifyTargets.push(t);
       }
     }
@@ -959,7 +940,6 @@ export async function start(args: string[] = []) {
           forwardToTelegram("", r);
           forwardToDiscord("", r);
           forwardToSlack("", r, currentSettings.heartbeat.slackTarget);
-          forwardToLine("", r);
         });
       nextHeartbeatAt = nextAllowedHeartbeatAt(
         currentSettings.heartbeat,
@@ -985,7 +965,6 @@ export async function start(args: string[] = []) {
     if (telegramFlag) forwardToTelegram("", triggerResult);
     if (discordFlag) forwardToDiscord("", triggerResult);
     if (slackFlag) forwardToSlack("", triggerResult);
-    if (lineFlag) forwardToLine("", triggerResult);
     if (triggerResult.exitCode !== 0) {
       console.error(`[${ts()}] Startup trigger failed (exit ${triggerResult.exitCode}). Daemon will continue running.`);
     }
@@ -1043,7 +1022,6 @@ export async function start(args: string[] = []) {
     forwardToTelegram(label, r);
     forwardToDiscord(label, r);
     forwardToSlack(label, r);
-    forwardToLine(label, r);
   }
 
   if (currentSettings.agentBus.enabled && currentSettings.agentBus.name) {
@@ -1229,7 +1207,6 @@ export async function start(args: string[] = []) {
             if (want("telegram")) forwardToTelegram(job.name, r);
             if (want("discord")) forwardToDiscord(job.name, r);
             if (want("slack")) forwardToSlack(job.name, r, job.slackTarget);
-            if (want("line")) forwardToLine(job.name, r);
           })
           .finally(async () => {
             if (job.recurring) return;

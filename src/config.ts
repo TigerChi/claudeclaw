@@ -81,9 +81,9 @@ const DEFAULT_SETTINGS: Settings = {
     },
     requireMention: true,
     defaultSpeechPolicy: "normal",
-    defaultPassiveListen: false,
+    defaultExtraPrompt: "",
     groups: {},
-    chatLog: { enabled: false, injectRecent: 15 },
+    chatLog: { enabled: true },
     webhookPort: 3100,
     webhookPath: "/webhook",
   },
@@ -182,12 +182,18 @@ export interface SlackConfig {
 export interface LineGroupConfig {
   /** Override the global requireMention setting for this specific group. */
   requireMention?: boolean;
-  /** When true, text from users who are NOT on the allowlist is buffered as
-   *  background context instead of being dropped. The agent is never woken by
-   *  these messages; the buffer is drained into the next authorized message's
-   *  prompt. Lets the agent follow a whole group conversation while still only
-   *  answering to paired users. Default false (unpaired text is dropped). */
-  passiveListen?: boolean;
+  /** Per-conversation override for the chat log (keyed by chatId — group/room id
+   *  or DM user id). Set `false` to stop archiving this specific conversation
+   *  while the global `chatLog.enabled` default stays on. Omitted = follow the
+   *  global default. */
+  chatLog?: boolean;
+  /** When true, users who are NOT on the allowlist can converse with the agent
+   *  in this group (subject to the same requireMention rule as anyone else).
+   *  Only opens the group path — the DM pairing gate is untouched, and these
+   *  users are never added to the allowlist, so a DM from them is still blocked.
+   *  Default false. There is deliberately no global toggle: opening a group is
+   *  always an explicit per-group opt-in. */
+  allowUnauthorized?: boolean;
   /** Speech discipline for this group.
    *    "normal"     — default; behaves like any group.
    *    "restricted" — for groups with outsiders present (e.g. a bank/vendor
@@ -199,6 +205,11 @@ export interface LineGroupConfig {
    *  still `requireMention`. Enforced by prompt, not routing (LINE agents only
    *  ever speak in response to a wake, so there is nothing to gate mechanically). */
   speechPolicy?: "normal" | "restricted";
+  /** Free-text directive appended to this conversation's prompt, independent of
+   *  speechPolicy. Overrides `defaultExtraPrompt`. When `speechPolicy` is
+   *  "restricted" it stacks on top of the built-in restricted template; for a
+   *  normal chat it is injected on its own. Omitted = fall back to the default. */
+  extraPrompt?: string;
 }
 
 /** Pairing configuration: lets unknown DM users self-enroll into the allowlist
@@ -216,11 +227,11 @@ export interface LinePairingConfig {
 
 /** Durable chat transcript settings. See src/chatlog.ts for the on-disk layout. */
 export interface ChatLogConfig {
-  /** Off by default — enabling it starts persisting conversation content. */
+  /** Global default. On by default; a conversation opts out via
+   *  `groups[chatId].chatLog === false`. The log is a durable archive only — it
+   *  is NOT injected turn-by-turn (the prompt gets a one-line pointer to it);
+   *  live context comes from the in-memory passive buffer. */
   enabled: boolean;
-  /** Entries injected into each prompt. Everything older stays on disk for the
-   *  agent to read on demand, so this bounds token cost, not available context. */
-  injectRecent: number;
 }
 
 export interface LineConfig {
@@ -241,18 +252,15 @@ export interface LineConfig {
    *  present until an admin explicitly marks a group `"normal"` (e.g. the
    *  internal task group). Defaults to "normal" to preserve existing agents. */
   defaultSpeechPolicy: "normal" | "restricted";
-  /** Default passiveListen for groups with no explicit `passiveListen` entry.
-   *  When true, every group buffers unpaired members' text as context instead of
-   *  dropping it, and never wakes on it — safe-by-default for agents that sit in
-   *  channels with outsiders. Defaults to false to preserve existing agents. */
-  defaultPassiveListen: boolean;
+  /** Agent-wide default extra prompt, appended to every conversation's prompt
+   *  unless a conversation sets its own `extraPrompt`. Empty = none. */
+  defaultExtraPrompt: string;
   /** Per-group config overrides, keyed by group/room ID (group IDs start with "C", room IDs with "R"). */
   groups: Record<string, LineGroupConfig>;
-  /** Durable transcript on disk. When enabled, every inbound message (paired or
-   *  not, mentioned or not) plus the agent's own replies are appended to
-   *  `.claude/claudeclaw/chatlog/`, and the prompt gets the most recent
-   *  `injectRecent` entries plus the path to read further back. Supersedes the
-   *  in-memory passive-listen buffer for the conversations it covers. */
+  /** Durable transcript on disk. When enabled (default), every inbound message
+   *  (paired or not, mentioned or not) plus the agent's own replies are appended
+   *  to `.claude/claudeclaw/chatlog/` as a queryable archive. It is not injected
+   *  into the prompt — the prompt only carries a pointer to the directory. */
   chatLog: ChatLogConfig;
   /** Local port for the webhook HTTP server (default: 3100) */
   webhookPort: number;
@@ -549,7 +557,7 @@ function parseSettings(raw: Record<string, any>): Settings {
       },
       requireMention: typeof raw.line?.requireMention === "boolean" ? raw.line.requireMention : true,
       defaultSpeechPolicy: raw.line?.defaultSpeechPolicy === "restricted" ? "restricted" : "normal",
-      defaultPassiveListen: typeof raw.line?.defaultPassiveListen === "boolean" ? raw.line.defaultPassiveListen : false,
+      defaultExtraPrompt: typeof raw.line?.defaultExtraPrompt === "string" ? raw.line.defaultExtraPrompt : "",
       groups: (() => {
         const result: Record<string, LineGroupConfig> = {};
         if (raw.line?.groups && typeof raw.line.groups === "object" && !Array.isArray(raw.line.groups)) {
@@ -558,11 +566,13 @@ function parseSettings(raw: Record<string, any>): Settings {
               const c = cfg as Record<string, unknown>;
               result[groupId] = {
                 requireMention: typeof c.requireMention === "boolean" ? c.requireMention : undefined,
-                passiveListen: typeof c.passiveListen === "boolean" ? c.passiveListen : undefined,
+                chatLog: typeof c.chatLog === "boolean" ? c.chatLog : undefined,
+                allowUnauthorized: typeof c.allowUnauthorized === "boolean" ? c.allowUnauthorized : undefined,
                 speechPolicy:
                   c.speechPolicy === "restricted" ? "restricted"
                   : c.speechPolicy === "normal" ? "normal"
                   : undefined,
+                extraPrompt: typeof c.extraPrompt === "string" ? c.extraPrompt : undefined,
               };
             }
           }
@@ -570,10 +580,7 @@ function parseSettings(raw: Record<string, any>): Settings {
         return result;
       })(),
       chatLog: {
-        enabled: typeof raw.line?.chatLog?.enabled === "boolean" ? raw.line.chatLog.enabled : false,
-        injectRecent: Number.isFinite(raw.line?.chatLog?.injectRecent)
-          ? Math.max(0, Number(raw.line.chatLog.injectRecent))
-          : 15,
+        enabled: typeof raw.line?.chatLog?.enabled === "boolean" ? raw.line.chatLog.enabled : true,
       },
       webhookPort: Number.isFinite(raw.line?.webhookPort) ? Number(raw.line.webhookPort) : 3100,
       webhookPath: typeof raw.line?.webhookPath === "string" && raw.line.webhookPath.trim()

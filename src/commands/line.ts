@@ -4,11 +4,8 @@ import { addLineAllowedUser, getSettings, loadSettings } from "../config";
 import { recordSeen, harvestAgentName, recordDeadLetter } from "../contacts";
 import {
   appendChatLog,
-  conversationDir,
+  conversationDirPath,
   conversationKey,
-  countEntries,
-  formatEntries,
-  readRecentEntries,
 } from "../chatlog";
 import { peekThreadSession } from "../sessionManager";
 import { transcribeAudioToText } from "../whisper";
@@ -133,39 +130,6 @@ const PROFILE_TTL_MS = 5 * 60 * 1000;
 
 // Loading animation interval handles per reply token
 const loadingTimers = new Map<string, ReturnType<typeof setInterval>>();
-
-// Known users — tracks DM users who have interacted with the bot.
-// Used by forwardToLine when allowedUserIds is empty (allow-all mode).
-const KNOWN_USERS_FILE = join(process.cwd(), ".claude", "claudeclaw", "line-known-users.json");
-
-const knownUsers = new Set<string>();
-
-async function loadKnownUsers(): Promise<void> {
-  try {
-    const raw = await Bun.file(KNOWN_USERS_FILE).text();
-    const arr = JSON.parse(raw);
-    if (Array.isArray(arr)) arr.forEach((id: string) => knownUsers.add(id));
-  } catch {
-    // file doesn't exist yet — that's fine
-  }
-}
-
-async function trackKnownUser(userId: string): Promise<void> {
-  if (knownUsers.has(userId)) return;
-  knownUsers.add(userId);
-  try {
-    await Bun.write(KNOWN_USERS_FILE, JSON.stringify([...knownUsers], null, 2) + "\n");
-  } catch (err) {
-    console.error(`[Line] Failed to persist known user: ${err}`);
-  }
-}
-
-/** Get the list of users to forward messages to (push API). */
-export function getLineForwardTargets(): string[] {
-  const config = getSettings().line;
-  if (config.allowedUserIds.length > 0) return config.allowedUserIds;
-  return [...knownUsers];
-}
 
 
 // --- Debug ---
@@ -576,10 +540,11 @@ function isBotMentioned(text: string): boolean {
 
 // --- Passive listen buffer ---
 //
-// Groups with `passiveListen` keep text from unauthorized (unpaired) members
-// here instead of discarding it. Nothing in this buffer wakes the agent — it is
-// drained into the prompt the next time an authorized user speaks, so the agent
-// sees the surrounding conversation without being driven by it.
+// The live context feed. Text a group says without mentioning the bot is kept
+// here instead of discarded. Nothing in this buffer wakes the agent — it is
+// drained (and cleared) into the prompt the next time an authorized user
+// speaks, so the agent sees the surrounding conversation, incrementally, without
+// being driven by it. Always on; the durable chat log is a separate archive.
 //
 // Bounded per chat and dropped oldest-first: a chatty group must never grow the
 // prompt without limit, and stale context is worth less than recent context.
@@ -595,14 +560,12 @@ function recordPassiveMessage(chatId: string, speaker: string, text: string): vo
   passiveBuffers.set(chatId, buffer);
 }
 
-/** Called on the unauthorized-user paths. If this is a passiveListen group and
- *  the message is text, keep it as context. Media is deliberately ignored —
- *  downloading files for someone we will never answer is not worth the cost. */
+/** Called on the unauthorized-user paths. Text is kept as context; media is
+ *  deliberately ignored — downloading files for someone we will never answer is
+ *  not worth the cost. */
 async function capturePassive(event: LineMessageEvent, userId: string, isGroup: boolean): Promise<void> {
   if (!isGroup || event.message.type !== "text") return;
   const chatId = getChatId(event.source);
-  const lineCfg = getSettings().line;
-  if (!(lineCfg.groups[chatId]?.passiveListen ?? lineCfg.defaultPassiveListen)) return;
   const speaker = await getDisplayName(userId, event.source);
   recordPassiveMessage(chatId, `${speaker}(${userId})`, event.message.text ?? "");
   debugLog(`Passive listen captured from ${userId} in ${chatId}`);
@@ -647,9 +610,11 @@ async function logInbound(
   unpaired: boolean,
 ): Promise<void> {
   const config = getSettings().line;
-  if (!config.chatLog.enabled) return;
   const kind = isGroup ? (event.source.groupId ? "group" : "room") : "user";
   const chatId = getChatId(event.source);
+  // Global default, with per-conversation opt-out (groups map is keyed by
+  // chatId — group/room id or DM user id, so this covers DMs too).
+  if (!(config.groups[chatId]?.chatLog ?? config.chatLog.enabled)) return;
   const name = await getDisplayName(userId, event.source);
   const conversationName = isGroup ? await getGroupName(chatId) : name;
 
@@ -691,10 +656,11 @@ async function logInbound(
 
 async function logOutbound(source: LineMessageEvent["source"], text: string): Promise<void> {
   const config = getSettings().line;
-  if (!config.chatLog.enabled) return;
   const isGroup = source.type === "group" || source.type === "room";
   const kind = isGroup ? (source.groupId ? "group" : "room") : "user";
-  await appendChatLog(conversationKey(kind, getChatId(source)), kind, undefined, {
+  const chatId = getChatId(source);
+  if (!(config.groups[chatId]?.chatLog ?? config.chatLog.enabled)) return;
+  await appendChatLog(conversationKey(kind, chatId), kind, undefined, {
     ts: new Date().toISOString(),
     role: "bot",
     kind: "text",
@@ -725,9 +691,13 @@ async function handleMessageEvent(event: LineMessageEvent): Promise<void> {
   }
 
   const isGroup = event.source.type === "group" || event.source.type === "room";
+  const chatId = getChatId(event.source);
 
-  // Track DM users for forwarding (push API)
-  if (!isGroup) trackKnownUser(userId);
+  // Open group: this specific group is flagged to let users who are NOT on the
+  // allowlist converse with the agent. It only relaxes the group path — the DM
+  // path is untouched, and these users are never added to `allowedUserIds`, so a
+  // DM from them is still stopped by the pairing gate. Never true for DMs.
+  const groupOpen = isGroup && (config.groups[chatId]?.allowUnauthorized ?? false);
 
   // Authorization check.
   //
@@ -745,7 +715,7 @@ async function handleMessageEvent(event: LineMessageEvent): Promise<void> {
   // transcript has to cover messages the agent never acts on.
   await logInbound(event, userId, isGroup, !onAllowlist);
 
-  if (hasPairing && !onAllowlist) {
+  if (hasPairing && !onAllowlist && !groupOpen) {
     if (!isGroup && event.message.type === "text") {
       const text = (event.message.text ?? "").trim();
       if (text === config.pairing.code) {
@@ -768,14 +738,12 @@ async function handleMessageEvent(event: LineMessageEvent): Promise<void> {
     return;
   }
 
-  if (config.allowedUserIds.length > 0 && !onAllowlist) {
+  if (config.allowedUserIds.length > 0 && !onAllowlist && !groupOpen) {
     await capturePassive(event, userId, isGroup);
     debugLog(`Unauthorized user: ${userId}`);
     return;
   }
 
-
-  const chatId = getChatId(event.source);
   const sessionThreadId = lineSessionId(event.source);
 
   // Contact harvest — feed the shared candidate pool (contacts/seen/). Runs
@@ -802,10 +770,11 @@ async function handleMessageEvent(event: LineMessageEvent): Promise<void> {
     const requireMention = groupOverride !== undefined ? groupOverride : config.requireMention;
     const isText = event.message.type === "text";
     if (requireMention && !(isText && isBotMentioned(event.message.text ?? ""))) {
-      // Buffer text too when passive listening — otherwise the context the agent
-      // eventually sees would have holes wherever a paired member spoke without
-      // mentioning the bot. (Media is not buffered: the chat log covers it.)
-      if (isText && (config.groups[chatId]?.passiveListen ?? config.defaultPassiveListen)) {
+      // Always buffer the text so the context the agent eventually sees has no
+      // holes where a member spoke without mentioning the bot. Drained (and
+      // cleared) into the next woken prompt. (Media is not buffered: the chat
+      // log covers it.)
+      if (isText) {
         recordPassiveMessage(chatId, `${await getDisplayName(userId, event.source)}(${userId})`, event.message.text ?? "");
       }
       debugLog(`Skip group ${event.message.type} message (mention required): ${chatId}`);
@@ -966,40 +935,35 @@ async function handleMessageEvent(event: LineMessageEvent): Promise<void> {
       );
     }
 
+    // Extra per-conversation prompt, independent of speechPolicy: a free-text
+    // directive appended for this chat. A per-conversation value wins, else the
+    // agent-wide default. Stacks on top of the restricted template when both
+    // apply; injected on its own for a normal/unset chat. Empty = nothing added.
+    const extraPrompt = (config.groups[chatId]?.extraPrompt ?? config.defaultExtraPrompt ?? "").trim();
+    if (extraPrompt) promptParts.push(extraPrompt);
+
     // Preceding conversation. Background only: it has already happened, so do
     // not reply to it or act on it directly.
     //
-    // With the chat log on, inject a fixed window and point at the file for the
-    // rest — the agent decides whether the context it was given is enough and
-    // reads further back only when it is not, so a long history costs nothing
-    // until it is actually needed. Without it, fall back to the RAM buffer.
-    const chatLog = config.chatLog;
-    if (chatLog.enabled) {
+    // Live context comes from the passive buffer: everything said since the
+    // agent last spoke, drained and cleared so nothing is replayed twice.
+    const overheard = drainPassiveMessages(chatId);
+    if (overheard.length > 0) {
+      promptParts.push(
+        `--- Overheard in this group since you last spoke (${overheard.length} message(s), context only — do not reply to these) ---\n${overheard
+          .map((line) => sanitizeUserInput(line))
+          .join("\n")}\n--- End of overheard messages ---`,
+      );
+    }
+
+    // The chat log is a durable archive, not injected turn-by-turn. Point the
+    // agent at it so it can read further back on its own when needed.
+    if (config.groups[chatId]?.chatLog ?? config.chatLog.enabled) {
       const key = conversationKey(isGroup ? (event.source.groupId ? "group" : "room") : "user", chatId);
-      // +1 and filter: this message was logged before the gate above, so it is
-      // already the newest entry and must not be replayed as prior context.
-      const recent = (await readRecentEntries(key, chatLog.injectRecent + 1))
-        .filter((e) => e.id !== event.message.id);
-      if (recent.length > 0) {
-        const total = await countEntries(key);
-        const older = Math.max(0, total - recent.length - 1);
+      const chatDir = await conversationDirPath(key);
+      if (chatDir) {
         promptParts.push(
-          [
-            `--- Preceding conversation (${recent.length} most recent, context only — do not reply to these) ---`,
-            ...formatEntries(recent).map((line) => sanitizeUserInput(line)),
-            `--- End of preceding conversation ---`,
-            `${older} older message(s) are on disk in ${conversationDir(key)} (monthly .jsonl files, oldest first within each).`,
-            `Read them yourself if the window above is not enough to understand what is being referred to.`,
-          ].join("\n"),
-        );
-      }
-    } else {
-      const overheard = drainPassiveMessages(chatId);
-      if (overheard.length > 0) {
-        promptParts.push(
-          `--- Overheard in this group since you last spoke (${overheard.length} message(s), context only — do not reply to these) ---\n${overheard
-            .map((line) => sanitizeUserInput(line))
-            .join("\n")}\n--- End of overheard messages ---`,
+          `This conversation's full history is archived at ${chatDir} (.jsonl files). Read it yourself if you need context earlier than what is shown above.`,
         );
       }
     }
@@ -1211,9 +1175,6 @@ export function startLine(debug = false): void {
     console.log("  LINE: not configured");
     return;
   }
-
-  // Load known users for forwarding
-  loadKnownUsers().catch(() => {});
 
   console.log("LINE bot started (Webhook)");
   console.log(`  Allowed users: ${config.allowedUserIds.length === 0 ? "all" : config.allowedUserIds.join(", ")}`);
