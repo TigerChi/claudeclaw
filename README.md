@@ -89,12 +89,12 @@ For commands you can send to the bot from inside a chat (`/cancel` to stop the c
 
 For the voice transcription pipeline — engine selection (MLX on Apple Silicon, whisper.cpp fallback, external STT API), model choice, two-tier vocabulary biasing, and where to edit which file — see [docs/WHISPER-GUIDE.md](docs/WHISPER-GUIDE.md).
 
-### Multi-Session Threads (Discord)
-- **Independent Thread Sessions:** Each Discord thread gets its own Claude CLI session, fully isolated from the main channel.
-- **Parallel Processing:** Thread conversations run concurrently — messages in different threads don't block each other.
-- **Auto-Create:** First message in a new thread automatically bootstraps a fresh session. No setup needed.
-- **Session Cleanup:** Thread sessions are automatically cleaned up when threads are deleted or archived.
-- **Backward Compatible:** DMs and main channel messages continue using the global session.
+### Multi-Session Conversations (LINE, Telegram, Slack, Discord)
+- **Independent Per-Conversation Sessions:** Every DM, group, room, and thread gets its own Claude CLI session, keyed in `sessions.json` and isolated from the global session.
+- **Parallel Processing:** Each session has its own queue — conversations run concurrently and don't block each other.
+- **Auto-Create:** The first message in a new conversation automatically bootstraps a fresh session. No setup needed.
+- **Session Cleanup:** Discord thread sessions are removed when the thread is deleted or archived.
+- **Global session fallback:** Only messages in untracked Discord guild top-level channels fall back to the global session (`session.json`). Because of that, deleting `session.json` does **not** reset an ordinary chat — use the platform's own reset path instead.
 
 See [docs/MULTI_SESSION.md](docs/MULTI_SESSION.md) for technical details.
 

@@ -462,19 +462,22 @@ export async function checkInbox(agentName: string): Promise<AgentMessage[]> {
  * Returns the cleaned text and extracted messages.
  *
  * Format: [send-agent:targetName] message content here
- * The message content extends to the next directive or end of text.
+ * The directive must start a line; the message content extends to the next
+ * directive, a [/send-agent] closer, or the end of the text.
  */
 export function extractAgentDirectives(
   text: string,
   fromAgent: string,
 ): { cleaned: string; directives: Array<{ to: string; payload: string }> } {
   const directives: Array<{ to: string; payload: string }> = [];
-  const pattern = /\[send-agent:([^\]\r\n]+)\]\s*/gi;
+  // Anchored to the start of a line, and the target has to look like an agent
+  // name. The old pattern matched the tag anywhere with any target text, so
+  // prose *about* the syntax fired real sends — including one to an agent
+  // literally named "[^\" from a quoted regex.
+  const pattern = /^[ \t]*\[send-agent:([a-z0-9_-]+)\][ \t]*/gim;
 
-  let cleaned = text;
-  let match: RegExpExecArray | null;
   const matches: Array<{ to: string; start: number; end: number }> = [];
-
+  let match: RegExpExecArray | null;
   while ((match = pattern.exec(text)) !== null) {
     matches.push({
       to: match[1].trim(),
@@ -482,6 +485,9 @@ export function extractAgentDirectives(
       end: match.index + match[0].length,
     });
   }
+
+  // Spans of the original text to drop from the cleaned output.
+  const drops: Array<{ start: number; end: number }> = [];
 
   // Extract payload for each directive. An optional [/send-agent] closing tag
   // ends the payload — without handling it, the closer leaks into the payload
@@ -494,14 +500,32 @@ export function extractAgentDirectives(
     const closerIdx = payload.search(/\[\/send-agent\]/i);
     if (closerIdx >= 0) payload = payload.slice(0, closerIdx);
     payload = payload.trim();
-    if (payload) {
-      directives.push({ to: m.to, payload });
+    if (!payload) continue;
+
+    // Never send to ourselves: the message comes straight back in, costing a
+    // full run and re-queueing indefinitely. Drop the tag, keep the text.
+    if (m.to.toLowerCase() === fromAgent.trim().toLowerCase()) {
+      console.warn(`[${ts()}] Agent Bus: ignoring [send-agent:${m.to}] — that is this agent`);
+      drops.push({ start: m.start, end: m.end });
+      continue;
     }
+
+    directives.push({ to: m.to, payload });
+    drops.push({ start: m.start, end: payloadEnd });
   }
 
-  // Remove directives (and any stray closing tags) from output
-  if (directives.length > 0) {
-    cleaned = text.replace(/\[send-agent:[^\]\r\n]+\][^\[]*/gi, "");
+  // Rebuild from the spans we kept. Slicing (rather than a second regex pass
+  // over the whole text) is what stops unrelated text from being swallowed.
+  let cleaned = text;
+  if (drops.length > 0) {
+    const parts: string[] = [];
+    let cursor = 0;
+    for (const d of drops) {
+      parts.push(text.slice(cursor, d.start));
+      cursor = d.end;
+    }
+    parts.push(text.slice(cursor));
+    cleaned = parts.join("");
   }
   cleaned = cleaned.replace(/\[\/send-agent\]/gi, "").trim();
 

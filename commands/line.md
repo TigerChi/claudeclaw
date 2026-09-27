@@ -10,12 +10,14 @@ Show the LINE bot integration status. Check the following:
    - Session UUID (first 8 chars)
    - Created at
    - Last used at
-   - Note: This session is shared across heartbeat, cron jobs, and LINE messages.
+   - Note: This session is used by heartbeat and cron jobs. **LINE messages do not use it** — every DM, group, and room gets its own session keyed `line:dm:<userId>` / `line:group:<groupId>` / `line:room:<roomId>` in `.claude/claudeclaw/sessions.json`.
 
-3. **If $ARGUMENTS contains "clear"**: Delete `.claude/claudeclaw/session.json` to reset the global session. Confirm to the user. The next run from any source (heartbeat, cron, or LINE) will create a fresh session.
+3. **Per-conversation Sessions**: Read `.claude/claudeclaw/sessions.json` and list the entries whose key starts with `line:` — key, session UUID (first 8 chars), turn count, last used at.
 
-4. **Running**: Check if the daemon is running by reading `.claude/claudeclaw/daemon.pid`. The LINE bot runs a webhook HTTP server in-process with the daemon when credentials are configured.
+4. **If $ARGUMENTS contains "clear"**: Deleting `.claude/claudeclaw/session.json` only resets the global (heartbeat/cron) session — it does **not** reset any LINE chat. To reset a specific LINE conversation, remove its `line:...` entry from `.claude/claudeclaw/sessions.json`. Confirm with the user which one they meant before deleting anything.
 
-5. **Webhook URL**: Remind the user that the LINE webhook URL should be set in LINE Developers Console to their public URL + webhookPath (e.g. `https://example.ngrok-free.dev<webhookPath>`).
+5. **Running**: Check if the daemon is running by reading `.claude/claudeclaw/daemon.pid`. The LINE bot runs a webhook HTTP server in-process with the daemon when credentials are configured.
+
+6. **Webhook URL**: Remind the user that the LINE webhook URL should be set in LINE Developers Console to their public URL + webhookPath (e.g. `https://example.ngrok-free.dev<webhookPath>`).
 
 Format the output clearly for the user.

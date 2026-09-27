@@ -1,12 +1,25 @@
 import { mkdir, readFile, writeFile } from "fs/promises";
 import { join } from "path";
 import { existsSync } from "fs";
-import { getSession, createSession, incrementTurn, markCompactWarned } from "./sessions";
+import {
+  getSession,
+  createSession,
+  incrementTurn,
+  markCompactWarned,
+  markPendingCompact,
+  getGlobalSessionDueForCompact,
+  resetSession,
+  resetTurnCount,
+} from "./sessions";
 import {
   getThreadSession,
   createThreadSession,
   incrementThreadTurn,
   markThreadCompactWarned,
+  resetThreadTurnCount,
+  markThreadPendingCompact,
+  listThreadsDueForCompact,
+  removeThreadSession,
 } from "./sessionManager";
 import { getSettings, type ModelConfig, type SecurityConfig, type AgentBusConfig } from "./config";
 import { buildClockPromptPrefix } from "./timezone";
@@ -81,6 +94,8 @@ export interface RunResult {
   stdout: string;
   stderr: string;
   exitCode: number;
+  /** True when the reply was a silence keyword and stdout was blanked. */
+  silenced?: boolean;
 }
 
 const RATE_LIMIT_PATTERN = /you.ve hit your limit|out of extra usage/i;
@@ -145,6 +160,11 @@ function extractRateLimitMessage(stdout: string, stderr: string): string | null 
   return null;
 }
 
+/** Claude Code's error when --resume points at a conversation it no longer has. */
+function isStaleSessionError(stderr: string): boolean {
+  return /No conversation found with session ID/i.test(stderr);
+}
+
 function sameModelConfig(a: ModelConfig, b: ModelConfig): boolean {
   return a.model.trim().toLowerCase() === b.model.trim().toLowerCase() && a.api.trim() === b.api.trim();
 }
@@ -183,6 +203,16 @@ function buildChildEnv(baseEnv: Record<string, string>, model: string, api: stri
 /** Default timeout for a single Claude Code invocation (15 minutes). */
 const CLAUDE_TIMEOUT_MS = 15 * 60 * 1000;
 
+/**
+ * Per-run timeout from settings. `sessionTimeoutMs: 0` disables it entirely —
+ * for agents whose runs legitimately exceed any fixed limit (long batch work).
+ * A hung run then blocks its queue until /cancel, which is the trade.
+ */
+function resolveTimeoutMs(settings: unknown): number {
+  const v = (settings as { sessionTimeoutMs?: unknown } | null)?.sessionTimeoutMs;
+  return typeof v === "number" && v >= 0 ? v : CLAUDE_TIMEOUT_MS;
+}
+
 async function runClaudeOnce(
   baseArgs: string[],
   model: string,
@@ -212,6 +242,7 @@ async function runClaudeOnce(
   }
 
   const timeoutPromise = new Promise<never>((_, reject) => {
+    if (timeoutMs <= 0) return;   // 0 = no limit
     setTimeout(() => reject(new Error(`Claude session timed out after ${timeoutMs / 1000}s`)), timeoutMs);
   });
   const abortPromise = new Promise<never>((_, reject) => {
@@ -402,6 +433,77 @@ export async function runCompact(
  * High-level compact: resolves session + settings internally.
  * Returns { success, message }.
  */
+/**
+ * Perform any compactions scheduled by the turn threshold whose conversation
+ * has since gone quiet. Intended to be polled from the daemon's timer.
+ *
+ * Each compact goes through the same per-thread queue as a normal run, so it
+ * can never overlap a `--resume` on the same session; if a message arrives
+ * first, the compact simply waits its turn behind it.
+ *
+ * Returns the number of sessions compacted (0 on a quiet sweep).
+ */
+const compactsInFlight = new Set<string>();
+
+export async function runPendingCompactions(): Promise<number> {
+  const settings = getSettings();
+  if (settings.autoCompactTurns <= 0) return 0;
+
+  const idleMs = settings.autoCompactIdleMs;
+  const due = await listThreadsDueForCompact(idleMs);
+  const globalDue = await getGlobalSessionDueForCompact(idleMs);
+  if (due.length === 0 && !globalDue) return 0;
+
+  const securityArgs = buildSecurityArgs(settings.security);
+  const { CLAUDECODE: _, ...cleanEnv } = process.env;
+  const baseEnv = {
+    ...withDaemonSafeEnv(cleanEnv as NodeJS.ProcessEnv),
+    ...loadAgentEnv(process.cwd()),
+  } as Record<string, string>;
+  const timeoutMs = resolveTimeoutMs(settings);
+
+  const targets: { sessionId: string; threadId?: string }[] = [
+    ...due.map((t) => ({ sessionId: t.sessionId, threadId: t.threadId as string | undefined })),
+    ...(globalDue ? [{ sessionId: globalDue.sessionId, threadId: undefined }] : []),
+  ]
+    // A compact can outlast the sweep interval, and its pendingCompact flag only
+    // clears on success — so without this guard every subsequent sweep queues
+    // the same compact again, and real messages pile up behind the duplicates.
+    .filter((t) => !compactsInFlight.has(t.threadId ?? "global"));
+  if (targets.length === 0) return 0;
+
+  let compacted = 0;
+  for (const target of targets) {
+    const key = target.threadId ?? "global";
+    const label = target.threadId ? `thread ${target.threadId.slice(0, 8)}` : "global session";
+    compactsInFlight.add(key);
+    console.log(`[${new Date().toLocaleTimeString()}] Idle compact starting for ${label}`);
+    emitCompactEvent({ type: "auto-compact-start" });
+
+    try {
+      const ok = await enqueue(
+        () => runCompact(target.sessionId, settings.model, settings.api, baseEnv, securityArgs, timeoutMs),
+        target.threadId,
+      ).catch(() => false);
+
+      emitCompactEvent({ type: "auto-compact-done", success: ok });
+      if (ok) {
+        compacted += 1;
+        // Only clear the flag on success — a failed compact stays scheduled and
+        // is retried on the next sweep.
+        if (target.threadId) {
+          await resetThreadTurnCount(target.threadId);
+        } else {
+          await resetTurnCount();
+        }
+      }
+    } finally {
+      compactsInFlight.delete(key);
+    }
+  }
+  return compacted;
+}
+
 export async function compactCurrentSession(): Promise<{ success: boolean; message: string }> {
   const existing = await getSession();
   if (!existing) return { success: false, message: "No active session to compact." };
@@ -413,7 +515,7 @@ export async function compactCurrentSession(): Promise<{ success: boolean; messa
     ...withDaemonSafeEnv(cleanEnv as NodeJS.ProcessEnv),
     ...loadAgentEnv(process.cwd()),
   } as Record<string, string>;
-  const timeoutMs = (settings as any).sessionTimeoutMs || CLAUDE_TIMEOUT_MS;
+  const timeoutMs = resolveTimeoutMs(settings);
 
   const ok = await runCompact(
     existing.sessionId,
@@ -448,7 +550,7 @@ async function execClaudeImpl(name: string, prompt: string, threadId: string | u
   const existing = threadId
     ? await getThreadSession(threadId)
     : await getSession();
-  const isNew = !existing;
+  let isNew = !existing;
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const logFile = join(LOGS_DIR, `${name}-${timestamp}.log`);
 
@@ -477,10 +579,10 @@ async function execClaudeImpl(name: string, prompt: string, threadId: string | u
     api: fallback?.api ?? "",
   };
   const securityArgs = buildSecurityArgs(security);
-  const timeoutMs = (settings as any).sessionTimeoutMs || CLAUDE_TIMEOUT_MS;
+  const timeoutMs = resolveTimeoutMs(settings);
 
   console.log(
-    `[${new Date().toLocaleTimeString()}] Running: ${name} (${isNew ? "new session" : `resume ${existing.sessionId.slice(0, 8)}`}, security: ${security.level})`
+    `[${new Date().toLocaleTimeString()}] Running: ${name} (${existing ? `resume ${existing.sessionId.slice(0, 8)}` : "new session"}, security: ${security.level})`
   );
 
   // New session: use json output to capture Claude's session_id
@@ -488,7 +590,7 @@ async function execClaudeImpl(name: string, prompt: string, threadId: string | u
   const outputFormat = isNew ? "json" : "text";
   const args = ["claude", "-p", prompt, "--output-format", outputFormat, ...securityArgs];
 
-  if (!isNew) {
+  if (existing) {
     args.push("--resume", existing.sessionId);
   }
 
@@ -538,7 +640,8 @@ async function execClaudeImpl(name: string, prompt: string, threadId: string | u
         others || "  (no other agents registered yet)",
         "",
         "### How to send a message to another agent:",
-        "Use the [send-agent:<name>] directive in your response:",
+        "Use the [send-agent:<name>] directive in your response. It MUST start its own line —",
+        "a tag written mid-sentence is treated as ordinary text and is not sent:",
         "  [send-agent:alice] Please check the latest deployment status",
         "",
         "### How Agent Bus messages work:",
@@ -588,6 +691,27 @@ async function execClaudeImpl(name: string, prompt: string, threadId: string | u
     );
     exec = await runClaudeOnce(args, fallbackConfig.model, fallbackConfig.api, baseEnv, timeoutMs, abortController.signal);
     usedFallback = true;
+  }
+
+  // --- Stale session recovery ---
+  // Claude Code loses a conversation when its transcript is pruned or deleted.
+  // Resuming it then fails every time, and session.json keeps pointing at the
+  // dead id forever — so every later run fails too. Forget it and start fresh.
+  if (!isNew && existing && exec.exitCode !== 0 && isStaleSessionError(exec.stderr) && !abortController.signal.aborted) {
+    console.warn(
+      `[${new Date().toLocaleTimeString()}] Session ${existing.sessionId.slice(0, 8)} no longer exists; starting a new one.`
+    );
+    if (threadId) await removeThreadSession(threadId);
+    else await resetSession();
+
+    const resumeIdx = args.indexOf("--resume");
+    if (resumeIdx !== -1) args.splice(resumeIdx, 2);
+    const formatIdx = args.indexOf("--output-format");
+    if (formatIdx !== -1) args[formatIdx + 1] = "json";
+    isNew = true;
+
+    const retryConfig = usedFallback ? fallbackConfig : primaryConfig;
+    exec = await runClaudeOnce(args, retryConfig.model, retryConfig.api, baseEnv, timeoutMs, abortController.signal);
   }
 
   const rawStdout = exec.rawStdout;
@@ -680,10 +804,29 @@ async function execClaudeImpl(name: string, prompt: string, threadId: string | u
     }
   }
 
-  // --- Turn tracking & compact warning ---
+  // --- Turn tracking, scheduled auto-compact, compact warning ---
   if (exitCode === 0 && !isNew) {
     const turnCount = threadId ? await incrementThreadTurn(threadId) : await incrementTurn();
     console.log(`[${new Date().toLocaleTimeString()}] Turn count: ${turnCount}${threadId ? ` (thread ${threadId.slice(0, 8)})` : ""}`);
+
+    // Reaching the turn threshold only *schedules* a compact; runPendingCompactions()
+    // performs it once the conversation has actually gone quiet.
+    //
+    // Compacting here instead would land the cost on whoever speaks next: the
+    // reply is already sent, but the run still occupies this thread's queue, so
+    // the following message waits behind it. And in the common back-and-forth
+    // rhythm there is never a lull to hide in — every turn looks idle while the
+    // user is simply typing. Deferring by wall-clock idleness is the only signal
+    // that distinguishes "conversation over" from "mid-sentence".
+    if (settings.autoCompactTurns > 0 && turnCount >= settings.autoCompactTurns && existing) {
+      if (threadId) {
+        await markThreadPendingCompact(threadId);
+      } else {
+        await markPendingCompact();
+      }
+      console.log(`[${new Date().toLocaleTimeString()}] Compact scheduled for next idle window${threadId ? ` (thread ${threadId.slice(0, 8)})` : ""}`);
+      return result;
+    }
 
     if (turnCount >= COMPACT_WARN_THRESHOLD && existing && !existing.compactWarned) {
       if (threadId) {
@@ -698,6 +841,35 @@ async function execClaudeImpl(name: string, prompt: string, threadId: string | u
   return result;
 }
 
+/**
+ * Send any [send-agent:] directives found in `text` and return the text with
+ * them stripped. Channels that bypass `run()` (e.g. Slack's streaming path)
+ * must call this themselves, or the directives are never sent and leak to the
+ * user as raw markup.
+ *
+ * When this run is processing an incoming agent-bus message, `replyToMsgId`
+ * is the origin message id; we attach it to outgoing directives so senders
+ * that registered a pending listener can have their reply routed back.
+ */
+export function dispatchAgentDirectives(text: string, replyToMsgId?: string): string {
+  const agentBus: AgentBusConfig = (getSettings() as any).agentBus ?? { enabled: false, name: "" };
+  if (!agentBus.enabled || !agentBus.name || !text) return text;
+
+  const { cleaned, directives } = extractAgentDirectives(text, agentBus.name);
+  if (directives.length === 0) return text;
+
+  for (const d of directives) {
+    sendToAgent(d.to, d.payload, {
+      from: agentBus.name,
+      type: replyToMsgId ? "response" : "message",
+      replyTo: replyToMsgId,
+    }).catch((err) => {
+      console.error(`[${new Date().toLocaleTimeString()}] Agent Bus: failed to send to "${d.to}":`, err);
+    });
+  }
+  return cleaned;
+}
+
 export async function run(
   name: string,
   prompt: string,
@@ -705,29 +877,8 @@ export async function run(
   replyToMsgId?: string,
 ): Promise<RunResult> {
   const result = await enqueue(() => execClaude(name, prompt, threadId), threadId);
-
-  // Process [send-agent:] directives in output — works for all channels.
-  // When this run is processing an incoming agent-bus message, `replyToMsgId`
-  // is the origin message id; we attach it to outgoing directives so senders
-  // that registered a pending listener can have their reply routed back.
-  const agentBus: AgentBusConfig = (getSettings() as any).agentBus ?? { enabled: false, name: "" };
-  if (agentBus.enabled && agentBus.name && result.stdout) {
-    const { cleaned, directives } = extractAgentDirectives(result.stdout, agentBus.name);
-    if (directives.length > 0) {
-      for (const d of directives) {
-        sendToAgent(d.to, d.payload, {
-          from: agentBus.name,
-          type: replyToMsgId ? "response" : "message",
-          replyTo: replyToMsgId,
-        }).catch((err) => {
-          console.error(`[${new Date().toLocaleTimeString()}] Agent Bus: failed to send to "${d.to}":`, err);
-        });
-      }
-      result.stdout = cleaned;
-    }
-  }
-
-  return result;
+  result.stdout = dispatchAgentDirectives(result.stdout, replyToMsgId);
+  return squelchSilenceKeyword(result, name);
 }
 
 async function streamClaude(
@@ -817,12 +968,11 @@ async function streamClaude(
 
   // Timeout via AbortController (also used for /cancel)
   const abortController = new AbortController();
-  const streamTimeoutMs = (streamSettings as any).sessionTimeoutMs || CLAUDE_TIMEOUT_MS;
+  const streamTimeoutMs = resolveTimeoutMs(streamSettings);
   let timedOut = false;
-  const timeoutId = setTimeout(() => {
-    timedOut = true;
-    abortController.abort();
-  }, streamTimeoutMs);
+  const timeoutId = streamTimeoutMs > 0
+    ? setTimeout(() => { timedOut = true; abortController.abort(); }, streamTimeoutMs)
+    : null;
   sdkOptions.abortController = abortController;
   registerInflight(cancelKey, abortController);
 
@@ -908,7 +1058,7 @@ async function streamClaude(
     }
     throw err;
   } finally {
-    clearTimeout(timeoutId);
+    if (timeoutId) clearTimeout(timeoutId);
     clearInflight(cancelKey, abortController);
   }
 
@@ -938,7 +1088,44 @@ function prefixUserMessageWithClock(prompt: string): string {
   }
 }
 
+/**
+ * Silence keywords — an agent with nothing worth sending opens its reply with
+ * one of these, and the platform sends nothing at all.
+ *
+ * `NO_SEND` is the current keyword. `HEARTBEAT_OK` is the historical one:
+ * it was coined when heartbeat runs were the only caller (back then the name
+ * was accurate — it meant "the heartbeat check found nothing"). Once USAGE.md
+ * started being injected into every session's system prompt, every agent
+ * learned it, and they reach for it while answering people and while running
+ * cron jobs too — where the name means nothing to the human who receives it.
+ * It stays recognized so existing job prompts and skills keep working; only
+ * `NO_SEND` is taught to new sessions.
+ */
+const SILENCE_KEYWORDS = ["NO_SEND", "HEARTBEAT_OK"];
+
+/** True when `text` opens with a silence keyword. */
+export function isSilenceKeyword(text: string): boolean {
+  const trimmed = text.trim();
+  return SILENCE_KEYWORDS.some((kw) => trimmed.startsWith(kw));
+}
+
+/**
+ * Honor a silence keyword: blank the output and flag the run.
+ *
+ * Every caller must treat empty stdout as "send nothing" — the platform
+ * forwarders do (they return early on empty output), and heartbeat reads
+ * `silenced` to decide whether its owner wants a "nothing to report" ping.
+ */
+function squelchSilenceKeyword(result: RunResult, name: string): RunResult {
+  if (!isSilenceKeyword(result.stdout)) return result;
+  console.log(`[${new Date().toLocaleTimeString()}] Squelched silence-keyword reply (${name})`);
+  result.stdout = "";
+  result.silenced = true;
+  return result;
+}
+
 export async function runUserMessage(name: string, prompt: string, threadId?: string): Promise<RunResult> {
+  // run() applies the silence-keyword squelch for every path, this one included.
   return run(name, prefixUserMessageWithClock(prompt), threadId);
 }
 

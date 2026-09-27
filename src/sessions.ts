@@ -10,6 +10,8 @@ export interface GlobalSession {
   lastUsedAt: string;
   turnCount: number;
   compactWarned: boolean;
+  /** See ThreadSession.pendingCompact. */
+  pendingCompact?: boolean;
 }
 
 let current: GlobalSession | null = null;
@@ -67,6 +69,33 @@ export async function incrementTurn(): Promise<number> {
   existing.turnCount += 1;
   await saveSession(existing);
   return existing.turnCount;
+}
+
+/** Zero the turn counter after a compact — see resetThreadTurnCount(). */
+export async function resetTurnCount(): Promise<void> {
+  const existing = await loadSession();
+  if (!existing) return;
+  existing.turnCount = 0;
+  existing.compactWarned = false;
+  existing.pendingCompact = false;
+  await saveSession(existing);
+}
+
+/** Flag the global session as due for compaction on its next idle window. */
+export async function markPendingCompact(): Promise<void> {
+  const existing = await loadSession();
+  if (!existing || existing.pendingCompact) return;
+  existing.pendingCompact = true;
+  await saveSession(existing);
+}
+
+/** The global session if it is flagged and has been idle at least `idleMs`. */
+export async function getGlobalSessionDueForCompact(idleMs: number): Promise<GlobalSession | null> {
+  const existing = await loadSession();
+  if (!existing?.pendingCompact) return null;
+  const last = Date.parse(existing.lastUsedAt);
+  if (!Number.isFinite(last) || last > Date.now() - idleMs) return null;
+  return existing;
 }
 
 /** Mark that the compact warning has been sent for the current session. */

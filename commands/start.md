@@ -128,7 +128,7 @@ Start the heartbeat daemon for this project. Follow these steps exactly:
    - **If yes to LINE**: First ask for the credentials and webhook config in free-form text:
      - LINE Channel Access Token (hint: create a Messaging API channel at https://developers.line.biz → Messaging API → Channel access token (long-lived), click "Issue")
      - LINE Channel Secret (hint: same page → Basic settings → Channel secret)
-     - Webhook port (default: 18789 — the local port the webhook HTTP server listens on)
+     - Webhook port (default: 3100 — the local port the webhook HTTP server listens on. Never use 18789: that is the LINE proxy's own external port, and an agent bound to it makes the proxy abort startup with a CRITICAL port conflict.)
      - Webhook path (default: `/line/webhook` — set to agent name for multi-agent setups, e.g. `/line/AgentName`)
      - Set `line.channelAccessToken`, `line.channelSecret`, `line.webhookPort` (as number), and `line.webhookPath` (as string).
      - Group mention policy is `requireMention: true` by default (groups must @mention the bot). Edit `line.requireMention` or per-group `line.groups[<groupId>].requireMention` after setup if needed.
@@ -180,10 +180,10 @@ CRITICAL: Output the ASCII art block below EXACTLY as-is inside a markdown code 
 **Daemon is running! PID: \<PID> | Dir: \<WORKING_DIR>**
 
 ```
-/heartbeat:status  - check status
-/heartbeat:stop    - stop daemon
-/heartbeat:clear   - back up session & restart fresh
-/heartbeat:config  - show config
+/claudeclaw:status  - check status
+/claudeclaw:stop    - stop daemon
+/claudeclaw:clear   - back up session & stop daemon
+/claudeclaw:config  - show config
 ```
 
 **To start chatting on Telegram**
@@ -279,7 +279,7 @@ Defaults: `WEB_HOST=127.0.0.1`, `WEB_PORT=4632` unless changed via settings or `
     "groups": {
       "C0123456789abcdef0123456789abcdef": { "requireMention": false }
     },
-    "webhookPort": 18789,
+    "webhookPort": 3100,
     "webhookPath": "/line/webhook"
   },
   "security": {
@@ -319,7 +319,7 @@ Defaults: `WEB_HOST=127.0.0.1`, `WEB_PORT=4632` unless changed via settings or `
 - `line.pairing.successMessage` — message shown after a successful pairing
 - `line.requireMention` — global default for whether bot requires @mention to respond in groups/rooms (default: `true`)
 - `line.groups` — per-group config overrides, keyed by group/room ID. Each entry can override `requireMention` for that specific group. Group IDs start with `C`, room IDs with `R`.
-- `line.webhookPort` — local port for the webhook HTTP server (default: 18789)
+- `line.webhookPort` — local port for the webhook HTTP server (default: 3100). Do not use 18789 — that is the LINE proxy's own external port
 - `line.webhookPath` — webhook URL path (default: `/line/webhook`). Set to agent name for multi-agent setups (e.g. `/line/AgentName`)
 - `security.level` — one of: `locked`, `strict`, `moderate`, `unrestricted`
 - `security.allowedTools` — extra tools to allow on top of the level (e.g. `["Bash(git:*)"]`)

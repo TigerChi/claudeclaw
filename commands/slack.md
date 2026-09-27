@@ -52,14 +52,14 @@ Add to `.claude/claudeclaw/settings.json`:
 5. Under **Slash Commands**, register `/reset`, `/compact`, `/status`
 6. Install the app to your workspace and copy the Bot Token
 
-## Multi-Session Threads
+## Multi-Session Conversations
 
-Each Slack thread gets its own isolated Claude session:
+Every Slack conversation gets its own isolated Claude session, stored in `.claude/claudeclaw/sessions.json`:
 
-- **Thread reply** → keyed by `slk:<channelId>:<thread_ts>`, runs in a separate Claude session
-- **DM / channel message** → uses the global session
+- **DM** → keyed by `slk:<channelId>`
+- **Channel message / thread reply** → keyed by `slk:<channelId>:<thread_ts>`, where `thread_ts` is the thread's anchor (a new top-level message uses its own `ts`)
 
-This mirrors the Discord thread model, giving each thread independent context and conversation history.
+Nothing on Slack uses the global session (`session.json`) — that one is for heartbeat and cron runs. Deleting `session.json` therefore does not reset a Slack conversation; remove its `slk:...` entry from `sessions.json` instead.
 
 ## Slash Commands
 

@@ -9,7 +9,7 @@ this file is the source of truth for everything else.
 |---|---|
 | Format | JSON |
 | Permissions | `0600` (owner-only) |
-| Created | First `claudeclaw hub start` writes a minimal file if absent |
+| Created | Only when `claudeclaw hub start` is given `--host` or `--port`. A plain `hub start` reads the file if present but never creates it — the defaults below apply until you write it yourself or pass a flag |
 | Reload | None. Edits take effect on next hub start |
 
 Malformed JSON or unrecognised fields are ignored without error; the affected
@@ -44,11 +44,20 @@ edits.
 
 The hub's bind address and TCP port.
 
-- Loopback (`127.0.0.1`, `::1`, `localhost`) bypasses bearer-token auth for
-  `/api/*`. The implicit security boundary is the OS user — anyone with shell
-  access on the host can already control daemons directly.
-- Non-loopback bind enforces bearer-token auth on every `/api/*` call. The
-  token travels in plaintext unless you terminate TLS in front of the hub
+- The auth bypass is keyed on the **peer IP**, not on the bind address: any
+  request whose source address is `127.0.0.1`, `::1`, or `::ffff:127.0.0.1`
+  skips bearer-token auth for `/api/*`, whatever `host` is set to. The implicit
+  security boundary is the OS user — anyone with shell access on the host can
+  already control daemons directly.
+- Binding a non-loopback `host` therefore does **not** make the hub
+  token-only. The hub deliberately opens a *second* listener on
+  `127.0.0.1:<port>` in that case, so local automation keeps working without a
+  token. Both listeners share the same request handler. (The second bind is
+  skipped when the main one already covers loopback — i.e. `127.0.0.1`, `::1`,
+  `localhost`, `0.0.0.0`, `::` — since it would just fail with `EADDRINUSE`;
+  if the bind fails for another reason the hub logs a warning and continues.)
+- Requests arriving over the non-loopback interface do need a bearer token. It
+  travels in plaintext unless you terminate TLS in front of the hub
   (caddy, nginx, traefik). See HUB-GUIDE.md → "Sharing access with teammates".
 - `--host` and `--port` CLI flags on `claudeclaw hub start` override this
   file for the lifetime of the process. If supplied, they are also written

@@ -14,23 +14,29 @@ dashboard, without keeping a terminal open per agent.
   start them again later.
 - **Open per-daemon UI.** One click opens the daemon's own full web UI in a new
   tab, proxied through the hub (no need to expose each daemon's port).
-- **Bearer-token auth.** A 32-byte token, hashed at rest, gates every `/api/*`
-  call. Loopback bind doesn't strictly need it; non-loopback bind requires it.
+- **Bearer-token auth.** A 32-byte token, hashed at rest, gates `/api/*` calls
+  that arrive from a non-loopback address. Requests whose source IP is
+  `127.0.0.1` / `::1` skip the token entirely — and when you bind a
+  non-loopback host, the hub keeps a second listener on `127.0.0.1:<port>`
+  precisely so that local, tokenless access keeps working.
 - **Mobile-friendly dashboard.** Sidebar collapses above the detail panel on
   narrow screens.
 
 ## Quick start
 
 ```bash
-# 1. Generate a Bearer token (printed once — copy now)
-claudeclaw hub init
-
-# 2. Start the hub daemon in the background
+# Start the hub daemon in the background.
+# On the very first run this also generates the Bearer token and prints it
+# once — copy it before the output scrolls away.
 claudeclaw hub start --detach
 # → http://127.0.0.1:4631
 ```
 
 Open `http://127.0.0.1:4631/`, paste the token, you're in.
+
+`claudeclaw hub` with no subcommand does the same thing: it prints status if
+the hub is already running, otherwise starts it detached. `hub init` exists but
+is rarely needed — `start` auto-inits on first run.
 
 ### Auto-login via URL token
 
@@ -56,12 +62,14 @@ The same actions are available two ways — pick whichever suits the moment.
 ### From inside Claude Code (slash command)
 
 ```
+/claudeclaw:hub
 /claudeclaw:hub status
-/claudeclaw:hub init
+/claudeclaw:hub init [--force]
 /claudeclaw:hub start [--detach] [--host <ip>] [--port <n>]
 /claudeclaw:hub stop
 /claudeclaw:hub token --rotate
 /claudeclaw:hub restart <id|path>
+/claudeclaw:hub autostart <enable|disable|status>
 ```
 
 > Slash commands load when Claude Code starts. After installing or upgrading
@@ -83,12 +91,14 @@ claudeclaw hub status
 
 | Subcommand | Effect |
 |---|---|
-| `init` | Generate the Bearer token (printed once — copy it now). |
-| `start [--detach] [--host <ip>] [--port <n>]` | Start the hub daemon. `--detach` logs to `~/.claude/claudeclaw/hub/hub.log`. Default port `4631`. Non-loopback `--host` requires auth. |
+| *(none)* | Print status if the hub is running; otherwise `start --detach`. |
+| `init [--force]` | Manually generate the Bearer token (printed once — copy it now). Rarely needed: `start` auto-inits on first run. `--force` rotates an existing token instead of erroring out. |
+| `start [--detach] [--host <ip>] [--port <n>]` | Start the hub daemon. `--detach` logs to `~/.claude/claudeclaw/hub/hub.log`. Default port `4631`. Auto-inits the token on first run. A non-loopback `--host` prints a plaintext-token warning and starts anyway. |
 | `stop` | Stop the hub daemon. |
 | `status` | Show running state, listening URL, auth status, and registered agent list. |
 | `token --rotate` | Replace the token (revokes the old one). Anyone using the old token must update. |
 | `restart <id\|path>` | Stop + re-spawn one agent daemon. `<id>` is the 12-char ID from `status`; `<path>` is the absolute project path. |
+| `autostart <enable\|disable\|status>` | Manage launch-on-login for the hub (macOS only; defaults to `status` if no argument). |
 
 `--host` and `--port` from `start` are persisted to
 `~/.claude/claudeclaw/hub/config.json`, so subsequent `start` calls reuse them
@@ -155,5 +165,5 @@ per-agent daemon autostart) see [HUB-CONFIG.md](HUB-CONFIG.md).
 | `Discovered agents (0)` | No daemon has registered yet. Start one with `claudeclaw start --detach` in any project. Existing daemons need to be restarted once on a version that includes the registry feature. |
 | `unauthorized` after pasting token | Token mismatch (rotated since you copied? typo?). `hub init --force` or `hub token --rotate` to reset. |
 | "Open per-daemon UI" returns 401 | The dashboard plants a cookie on click — make sure JavaScript is enabled and you didn't open the link from outside the dashboard. |
-| Hub `--host` refused | Non-loopback bind requires `hub init` to have been run. |
+| Hub warns when using `--host` | Expected: a non-loopback bind prints a plaintext-token warning and starts anyway. It is not an error. |
 | `claudeclaw hub start` says "already running" | Stop it first with `hub stop`, or kill the PID listed in `hub.pid` if stale. |

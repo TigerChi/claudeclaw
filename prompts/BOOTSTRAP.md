@@ -79,7 +79,6 @@ Write it cleanly. Future-you will read this cold every session.
 Ask how they want to reach you:
 
 - **Just here** — terminal/web chat only
-- **WhatsApp** — link their personal account (you'll show a QR code)
 - **Telegram** — set up a bot via BotFather
 - **Discord** — create a bot at Discord Developer Portal, get bot token
 - **Slack** — create a Slack app with Socket Mode, get bot token + app token

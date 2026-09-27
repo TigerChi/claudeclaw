@@ -2,7 +2,7 @@ import { writeFile, unlink, mkdir } from "fs/promises";
 import { openSync } from "fs";
 import { join } from "path";
 import { fileURLToPath } from "url";
-import { run, runUserMessage, streamUserMessage, bootstrap, ensureProjectClaudeMd, loadHeartbeatPromptTemplate } from "../runner";
+import { run, runUserMessage, streamUserMessage, bootstrap, ensureProjectClaudeMd, loadHeartbeatPromptTemplate, runPendingCompactions } from "../runner";
 import { writeState, type StateData } from "../statusline";
 import { cronMatches, nextCronMatch } from "../cron";
 import { clearJobSchedule, loadJobs } from "../jobs";
@@ -647,11 +647,25 @@ export async function start(args: string[] = []) {
     }
   }
 
+  /**
+   * Body text for a forwarded run, or null when there is nothing to send.
+   *
+   * A successful run with empty stdout means "stay silent" — either a silence
+   * keyword was squelched in run(), or the agent deliberately produced nothing.
+   * Never turn that into a message: the old `stdout || "(empty)"` fallback sent
+   * the literal string "(empty)" into the user's chat.
+   */
+  function forwardBody(result: { exitCode: number; stdout: string; stderr: string }): string | null {
+    if (result.exitCode !== 0) {
+      return `error (exit ${result.exitCode}): ${result.stderr || "Unknown"}`;
+    }
+    return result.stdout.trim() ? result.stdout : null;
+  }
+
   function forwardToTelegram(label: string, result: { exitCode: number; stdout: string; stderr: string }) {
     if (!telegramSend || currentSettings.telegram.allowedUserIds.length === 0) return;
-    const body = result.exitCode === 0
-      ? (result.stdout || "(empty)")
-      : `error (exit ${result.exitCode}): ${result.stderr || "Unknown"}`;
+    const body = forwardBody(result);
+    if (body === null) return;
     // Label goes at the END so push-notification previews show content first.
     const text = label ? `${body}\n[${label}]` : body;
     for (const userId of currentSettings.telegram.allowedUserIds) {
@@ -663,9 +677,8 @@ export async function start(args: string[] = []) {
 
   function forwardToDiscord(label: string, result: { exitCode: number; stdout: string; stderr: string }) {
     if (!discordSendToUser || currentSettings.discord.allowedUserIds.length === 0) return;
-    const body = result.exitCode === 0
-      ? (result.stdout || "(empty)")
-      : `error (exit ${result.exitCode}): ${result.stderr || "Unknown"}`;
+    const body = forwardBody(result);
+    if (body === null) return;
     // Label goes at the END so push-notification previews show content first.
     const text = label ? `${body}\n[${label}]` : body;
     for (const userId of currentSettings.discord.allowedUserIds) {
@@ -680,9 +693,8 @@ export async function start(args: string[] = []) {
     result: { exitCode: number; stdout: string; stderr: string },
     target?: string,
   ) {
-    const body = result.exitCode === 0
-      ? (result.stdout || "(empty)")
-      : `error (exit ${result.exitCode}): ${result.stderr || "Unknown"}`;
+    const body = forwardBody(result);
+    if (body === null) return;
     // Label goes at the END so push-notification previews show content first.
     const text = label ? `${body}\n[${label}]` : body;
     // Explicit channel/thread target (cron job slackTarget / heartbeat slackTarget):
@@ -705,9 +717,8 @@ export async function start(args: string[] = []) {
     if (!lineSendToUser) return;
     const targets = lineForwardTargets();
     if (targets.length === 0) return;
-    const body = result.exitCode === 0
-      ? (result.stdout || "(empty)")
-      : `error (exit ${result.exitCode}): ${result.stderr || "Unknown"}`;
+    const body = forwardBody(result);
+    if (body === null) return;
     // Label goes at the END so push-notification previews show content first.
     const text = label ? `${body}\n[${label}]` : body;
     for (const userId of targets) {
@@ -831,6 +842,54 @@ export async function start(args: string[] = []) {
     return { cleaned, hadNotify: true };
   }
 
+  /** Sent when a heartbeat run found nothing and the owner asked for proof it ran. */
+  const SILENT_PING_TEXT = "💓 Nothing needed attention.";
+
+  /**
+   * Deliver the "still alive" ping for a silenced heartbeat run.
+   *
+   * Targets are explicit by design: an empty list means NOBODY, not everybody.
+   * (Cron's `channels:` uses the opposite default — empty means broadcast —
+   * so don't carry that intuition over.)
+   *
+   *   "all"                                       every configured platform's allowed users
+   *   "telegram" | "discord" | "slack" | "line"   that one platform's allowed users
+   *   anything else                               a [notify:] target: "<platform>:<id>",
+   *                                               a contacts-book name, or "<name>@<platform>"
+   */
+  async function sendSilentPing(targets: string[]): Promise<void> {
+    const wanted = targets.map((t) => t.trim()).filter(Boolean);
+    if (wanted.length === 0) return;
+    const result = { exitCode: 0, stdout: SILENT_PING_TEXT, stderr: "" };
+
+    if (wanted.some((t) => t.toLowerCase() === "all")) {
+      forwardToTelegram("", result);
+      forwardToDiscord("", result);
+      forwardToSlack("", result, currentSettings.heartbeat.slackTarget);
+      forwardToLine("", result);
+      return;
+    }
+
+    const notifyTargets: string[] = [];
+    for (const t of wanted) {
+      switch (t.toLowerCase()) {
+        case "telegram": forwardToTelegram("", result); break;
+        case "discord": forwardToDiscord("", result); break;
+        case "slack": forwardToSlack("", result, currentSettings.heartbeat.slackTarget); break;
+        case "line": forwardToLine("", result); break;
+        default: notifyTargets.push(t);
+      }
+    }
+    if (notifyTargets.length === 0) return;
+    // Reuse the [notify:] pipeline so resolution, soft-skip of platforms this
+    // agent can't reach, and dead-lettering all behave exactly as they do for
+    // directives the agent writes itself.
+    await dispatchNotifies(
+      "heartbeat",
+      notifyTargets.map((t) => `[notify:${t}]${SILENT_PING_TEXT}[/notify]`).join("\n"),
+    );
+  }
+
   // Let platform reply pipelines (slack/telegram/...) honor [notify:] too —
   // they run inside their own modules and can't reach this closure directly.
   setNotifyDispatcher(dispatchNotifies);
@@ -887,13 +946,20 @@ export async function start(args: string[] = []) {
             // the remainder is not broadcast.
             if (hadNotify) return;
           }
-          const shouldForward = currentSettings.heartbeat.forwardToTelegram || !r.stdout.trim().startsWith("HEARTBEAT_OK");
-          if (shouldForward) {
-            forwardToTelegram("", r);
-            forwardToDiscord("", r);
-            forwardToSlack("", r, currentSettings.heartbeat.slackTarget);
-            forwardToLine("", r);
+          // A silenced run means the check found nothing worth saying. Most
+          // owners want nothing at all; `forwardWhenSilent` is for the ones who
+          // want proof it ran, and `silentTargets` says who gets it (empty =
+          // nobody). They get a readable line rather than the raw keyword,
+          // which run() has already stripped.
+          if (r.silenced) {
+            if (!currentSettings.heartbeat.forwardWhenSilent) return;
+            await sendSilentPing(currentSettings.heartbeat.silentTargets);
+            return;
           }
+          forwardToTelegram("", r);
+          forwardToDiscord("", r);
+          forwardToSlack("", r, currentSettings.heartbeat.slackTarget);
+          forwardToLine("", r);
         });
       nextHeartbeatAt = nextAllowedHeartbeatAt(
         currentSettings.heartbeat,
@@ -1176,6 +1242,12 @@ export async function start(args: string[] = []) {
           });
       }
     }
+    // Sessions that hit the turn threshold compact here, once their
+    // conversation has been quiet long enough — never mid-discussion.
+    void runPendingCompactions().catch((err) =>
+      console.error(`[${ts()}] Idle compact sweep failed:`, err)
+    );
+
     updateState();
   }, 60_000);
 }

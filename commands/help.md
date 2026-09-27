@@ -7,18 +7,22 @@ Display this help information to the user:
 **ClaudeClaw** — daemon mode plus one-shot prompt/trigger runs.
 
 **Commands:**
-- `/heartbeat:start` — Initialize config and start the daemon
-- `/heartbeat:stop` — Stop the running daemon
-- `/heartbeat:clear` — Back up the current session and restart fresh
-- `/heartbeat:status` — Show daemon status, countdowns, and config
-- `/heartbeat:config` — View or modify heartbeat settings (interval, prompt, telegram)
-- `/heartbeat:jobs` — Create, list, edit, or delete cron jobs
-- `/heartbeat:logs` — Show recent execution logs (accepts count or job name filter)
-- `/heartbeat:telegram` — Show Telegram bot status and sessions (use `clear` to reset sessions)
-- `/heartbeat:discord` — Show Discord bot status and sessions
-- `/heartbeat:slack` — Show Slack bot status and sessions
-- `/heartbeat:line` — Show LINE bot status and sessions
-- `/heartbeat:help` — Show this help message
+- `/claudeclaw:start` — Initialize config and start the daemon
+- `/claudeclaw:stop` — Stop the running daemon
+- `/claudeclaw:restart` — Stop the daemon and start it again
+- `/claudeclaw:clear` — Back up the current session and stop the daemon (next start creates a fresh session)
+- `/claudeclaw:status` — Show daemon status, countdowns, and config
+- `/claudeclaw:config` — View or modify heartbeat settings (interval, prompt, telegram)
+- `/claudeclaw:jobs` — Create, list, edit, or delete cron jobs
+- `/claudeclaw:logs` — Show recent execution logs (accepts count or job name filter)
+- `/claudeclaw:telegram` — Show Telegram bot status and sessions (use `clear` to reset sessions)
+- `/claudeclaw:discord` — Show Discord bot status and sessions
+- `/claudeclaw:slack` — Show Slack bot status and sessions
+- `/claudeclaw:line` — Show LINE bot status and sessions
+- `/claudeclaw:contacts` — Manage the shared notify contacts book
+- `/claudeclaw:hub` — Manage the ClaudeClaw Hub (multi-agent dashboard and reverse proxy)
+- `/claudeclaw:proxy` — Manage the LINE webhook proxy that routes multiple agents through one port
+- `/claudeclaw:help` — Show this help message
 
 **Start command options (CLI):**
 - `bun run src/index.ts start` — normal daemon mode
@@ -54,7 +58,7 @@ Your prompt here. Claude will run this at the scheduled time.
 
 Schedule uses standard cron syntax: `minute hour day-of-month month day-of-week`
 
-**Note:** Bun is required to run the daemon. It will be auto-installed on first `/heartbeat:start` if missing.
+**Note:** Bun is required to run the daemon. It will be auto-installed on first `/claudeclaw:start` if missing.
 
 **Telegram:**
 - Configure in `.claude/claudeclaw/settings.json` under `telegram`

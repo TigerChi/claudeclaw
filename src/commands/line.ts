@@ -1,10 +1,18 @@
 import { ensureProjectClaudeMd, runUserMessage, cancelThread } from "../runner";
 import { isCancelCommand, CANCEL_CONFIRM_MESSAGE, CANCEL_NOTHING_MESSAGE } from "../cancel";
 import { addLineAllowedUser, getSettings, loadSettings } from "../config";
-import { recordSeen, harvestAgentName } from "../contacts";
+import { recordSeen, harvestAgentName, recordDeadLetter } from "../contacts";
+import {
+  appendChatLog,
+  conversationDir,
+  conversationKey,
+  countEntries,
+  formatEntries,
+  readRecentEntries,
+} from "../chatlog";
 import { peekThreadSession } from "../sessionManager";
 import { transcribeAudioToText } from "../whisper";
-import { mkdir } from "node:fs/promises";
+import { mkdir, rename } from "node:fs/promises";
 import { extname, join } from "node:path";
 import { existsSync } from "node:fs";
 import { createHmac } from "node:crypto";
@@ -158,6 +166,7 @@ export function getLineForwardTargets(): string[] {
   if (config.allowedUserIds.length > 0) return config.allowedUserIds;
   return [...knownUsers];
 }
+
 
 // --- Debug ---
 
@@ -425,6 +434,8 @@ async function sendText(
 
 // --- Media download ---
 
+const DOWNLOAD_MAX_RETRIES = 3;
+
 async function downloadLineContent(
   messageId: string,
   type: "image" | "video" | "audio" | "file",
@@ -434,35 +445,96 @@ async function downloadLineContent(
   const dir = join(process.cwd(), ".claude", "claudeclaw", "inbox", "line");
   await mkdir(dir, { recursive: true });
 
-  const res = await fetch(`${LINE_DATA_API}/bot/message/${messageId}/content`, {
-    headers: { Authorization: `Bearer ${config.channelAccessToken}` },
-  });
-  if (!res.ok) {
-    throw new Error(`Content download failed: HTTP ${res.status}`);
+  let lastError = "unknown";
+  for (let attempt = 1; attempt <= DOWNLOAD_MAX_RETRIES; attempt++) {
+    try {
+      const res = await fetch(`${LINE_DATA_API}/bot/message/${messageId}/content`, {
+        headers: { Authorization: `Bearer ${config.channelAccessToken}` },
+      });
+      if (!res.ok) {
+        lastError = `HTTP ${res.status}`;
+        // 4xx (bar 429) won't fix on retry — content expired or bad id.
+        if (res.status >= 400 && res.status < 500 && res.status !== 429) break;
+        if (attempt < DOWNLOAD_MAX_RETRIES) await Bun.sleep(attempt * 500);
+        continue;
+      }
+
+      const contentType = res.headers.get("content-type") ?? "";
+      const bytes = new Uint8Array(await res.arrayBuffer());
+      // LINE has been seen to answer 200 with an empty body (the same bad
+      // response that also drops Content-Type). Treat it as a failure instead
+      // of writing a 0-byte file and reporting success.
+      if (bytes.length === 0) {
+        lastError = "empty body (HTTP 200, 0 bytes)";
+        if (attempt < DOWNLOAD_MAX_RETRIES) await Bun.sleep(attempt * 500);
+        continue;
+      }
+
+      // Determine extension from content-type or filename
+      let ext = "";
+      if (fileName) {
+        ext = extname(fileName);
+      } else if (contentType.includes("jpeg") || contentType.includes("jpg")) {
+        ext = ".jpg";
+      } else if (contentType.includes("png")) {
+        ext = ".png";
+      } else if (contentType.includes("gif")) {
+        ext = ".gif";
+      } else if (contentType.includes("mp4")) {
+        ext = type === "audio" ? ".m4a" : ".mp4";
+      } else if (contentType.includes("audio")) {
+        ext = ".m4a";
+      }
+
+      // Write to a temp file, then rename into place — a reader that sees the
+      // final path always sees the full bytes, never a half-written file.
+      const localPath = join(dir, `${messageId}${ext}`);
+      const tmpPath = `${localPath}.part`;
+      await Bun.write(tmpPath, bytes);
+      await rename(tmpPath, localPath);
+      debugLog(`Downloaded ${type}: ${localPath} (${bytes.length} bytes)`);
+      return localPath;
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : String(err);
+      if (attempt < DOWNLOAD_MAX_RETRIES) await Bun.sleep(attempt * 500);
+    }
   }
 
-  // Determine extension from content-type or filename
-  const contentType = res.headers.get("content-type") ?? "";
-  let ext = "";
-  if (fileName) {
-    ext = extname(fileName);
-  } else if (contentType.includes("jpeg") || contentType.includes("jpg")) {
-    ext = ".jpg";
-  } else if (contentType.includes("png")) {
-    ext = ".png";
-  } else if (contentType.includes("gif")) {
-    ext = ".gif";
-  } else if (contentType.includes("mp4")) {
-    ext = type === "audio" ? ".m4a" : ".mp4";
-  } else if (contentType.includes("audio")) {
-    ext = ".m4a";
-  }
+  // Give up: record a dead letter so the gap is auditable, and return null so
+  // the caller omits mediaPath from the chat log rather than recording a path
+  // to a file that was never written.
+  console.error(`[Line] Media download failed for ${messageId} (${type}): ${lastError}`);
+  await recordDeadLetter({
+    at: new Date().toISOString(),
+    source: "line-media",
+    target: `line:${type}:${messageId}`,
+    error: lastError,
+    preview: fileName ?? type,
+  }).catch(() => {});
+  return null;
+}
 
-  const localPath = join(dir, `${messageId}${ext}`);
-  const bytes = new Uint8Array(await res.arrayBuffer());
-  await Bun.write(localPath, bytes);
-  debugLog(`Downloaded ${type}: ${localPath} (${bytes.length} bytes)`);
-  return localPath;
+// Attachments are fetched twice per message once the chat log is on: once to
+// archive it, once to hand the path to the agent. LINE content is single-copy
+// (the local file is keyed by message id, so the second write is identical) —
+// memoizing keeps it to one round trip instead.
+const downloadedMedia = new Map<string, string | null>();
+const DOWNLOAD_CACHE_LIMIT = 200;
+
+async function downloadLineContentOnce(
+  messageId: string,
+  type: "image" | "video" | "audio" | "file",
+  fileName?: string,
+): Promise<string | null> {
+  if (downloadedMedia.has(messageId)) return downloadedMedia.get(messageId)!;
+  const path = await downloadLineContent(messageId, type, fileName);
+  if (downloadedMedia.size >= DOWNLOAD_CACHE_LIMIT) {
+    // Oldest-first eviction; a miss only costs a re-download, never correctness.
+    const oldest = downloadedMedia.keys().next().value;
+    if (oldest !== undefined) downloadedMedia.delete(oldest);
+  }
+  downloadedMedia.set(messageId, path);
+  return path;
 }
 
 // --- Input sanitization ---
@@ -489,11 +561,154 @@ function getChatId(source: LineMessageEvent["source"]): string {
 
 // --- Mention detection for groups ---
 
+// The bot's display name can contain regex metacharacters (e.g. a "." or "+"),
+// so escape it before splicing into a `new RegExp`.
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 function isBotMentioned(text: string): boolean {
   if (!botDisplayName) return false;
   // LINE doesn't have a standardized @mention format like Slack.
   // Check if the message contains the bot's display name.
   return text.includes(`@${botDisplayName}`);
+}
+
+// --- Passive listen buffer ---
+//
+// Groups with `passiveListen` keep text from unauthorized (unpaired) members
+// here instead of discarding it. Nothing in this buffer wakes the agent — it is
+// drained into the prompt the next time an authorized user speaks, so the agent
+// sees the surrounding conversation without being driven by it.
+//
+// Bounded per chat and dropped oldest-first: a chatty group must never grow the
+// prompt without limit, and stale context is worth less than recent context.
+const PASSIVE_BUFFER_LIMIT = 40;
+const passiveBuffers = new Map<string, string[]>();
+
+function recordPassiveMessage(chatId: string, speaker: string, text: string): void {
+  const trimmed = text.trim();
+  if (!trimmed) return;
+  const buffer = passiveBuffers.get(chatId) ?? [];
+  buffer.push(`${speaker}: ${trimmed}`);
+  if (buffer.length > PASSIVE_BUFFER_LIMIT) buffer.splice(0, buffer.length - PASSIVE_BUFFER_LIMIT);
+  passiveBuffers.set(chatId, buffer);
+}
+
+/** Called on the unauthorized-user paths. If this is a passiveListen group and
+ *  the message is text, keep it as context. Media is deliberately ignored —
+ *  downloading files for someone we will never answer is not worth the cost. */
+async function capturePassive(event: LineMessageEvent, userId: string, isGroup: boolean): Promise<void> {
+  if (!isGroup || event.message.type !== "text") return;
+  const chatId = getChatId(event.source);
+  const lineCfg = getSettings().line;
+  if (!(lineCfg.groups[chatId]?.passiveListen ?? lineCfg.defaultPassiveListen)) return;
+  const speaker = await getDisplayName(userId, event.source);
+  recordPassiveMessage(chatId, `${speaker}(${userId})`, event.message.text ?? "");
+  debugLog(`Passive listen captured from ${userId} in ${chatId}`);
+}
+
+// --- Durable chat log ---
+//
+// Runs before the authorization and mention checks so the transcript is the
+// whole conversation, not just the parts the agent was woken for. A log with
+// holes is worse than no log: the agent reading it back would silently miss
+// whatever happened while it was not addressed.
+
+/** One-line description of a message. Attachments are archived separately (see
+ *  `logInbound`); stickers are describable but not downloadable, so their
+ *  keywords and ids are the only record there will ever be of what was sent. */
+function describeMessage(message: LineMessageEvent["message"]): string {
+  switch (message.type) {
+    case "text":
+      return message.text ?? "";
+    case "sticker": {
+      const keywords = message.keywords ?? [];
+      const ids = `package ${message.packageId ?? "?"}/${message.stickerId ?? "?"}`;
+      return keywords.length > 0
+        ? `[sticker: ${keywords.join(", ")} — ${ids}]`
+        : `[sticker: ${ids}]`;
+    }
+    case "location":
+      return `[location: ${message.title ?? ""} ${message.address ?? ""} (${message.latitude}, ${message.longitude})]`;
+    case "file":
+      return `[file: ${message.fileName ?? "unknown"}]`;
+    default:
+      return `[${message.type}]`;
+  }
+}
+
+const DOWNLOADABLE = new Set(["image", "video", "audio", "file"]);
+
+async function logInbound(
+  event: LineMessageEvent,
+  userId: string,
+  isGroup: boolean,
+  unpaired: boolean,
+): Promise<void> {
+  const config = getSettings().line;
+  if (!config.chatLog.enabled) return;
+  const kind = isGroup ? (event.source.groupId ? "group" : "room") : "user";
+  const chatId = getChatId(event.source);
+  const name = await getDisplayName(userId, event.source);
+  const conversationName = isGroup ? await getGroupName(chatId) : name;
+
+  // Never persist the pairing code: it is the shared secret that grants access,
+  // and a DM that consists of it is a login, not conversation content.
+  const described = describeMessage(event.message);
+  const text = config.pairing.code && described.trim() === config.pairing.code
+    ? "[pairing code]"
+    : described;
+
+  // Archive attachments as well as the line describing them. LINE keeps message
+  // content for a limited window only, so a path recorded without the bytes
+  // would rot into a dead reference.
+  let mediaPath: string | null = null;
+  if (DOWNLOADABLE.has(event.message.type)) {
+    try {
+      mediaPath = await downloadLineContentOnce(
+        event.message.id,
+        event.message.type as "image" | "video" | "audio" | "file",
+        event.message.fileName,
+      );
+    } catch (err) {
+      console.error(`[ChatLog] Failed to archive ${event.message.type} ${event.message.id}: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+
+  await appendChatLog(conversationKey(kind, chatId), kind, conversationName, {
+    ...(mediaPath ? { mediaPath } : {}),
+    ts: new Date(event.timestamp).toISOString(),
+    id: event.message.id,
+    role: "user",
+    userId,
+    name,
+    kind: event.message.type,
+    text,
+    ...(unpaired ? { unpaired: true } : {}),
+  });
+}
+
+async function logOutbound(source: LineMessageEvent["source"], text: string): Promise<void> {
+  const config = getSettings().line;
+  if (!config.chatLog.enabled) return;
+  const isGroup = source.type === "group" || source.type === "room";
+  const kind = isGroup ? (source.groupId ? "group" : "room") : "user";
+  await appendChatLog(conversationKey(kind, getChatId(source)), kind, undefined, {
+    ts: new Date().toISOString(),
+    role: "bot",
+    kind: "text",
+    text,
+  });
+}
+
+/** Take everything buffered for this chat and clear it, so the same lines are
+ *  never replayed into a second prompt. */
+function drainPassiveMessages(chatId: string): string[] {
+  const buffer = passiveBuffers.get(chatId);
+  if (!buffer || buffer.length === 0) return [];
+  passiveBuffers.delete(chatId);
+  return buffer;
 }
 
 // --- Message handler ---
@@ -526,6 +741,10 @@ async function handleMessageEvent(event: LineMessageEvent): Promise<void> {
   const hasPairing = config.pairing.enabled && Boolean(config.pairing.code);
   const onAllowlist = config.allowedUserIds.includes(userId);
 
+  // Record first, gate second — see the chat log section above for why the
+  // transcript has to cover messages the agent never acts on.
+  await logInbound(event, userId, isGroup, !onAllowlist);
+
   if (hasPairing && !onAllowlist) {
     if (!isGroup && event.message.type === "text") {
       const text = (event.message.text ?? "").trim();
@@ -544,11 +763,13 @@ async function handleMessageEvent(event: LineMessageEvent): Promise<void> {
       }
       return;
     }
+    await capturePassive(event, userId, isGroup);
     debugLog(`Unauthorized user (no pairing channel for groups/non-text): ${userId}`);
     return;
   }
 
   if (config.allowedUserIds.length > 0 && !onAllowlist) {
+    await capturePassive(event, userId, isGroup);
     debugLog(`Unauthorized user: ${userId}`);
     return;
   }
@@ -568,12 +789,26 @@ async function handleMessageEvent(event: LineMessageEvent): Promise<void> {
     }
   })();
 
-  // In groups, check requireMention policy (per-group override falls back to global default)
-  if (isGroup && event.message.type === "text") {
+  // In groups, check requireMention policy (per-group override falls back to global default).
+  //
+  // Applies to every message type, not just text. A LINE mention lives in a
+  // text message's body, so an image/file/sticker can never carry one — gating
+  // only text meant media woke the agent unconditionally in a mention-only
+  // group, with no instruction attached to act on. Nothing is lost by skipping:
+  // the chat log (written before the auth gate above) already archived the
+  // attachment, so a follow-up mention can refer back to it.
+  if (isGroup) {
     const groupOverride = config.groups[chatId]?.requireMention;
     const requireMention = groupOverride !== undefined ? groupOverride : config.requireMention;
-    if (requireMention && !isBotMentioned(event.message.text ?? "")) {
-      debugLog(`Skip group message (mention required): ${chatId}`);
+    const isText = event.message.type === "text";
+    if (requireMention && !(isText && isBotMentioned(event.message.text ?? ""))) {
+      // Buffer text too when passive listening — otherwise the context the agent
+      // eventually sees would have holes wherever a paired member spoke without
+      // mentioning the bot. (Media is not buffered: the chat log covers it.)
+      if (isText && (config.groups[chatId]?.passiveListen ?? config.defaultPassiveListen)) {
+        recordPassiveMessage(chatId, `${await getDisplayName(userId, event.source)}(${userId})`, event.message.text ?? "");
+      }
+      debugLog(`Skip group ${event.message.type} message (mention required): ${chatId}`);
       return;
     }
   }
@@ -593,14 +828,26 @@ async function handleMessageEvent(event: LineMessageEvent): Promise<void> {
       messageText = event.message.text ?? "";
       // Strip bot name from mention
       if (botDisplayName) {
-        messageText = messageText.replace(new RegExp(`@${botDisplayName}`, "g"), "").trim();
+        const rawText = messageText;
+        messageText = messageText
+          .replace(new RegExp(`@${escapeRegExp(botDisplayName)}`, "g"), "")
+          .trim();
+        // A bare "@Bot" (mention with no other words) strips to empty. In a
+        // group that is still a summons — keep it awake with a placeholder so
+        // the empty-message guard below does not drop it, and so downstream
+        // `if (messageText)` still injects a Message line. The preceding
+        // chat-log window carries whatever the user said just before.
+        if (!messageText && isGroup && isBotMentioned(rawText)) {
+          messageText =
+            "(mentioned you with no other text — see the preceding conversation for what they're referring to)";
+        }
       }
       break;
     }
 
     case "image": {
       try {
-        imagePath = await downloadLineContent(event.message.id, "image");
+        imagePath = await downloadLineContentOnce(event.message.id, "image");
       } catch (err) {
         console.error(`[Line] Failed to download image: ${err instanceof Error ? err.message : err}`);
       }
@@ -609,7 +856,7 @@ async function handleMessageEvent(event: LineMessageEvent): Promise<void> {
 
     case "video": {
       try {
-        filePath = await downloadLineContent(event.message.id, "video");
+        filePath = await downloadLineContentOnce(event.message.id, "video");
         messageText = "(user sent a video)";
       } catch (err) {
         console.error(`[Line] Failed to download video: ${err instanceof Error ? err.message : err}`);
@@ -619,7 +866,7 @@ async function handleMessageEvent(event: LineMessageEvent): Promise<void> {
 
     case "audio": {
       try {
-        voicePath = await downloadLineContent(event.message.id, "audio");
+        voicePath = await downloadLineContentOnce(event.message.id, "audio");
       } catch (err) {
         console.error(`[Line] Failed to download audio: ${err instanceof Error ? err.message : err}`);
       }
@@ -643,7 +890,7 @@ async function handleMessageEvent(event: LineMessageEvent): Promise<void> {
 
     case "file": {
       try {
-        filePath = await downloadLineContent(
+        filePath = await downloadLineContentOnce(
           event.message.id,
           "file",
           event.message.fileName,
@@ -698,6 +945,65 @@ async function handleMessageEvent(event: LineMessageEvent): Promise<void> {
     const promptParts = [`[LINE from ${displayName}(${userId}) in ${channelType} ${chatId}]`];
     if (lineDirectives) promptParts.push(lineDirectives);
 
+    // Restricted-group speech discipline (e.g. a channel with outside parties).
+    // Governs what to say, not whether to wake — see LineGroupConfig.speechPolicy.
+    // A per-group setting wins; otherwise the agent-wide default applies, so an
+    // agent can be safe-by-default (defaultSpeechPolicy "restricted") and open
+    // up only the groups explicitly marked "normal".
+    const speechPolicy = isGroup
+      ? (config.groups[chatId]?.speechPolicy ?? config.defaultSpeechPolicy)
+      : "normal";
+    if (speechPolicy === "restricted") {
+      promptParts.push(
+        [
+          "RESTRICTED GROUP — outsiders are present in this chat.",
+          "- Reply ONLY to the message that directly addressed you, and keep it as short as possible.",
+          "- Do NOT volunteer information, comment on others' messages, or make small talk.",
+          "- Do NOT report task or system status here (e.g. \"created a task\", \"updated Notion\").",
+          "  If you did such work, confirm it privately to the admin instead — never in this group.",
+          "- When in doubt, stay silent. Recording still happens in the background regardless.",
+        ].join("\n"),
+      );
+    }
+
+    // Preceding conversation. Background only: it has already happened, so do
+    // not reply to it or act on it directly.
+    //
+    // With the chat log on, inject a fixed window and point at the file for the
+    // rest — the agent decides whether the context it was given is enough and
+    // reads further back only when it is not, so a long history costs nothing
+    // until it is actually needed. Without it, fall back to the RAM buffer.
+    const chatLog = config.chatLog;
+    if (chatLog.enabled) {
+      const key = conversationKey(isGroup ? (event.source.groupId ? "group" : "room") : "user", chatId);
+      // +1 and filter: this message was logged before the gate above, so it is
+      // already the newest entry and must not be replayed as prior context.
+      const recent = (await readRecentEntries(key, chatLog.injectRecent + 1))
+        .filter((e) => e.id !== event.message.id);
+      if (recent.length > 0) {
+        const total = await countEntries(key);
+        const older = Math.max(0, total - recent.length - 1);
+        promptParts.push(
+          [
+            `--- Preceding conversation (${recent.length} most recent, context only — do not reply to these) ---`,
+            ...formatEntries(recent).map((line) => sanitizeUserInput(line)),
+            `--- End of preceding conversation ---`,
+            `${older} older message(s) are on disk in ${conversationDir(key)} (monthly .jsonl files, oldest first within each).`,
+            `Read them yourself if the window above is not enough to understand what is being referred to.`,
+          ].join("\n"),
+        );
+      }
+    } else {
+      const overheard = drainPassiveMessages(chatId);
+      if (overheard.length > 0) {
+        promptParts.push(
+          `--- Overheard in this group since you last spoke (${overheard.length} message(s), context only — do not reply to these) ---\n${overheard
+            .map((line) => sanitizeUserInput(line))
+            .join("\n")}\n--- End of overheard messages ---`,
+        );
+      }
+    }
+
     if (messageText) {
       promptParts.push(`Message: ${sanitizeUserInput(messageText)}`);
     }
@@ -733,6 +1039,9 @@ async function handleMessageEvent(event: LineMessageEvent): Promise<void> {
       );
     } else if (result.stdout) {
       await sendText(chatId, result.stdout, event.replyToken);
+      // Log what we said too, so reading the transcript back shows a dialogue
+      // rather than a one-sided list of what everyone else said.
+      await logOutbound(event.source, result.stdout);
     }
   } catch (err) {
     stopLoadingAnimation(chatId);

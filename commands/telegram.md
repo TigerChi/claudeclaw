@@ -10,10 +10,12 @@ Show the Telegram bot integration status. Check the following:
    - Session UUID (first 8 chars)
    - Created at
    - Last used at
-   - Note: This session is shared across heartbeat, cron jobs, and Telegram messages.
+   - Note: This session is used by heartbeat and cron jobs. **Telegram messages do not use it** — every chat gets its own session keyed `tg:<chatId>` (plus `:<threadId>` for forum topics) in `.claude/claudeclaw/sessions.json`.
 
-3. **If $ARGUMENTS contains "clear"**: Delete `.claude/claudeclaw/session.json` to reset the global session. Confirm to the user. The next run from any source (heartbeat, cron, or Telegram) will create a fresh session.
+3. **Per-conversation Sessions**: Read `.claude/claudeclaw/sessions.json` and list the entries whose key starts with `tg:` — key, session UUID (first 8 chars), turn count, last used at.
 
-4. **Running**: Check if the daemon is running by reading `.claude/claudeclaw/daemon.pid`. The Telegram bot runs in-process with the daemon when a token is configured.
+4. **If $ARGUMENTS contains "clear"**: Deleting `.claude/claudeclaw/session.json` only resets the global (heartbeat/cron) session — it does **not** reset any Telegram chat. Neither does the in-chat `/reset` command, which also targets the global session. To reset a chat, remove its `tg:...` entry from `.claude/claudeclaw/sessions.json`.
+
+5. **Running**: Check if the daemon is running by reading `.claude/claudeclaw/daemon.pid`. The Telegram bot runs in-process with the daemon when a token is configured.
 
 Format the output clearly for the user.

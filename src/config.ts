@@ -54,7 +54,8 @@ const DEFAULT_SETTINGS: Settings = {
     interval: 15,
     prompt: "",
     excludeWindows: [],
-    forwardToTelegram: true,
+    forwardWhenSilent: false,
+    silentTargets: [],
   },
   telegram: {
     token: "",
@@ -79,7 +80,10 @@ const DEFAULT_SETTINGS: Settings = {
       successMessage: "✅ 配對成功，歡迎加入！現在可以開始對話了。",
     },
     requireMention: true,
+    defaultSpeechPolicy: "normal",
+    defaultPassiveListen: false,
     groups: {},
+    chatLog: { enabled: false, injectRecent: 15 },
     webhookPort: 3100,
     webhookPath: "/webhook",
   },
@@ -89,6 +93,8 @@ const DEFAULT_SETTINGS: Settings = {
   whisper: { engine: "auto", model: "large-v3-turbo", language: "" },
   agentBus: { enabled: false, name: "" },
   notify: { mode: "explicit" },
+  autoCompactTurns: 0,
+  autoCompactIdleMs: 5 * 60 * 1000,
 };
 
 export interface HeartbeatExcludeWindow {
@@ -102,7 +108,26 @@ export interface HeartbeatConfig {
   interval: number;
   prompt: string;
   excludeWindows: HeartbeatExcludeWindow[];
-  forwardToTelegram: boolean;
+  /**
+   * Send a "nothing needed attention" ping when a heartbeat run comes back
+   * silenced. Off by default — a silent check is meant to be silent.
+   * (Was `forwardToTelegram`, back when Telegram was the only platform and the
+   * name still described what it did. Old settings files are read for
+   * backward compatibility.)
+   */
+  forwardWhenSilent: boolean;
+  /**
+   * Who receives that ping. Explicit by design: an empty list means NOBODY,
+   * even when `forwardWhenSilent` is true — a liveness ping is opt-in per
+   * recipient. (Cron's `channels:` uses the opposite default, where empty
+   * means broadcast; do not carry that intuition over.)
+   *
+   *   "all"                                  every configured platform's allowed users
+   *   "telegram" | "discord" | "slack" | "line"   that one platform's allowed users
+   *   anything else                          a [notify:] target — "<platform>:<id>",
+   *                                          a contacts-book name, or "<name>@<platform>"
+   */
+  silentTargets: string[];
   /**
    * Optional Slack target for heartbeat output: "<channelId>" or
    * "<channelId>:<threadTs>". When set, Slack heartbeats post to this
@@ -157,6 +182,23 @@ export interface SlackConfig {
 export interface LineGroupConfig {
   /** Override the global requireMention setting for this specific group. */
   requireMention?: boolean;
+  /** When true, text from users who are NOT on the allowlist is buffered as
+   *  background context instead of being dropped. The agent is never woken by
+   *  these messages; the buffer is drained into the next authorized message's
+   *  prompt. Lets the agent follow a whole group conversation while still only
+   *  answering to paired users. Default false (unpaired text is dropped). */
+  passiveListen?: boolean;
+  /** Speech discipline for this group.
+   *    "normal"     — default; behaves like any group.
+   *    "restricted" — for groups with outsiders present (e.g. a bank/vendor
+   *                   channel). Injects a directive telling the agent to reply
+   *                   only to the message that addressed it, as briefly as
+   *                   possible, and never to volunteer, comment, or report
+   *                   task/system status in-channel.
+   *  This governs what the agent *says* once awake; whether it wakes at all is
+   *  still `requireMention`. Enforced by prompt, not routing (LINE agents only
+   *  ever speak in response to a wake, so there is nothing to gate mechanically). */
+  speechPolicy?: "normal" | "restricted";
 }
 
 /** Pairing configuration: lets unknown DM users self-enroll into the allowlist
@@ -172,6 +214,15 @@ export interface LinePairingConfig {
   successMessage: string;
 }
 
+/** Durable chat transcript settings. See src/chatlog.ts for the on-disk layout. */
+export interface ChatLogConfig {
+  /** Off by default — enabling it starts persisting conversation content. */
+  enabled: boolean;
+  /** Entries injected into each prompt. Everything older stays on disk for the
+   *  agent to read on demand, so this bounds token cost, not available context. */
+  injectRecent: number;
+}
+
 export interface LineConfig {
   /** LINE channel access token (from LINE Developers console) */
   channelAccessToken: string;
@@ -185,8 +236,24 @@ export interface LineConfig {
   /** Whether the bot requires @mention to respond in groups/rooms (default: true).
    *  Can be overridden per-group via the `groups` map. */
   requireMention: boolean;
+  /** Default speech policy for groups with no explicit `speechPolicy` entry.
+   *  "restricted" makes every group safe-by-default — treat as if outsiders are
+   *  present until an admin explicitly marks a group `"normal"` (e.g. the
+   *  internal task group). Defaults to "normal" to preserve existing agents. */
+  defaultSpeechPolicy: "normal" | "restricted";
+  /** Default passiveListen for groups with no explicit `passiveListen` entry.
+   *  When true, every group buffers unpaired members' text as context instead of
+   *  dropping it, and never wakes on it — safe-by-default for agents that sit in
+   *  channels with outsiders. Defaults to false to preserve existing agents. */
+  defaultPassiveListen: boolean;
   /** Per-group config overrides, keyed by group/room ID (group IDs start with "C", room IDs with "R"). */
   groups: Record<string, LineGroupConfig>;
+  /** Durable transcript on disk. When enabled, every inbound message (paired or
+   *  not, mentioned or not) plus the agent's own replies are appended to
+   *  `.claude/claudeclaw/chatlog/`, and the prompt gets the most recent
+   *  `injectRecent` entries plus the path to read further back. Supersedes the
+   *  in-memory passive-listen buffer for the conversations it covers. */
+  chatLog: ChatLogConfig;
   /** Local port for the webhook HTTP server (default: 3100) */
   webhookPort: number;
   /** Webhook URL path (default: "/webhook"). Set to agent name for multi-agent setups, e.g. "/beo" */
@@ -223,6 +290,22 @@ export interface Settings {
   whisper: WhisperConfig;
   agentBus: AgentBusConfig;
   notify: NotifyConfig;
+  /** Per-run timeout in ms. 0 disables it. Omitted → 15 minutes. */
+  sessionTimeoutMs?: number;
+  /** Run `/compact` automatically once a session reaches this many turns, then
+   *  reset the counter so it repeats every interval. 0 disables it.
+   *
+   *  Without this, a session only compacts when its context nears the model
+   *  limit — correct for avoiding overflow, but it means a long-running chat
+   *  gets steadily slower long before that point, since every turn re-reads the
+   *  whole accumulated history. A turn threshold keeps the working context
+   *  bounded by conversation length instead of by the context ceiling. */
+  autoCompactTurns: number;
+  /** How long a conversation must be quiet before a scheduled compact runs.
+   *  Guards against compacting mid-discussion: in back-and-forth chat every
+   *  turn ends with an empty queue, so only wall-clock silence distinguishes
+   *  "done talking" from "still typing". Default 5 minutes. */
+  autoCompactIdleMs: number;
 }
 
 export interface AgenticMode {
@@ -397,7 +480,8 @@ function parseSettings(raw: Record<string, any>): Settings {
       interval: raw.heartbeat?.interval ?? 15,
       prompt: raw.heartbeat?.prompt ?? "",
       excludeWindows: parseExcludeWindows(raw.heartbeat?.excludeWindows),
-      forwardToTelegram: raw.heartbeat?.forwardToTelegram ?? false,
+      forwardWhenSilent: raw.heartbeat?.forwardWhenSilent ?? raw.heartbeat?.forwardToTelegram ?? false,
+      silentTargets: parseSilentTargets(raw.heartbeat?.silentTargets),
       slackTarget: raw.heartbeat?.slackTarget || undefined,
     },
     telegram: {
@@ -464,6 +548,8 @@ function parseSettings(raw: Record<string, any>): Settings {
           : "✅ 配對成功，歡迎加入！現在可以開始對話了。",
       },
       requireMention: typeof raw.line?.requireMention === "boolean" ? raw.line.requireMention : true,
+      defaultSpeechPolicy: raw.line?.defaultSpeechPolicy === "restricted" ? "restricted" : "normal",
+      defaultPassiveListen: typeof raw.line?.defaultPassiveListen === "boolean" ? raw.line.defaultPassiveListen : false,
       groups: (() => {
         const result: Record<string, LineGroupConfig> = {};
         if (raw.line?.groups && typeof raw.line.groups === "object" && !Array.isArray(raw.line.groups)) {
@@ -472,12 +558,23 @@ function parseSettings(raw: Record<string, any>): Settings {
               const c = cfg as Record<string, unknown>;
               result[groupId] = {
                 requireMention: typeof c.requireMention === "boolean" ? c.requireMention : undefined,
+                passiveListen: typeof c.passiveListen === "boolean" ? c.passiveListen : undefined,
+                speechPolicy:
+                  c.speechPolicy === "restricted" ? "restricted"
+                  : c.speechPolicy === "normal" ? "normal"
+                  : undefined,
               };
             }
           }
         }
         return result;
       })(),
+      chatLog: {
+        enabled: typeof raw.line?.chatLog?.enabled === "boolean" ? raw.line.chatLog.enabled : false,
+        injectRecent: Number.isFinite(raw.line?.chatLog?.injectRecent)
+          ? Math.max(0, Number(raw.line.chatLog.injectRecent))
+          : 15,
+      },
       webhookPort: Number.isFinite(raw.line?.webhookPort) ? Number(raw.line.webhookPort) : 3100,
       webhookPath: typeof raw.line?.webhookPath === "string" && raw.line.webhookPath.trim()
         ? (raw.line.webhookPath.trim().startsWith("/") ? raw.line.webhookPath.trim() : `/${raw.line.webhookPath.trim()}`)
@@ -509,6 +606,19 @@ function parseSettings(raw: Record<string, any>): Settings {
     notify: {
       mode: raw.notify?.mode === "legacy" ? "legacy" : "explicit",
     },
+    // Passed through rather than defaulted here: resolveTimeoutMs() treats
+    // "absent" and "0" differently (default vs. disabled).
+    ...(Number.isFinite(raw.sessionTimeoutMs) && raw.sessionTimeoutMs >= 0
+      ? { sessionTimeoutMs: Number(raw.sessionTimeoutMs) }
+      : {}),
+    autoCompactTurns:
+      Number.isFinite(raw.autoCompactTurns) && raw.autoCompactTurns >= 0
+        ? Math.floor(Number(raw.autoCompactTurns))
+        : 0,
+    autoCompactIdleMs:
+      Number.isFinite(raw.autoCompactIdleMs) && raw.autoCompactIdleMs >= 0
+        ? Math.floor(Number(raw.autoCompactIdleMs))
+        : 5 * 60 * 1000,
   };
 }
 
@@ -517,6 +627,15 @@ const ALL_DAYS = [0, 1, 2, 3, 4, 5, 6];
 
 function parseTimezone(value: unknown): string {
   return normalizeTimezoneName(value);
+}
+
+/** Heartbeat silent-ping targets: a list of non-empty strings, or []. */
+function parseSilentTargets(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((v): v is string => typeof v === "string")
+    .map((v) => v.trim())
+    .filter((v) => v.length > 0);
 }
 
 function parseExcludeWindows(value: unknown): HeartbeatExcludeWindow[] {

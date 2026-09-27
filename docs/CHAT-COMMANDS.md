@@ -26,12 +26,12 @@ What "your conversation" means depends on the platform:
 
 | Channel | Cancel scope |
 |---|---|
-| **Slack** | The current thread (if message is in a thread), otherwise the global session for that workspace. |
-| **Discord** | The current thread (if message is in a thread channel), otherwise the global session. |
+| **Slack** | The current DM, or the current thread in a channel. |
+| **Discord** | The current DM or thread. A message in an untracked guild top-level channel cancels the global session instead. |
 | **LINE** | The current LINE source — DM, group, or room. |
-| **Telegram** | The global session (Telegram doesn't use thread-scoped sessions yet). |
+| **Telegram** | The current chat (and forum topic, if any). |
 
-So in Slack and Discord, `/cancel` in thread A doesn't affect thread B. In LINE it's per-source. In Telegram it cancels whatever the bot is currently doing globally.
+So `/cancel` in one conversation never affects another. The only exception is an untracked Discord guild channel, which shares the global session.
 
 ### Feedback
 
@@ -65,9 +65,12 @@ If you see the indicator, your message is in the queue and will be processed in 
 
 ### Queueing scope
 
-- **Slack / Discord**: each thread has its own queue, so different threads run in parallel.
-- **LINE**: each source (DM / group / room) has its own queue.
-- **Telegram**: all messages share one global queue (per-chat queueing is not implemented yet).
+Queues are keyed by the same id as the session, so every conversation has its own queue and different conversations run in parallel:
+
+- **Slack**: per DM, and per thread within a channel.
+- **Discord**: per DM and per known thread. Untracked guild top-level channels share the global queue.
+- **LINE**: per source (DM / group / room).
+- **Telegram**: per chat (and per forum topic, when present).
 
 ---
 

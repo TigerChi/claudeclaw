@@ -19,7 +19,7 @@ ClaudeClaw integrates four messaging platforms — **LINE, Telegram, Slack, Disc
 | **`requireMention` toggle** for groups | ✓ (configurable) | hardcoded ON | hardcoded ON | hardcoded ON |
 | **Reply-to-bot triggers** in groups | ✗ | ✓ | (via thread) | ✓ |
 | **Per-group / per-channel overrides** | ✓ `groups[].requireMention` | ✗ | ✗ | ✗ |
-| **Thread-scoped sessions** | ✗ | ✗ | ✓ `thread_ts` | ✓ thread channels |
+| **Per-conversation sessions** | ✓ `line:dm:` / `line:group:` / `line:room:` | ✓ `tg:<chatId>[:<topic>]` | ✓ `slk:<channel>[:<thread_ts>]` | ✓ DMs + known threads (untracked guild channels use the global session) |
 | **Group/Channel allowlist** (only respond in these) | ✗ | ✗ | ✗ | ✗ |
 | **Time-window / quiet hours** | ✗ | ✗ | ✗ | ✗ |
 | **Per-user rate limit** | ✗ | ✗ | ✗ | ✗ |
@@ -53,7 +53,7 @@ Every platform has an `allowedUserIds` array in its `<platform>` block of `setti
   "groups": {
     "Cxxxxxxxx": { "requireMention": false }   // override for this group
   },
-  "webhookPort": 18789,
+  "webhookPort": 3100,          // default; 18789 is the proxy's own external port — never use it for an agent
   "webhookPath": "/line/<agent>"
 }
 ```

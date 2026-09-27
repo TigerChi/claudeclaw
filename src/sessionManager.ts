@@ -10,6 +10,9 @@ export interface ThreadSession {
   lastUsedAt: string;
   turnCount: number;
   compactWarned: boolean;
+  /** Set when the turn threshold is reached. The compact itself is deferred
+   *  until the thread goes idle — see runPendingCompactions() in runner.ts. */
+  pendingCompact?: boolean;
 }
 
 interface SessionsData {
@@ -86,6 +89,41 @@ export async function incrementThreadTurn(threadId: string): Promise<number> {
   session.turnCount += 1;
   await saveSessions(data);
   return session.turnCount;
+}
+
+/** Zero a thread's turn counter after a compact, so the next auto-compact is
+ *  another full interval away rather than firing on every subsequent turn.
+ *  Also clears the warning flag: post-compact the context is small again, so a
+ *  fresh warning is meaningful when it next grows. */
+export async function resetThreadTurnCount(threadId: string): Promise<void> {
+  const data = await loadSessions();
+  const session = data.threads[threadId];
+  if (!session) return;
+  session.turnCount = 0;
+  session.compactWarned = false;
+  session.pendingCompact = false;
+  await saveSessions(data);
+}
+
+/** Flag a thread as due for compaction on its next idle window. */
+export async function markThreadPendingCompact(threadId: string): Promise<void> {
+  const data = await loadSessions();
+  const session = data.threads[threadId];
+  if (!session || session.pendingCompact) return;
+  session.pendingCompact = true;
+  await saveSessions(data);
+}
+
+/** Threads flagged for compaction whose last activity is older than `idleMs`.
+ *  Reads straight from disk so a daemon-side sweep sees writes from any run. */
+export async function listThreadsDueForCompact(idleMs: number): Promise<ThreadSession[]> {
+  const data = await loadSessions();
+  const cutoff = Date.now() - idleMs;
+  return Object.values(data.threads).filter((t) => {
+    if (!t.pendingCompact) return false;
+    const last = Date.parse(t.lastUsedAt);
+    return Number.isFinite(last) && last <= cutoff;
+  });
 }
 
 /** Mark compact warning sent for a thread session. */

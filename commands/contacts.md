@@ -29,9 +29,13 @@ Promote a harvested candidate into the book.
 
 1. Find the candidate in the merged `seen/*.json` — `<candidate>` may be an id, an id prefix, or a (partial) display name. Ambiguous → show matches and ask.
 2. Validate `<name>`: must not be a reserved word (`reply`, `telegram`, `slack`, `line`, `discord`), must not contain `:` or `@`, must not collide with existing recipient names/aliases (case-insensitive).
-3. Add to `book.json`:
+3. Add to `book.json` under the top-level `recipients` object — the loader only reads `raw.recipients`, so a flat `"<name>": {...}` at the root is silently ignored:
    ```json
-   "<name>": { "type": "person|group|channel", "platforms": { "<platform>": "<id>" }, "default": ["<platform>"] }
+   {
+     "recipients": {
+       "<name>": { "type": "person|group|channel", "platforms": { "<platform>": "<id>" }, "default": ["<platform>"] }
+     }
+   }
    ```
    Infer `type` from the candidate's `kind`. Write atomically: write to a temp file in the same directory, then rename over `book.json`.
 4. Confirm what was added and show how to use it: `[notify:<name>]message[/notify]`.

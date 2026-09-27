@@ -1,6 +1,15 @@
 # Task: Add Multi-Session Thread Support to ClaudeClaw
 
-Read MULTI_SESSION_SPEC.md for the full specification.
+> **Historical — this work has shipped.** Kept as a record of the original
+> assignment; it is written in future tense and does not describe the code as
+> it exists today. For current behaviour see
+> [`docs/MULTI_SESSION.md`](docs/MULTI_SESSION.md). Notably, per-conversation
+> sessions now cover LINE, Telegram, Slack, and Discord — not just Discord
+> threads — and `src/sessionManager.ts` exports plain functions
+> (`getThreadSession`, `createThreadSession`, `removeThreadSession`,
+> `listThreadSessions`), not the `SessionMap` class sketched below.
+
+Read MULTI_SESSION_SPEC.md for the original specification.
 
 ## What to do:
 
@@ -40,4 +49,6 @@ Read MULTI_SESSION_SPEC.md for the full specification.
 - Keep the same coding style as the existing codebase (TypeScript, Bun)
 - Run `bun build` or type-check if possible to verify no errors
 
-When completely finished, run: openclaw system event --text "Done: ClaudeClaw multi-session thread support implemented" --mode now
+(The original task ended with a completion-notification command that referenced
+a `system` subcommand which does not exist in `src/index.ts`. Dropped — there is
+nothing to run.)

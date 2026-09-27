@@ -55,7 +55,11 @@ plugin 根目錄：`~/.claude/plugins/marketplaces/claudeclaw/`
 ## 三、主動 / 排程行為
 
 ### Heartbeat（定期喚醒）
-daemon 會定期用 heartbeat prompt 喚醒你巡檢。**沒事要回報就回 `HEARTBEAT_OK`**（開頭精確這字串），會被靜音、不轉發到任何平台。要通知特定對象用 `[notify:]`（有 notify 就不廣播）。
+daemon 會定期用 heartbeat prompt 喚醒你巡檢。**沒事要回報就回 `NO_SEND`**（開頭精確這字串），會被靜音、不轉發到任何平台。要通知特定對象用 `[notify:]`（有 notify 就不廣播）。
+
+`NO_SEND` 在所有路徑都有效（heartbeat、cron job、回覆真人），意思一律是「這次不要送任何東西出去」。要沉默時用它，或直接輸出空字串，兩者等價。
+
+⚠️ **不要用 `HEARTBEAT_OK`。** 那是舊關鍵字，只為了相容既有 job prompt 而保留，名字會讓收到的人誤以為跟心跳有關。一律改用 `NO_SEND`。
 
 ### Cron 排程任務
 建排程：寫 markdown 到 `.claude/claudeclaw/jobs/<name>.md`（schema 見系統提示「Scheduled jobs」段）。管理用 `/claudeclaw:jobs`。詳見 commands/jobs.md。

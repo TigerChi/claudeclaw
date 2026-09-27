@@ -245,7 +245,7 @@ agent-bus
 <agent-root>/_claude/whisper/merged-prompt.txt
 ```
 
-這是 ClaudeClaw 真正餵給 Whisper 的字串（已截斷到 ~150 字）。Debug「為什麼
+這是 ClaudeClaw 真正餵給 Whisper 的字串（上限 240 字元）。Debug「為什麼
 Whisper 沒聽出某個詞」時可以看這個檔。
 
 ---
@@ -339,9 +339,10 @@ Daemon 是 long-running process，source 改了不會自動載：
 # 對某個 agent
 /claudeclaw:restart
 
-# 或對全部 agent（透過 hub）
-curl -X POST -H "Authorization: Bearer $(cat ~/.claude/claudeclaw/hub/auth.json | python3 -c 'import json,sys;print(json.load(sys.stdin)["primary"])')" \
-  http://127.0.0.1:$(cat ~/.claude/claudeclaw/hub/hub.port)/api/agents/restart-all
+# 或對全部 agent（透過 hub）— 從本機 loopback 打，hub 會略過 token 驗證
+curl -X POST http://127.0.0.1:$(cat ~/.claude/claudeclaw/hub/hub.port)/api/agents/restart-all
 ```
+
+> 從非 loopback 位址打就要帶 `Authorization: Bearer <token>`。那個 token 只在 `hub init` / 第一次 `hub start` 時印出一次，`hub/auth.json` 只存它的 SHA-256 hash，事後讀不回來 — 弄丟就 `claudeclaw hub token --rotate` 換一支。
 
 詞表檔不需要 restart（每次轉錄重讀）— 只有 source code 改才需要。

@@ -22,7 +22,7 @@ Report the output. Show:
 ### `start`
 
 1. Check if proxy is already running — if yes, tell the user and exit.
-2. Start the proxy as a background daemon:
+2. Start the proxy as a background daemon (optionally with `--port <n>` / `--bind <addr>`):
 ```bash
 nohup bun run <PLUGIN_ROOT>/src/index.ts proxy start > ~/.claude/claudeclaw/proxy.log 2>&1 & disown
 echo "Proxy PID: $!"
@@ -49,5 +49,5 @@ Report the output.
 - **Auto-reload**: Every 15 seconds, the proxy re-scans for new agents or changed settings.
 - **Health check**: Every 30 seconds, the proxy checks if each agent's daemon is reachable.
 - **Status API**: `GET http://localhost:18789/status` returns JSON with all routes and health.
-- **Config**: No proxy config file needed. Each agent's `webhookPort` and `webhookPath` in their own `settings.json` is the only setting.
-- **Port rule**: The proxy listens on 18789 (external). Each agent must use a different internal port (e.g., 18801, 18802, 18803).
+- **Config**: Routing needs no config — each agent's `webhookPort` and `webhookPath` in their own `settings.json` is enough. The proxy's own listen address comes from `~/.claude/claudeclaw/proxy-config.json` (optional, `{ "port": <n>, "bind": "<addr>" }`), which is read on `proxy start` if present. Precedence: `--port` / `--bind` CLI flags > `proxy-config.json` > defaults (`18789`, `0.0.0.0`).
+- **Port rule**: The proxy listens on 18789 (external) by default. Each agent must use a different internal port (e.g., 18801, 18802, 18803). If any agent's `webhookPort` equals the proxy's external port, `proxy start` prints a CRITICAL warning and refuses to start.

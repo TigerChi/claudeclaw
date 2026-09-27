@@ -1,5 +1,15 @@
 # ClaudeClaw Multi-Session Thread Support - Feature Spec
 
+> **Historical — this work has shipped.** This is the original design sketch,
+> written in future tense before implementation. It does not describe the code
+> as it exists today. For current behaviour see
+> [`docs/MULTI_SESSION.md`](docs/MULTI_SESSION.md). Two differences worth
+> flagging up front: per-conversation sessions ended up covering LINE,
+> Telegram, Slack, and Discord (not only Discord threads), and
+> `src/sessionManager.ts` shipped as plain exported functions —
+> `getThreadSession`, `createThreadSession`, `removeThreadSession`,
+> `listThreadSessions` — rather than the `SessionMap` class described below.
+
 ## Goal
 Add Discord thread binding with independent Claude CLI sessions per thread, enabling parallel conversations.
 

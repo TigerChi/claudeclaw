@@ -102,9 +102,15 @@ Notable behavior:
 | Constant-time floor | If no auth is configured but a token is presented, a fake-hash compare runs anyway to avoid leaking config state via timing |
 | Token sources accepted | `Authorization: Bearer …` (preferred) → `Cookie: claudeclaw_hub_token=…` (fallback for new-tab navigations that can't set headers) |
 
-Non-loopback bind refuses to start without auth configured. Loopback bind
-doesn't enforce auth at the host level (anyone with shell access could read
-`auth.json` anyway), but auth is still recommended.
+`hub start` auto-initialises a token on first run, so the "no auth configured"
+state doesn't survive a start. A non-loopback bind does not refuse to start —
+it prints a warning that a bearer token alone isn't confidential over plain
+HTTP, and starts anyway.
+
+Auth is bypassed per-request for loopback source IPs (anyone with shell access
+could read `auth.json` anyway). Because a non-loopback bind also opens a
+companion listener on `127.0.0.1:<port>`, local requests stay tokenless in that
+configuration too.
 
 ## HTTP API reference
 

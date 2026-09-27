@@ -25,7 +25,8 @@ Parse `$ARGUMENTS` to identify what the user wants. If no arguments are given, s
    - Interval: Xm
    - Prompt: (show full prompt or "not set")
    - Exclude windows: (list each window's days + start-end, or "none")
-   - Forward to Telegram: yes/no (`HEARTBEAT_OK` is forwarded only when enabled)
+   - Ping when silent: yes/no (send a "nothing needed attention" line when a heartbeat run comes back silenced)
+   - Silent-ping targets: (list them, or "nobody" when empty)
 
    **Telegram**
    - Token: (first 5 chars + "..." or "not configured")
@@ -72,17 +73,45 @@ Change the heartbeat prompt.
 4. Write the updated settings back.
 5. Confirm the change.
 
-### `heartbeat telegram on` / `heartbeat telegram off` / `heartbeat forward telegram on` / `heartbeat forward telegram off`
+### `heartbeat silent-ping on` / `heartbeat silent-ping off`
 
-Toggle whether heartbeat outputs are forwarded to Telegram.
+Toggle whether a heartbeat run that found nothing still sends a ping.
+
+Also accept the old spellings (`heartbeat telegram on/off`, `heartbeat forward telegram on/off`) — they set the same thing.
 
 1. Read `.claude/claudeclaw/settings.json`.
-2. Set `heartbeat.forwardToTelegram` to `true` for `on` and `false` for `off`.
+2. Set `heartbeat.forwardWhenSilent` to `true` for `on` and `false` for `off`.
+   (Older files may carry the previous name `heartbeat.forwardToTelegram`; it is
+   still read, but write the new name.)
 3. Write the updated settings back.
 4. Confirm the change.
 5. Clarify behavior:
-   - `true` = forward all heartbeat replies (including `HEARTBEAT_OK`)
-   - `false` = suppress `HEARTBEAT_OK` and forward only actionable heartbeat outputs
+   - `true` = silent runs ping the recipients in `heartbeat.silentTargets`
+   - `false` = silent runs send nothing at all (default)
+6. If turning it on while `heartbeat.silentTargets` is empty, say so — nothing
+   will be sent until a target is added (see the next command).
+
+### `heartbeat silent-ping to <targets>` / `heartbeat silent-ping to none`
+
+Set who receives the silent-ping. Comma-separated.
+
+1. Read `.claude/claudeclaw/settings.json`.
+2. Set `heartbeat.silentTargets` to the parsed list (`none` / `off` clears it to `[]`).
+3. Write the updated settings back.
+4. Confirm the change.
+
+Accepted target forms:
+
+| Target | Meaning |
+|--------|---------|
+| `all` | Every configured platform's allowed users |
+| `telegram` / `discord` / `slack` / `line` | That one platform's allowed users |
+| `<platform>:<id>` | One exact chat — e.g. `line:C0123…` for a group, `telegram:7692339732` for a DM |
+| `<name>` or `<name>@<platform>` | A recipient from the shared contacts book |
+
+**Empty means nobody**, even with `forwardWhenSilent` on. This is the opposite
+of a cron job's `channels:` field, where empty means broadcast — do not assume
+the two behave alike.
 
 ### `telegram token <token>` / `telegram token`
 
@@ -205,7 +234,10 @@ Configure web UI bind address or port.
 Reset all settings to defaults.
 
 1. Use **AskUserQuestion**: "Reset all settings to defaults? This will disable heartbeat and clear Telegram config." (header: "Confirm", options: "Yes, reset everything", "No, keep current settings")
-2. If confirmed, write the default settings:
+
+   ⚠️ **Warn the user before writing**: overwriting `settings.json` wipes every platform credential stored in it — `telegram.token`, `discord.token`, `slack.botToken` / `slack.appToken`, `line.channelAccessToken` / `line.channelSecret` — plus every allowlist and pairing code. Offer to back the file up first (e.g. `cp .claude/claudeclaw/settings.json .claude/claudeclaw/settings.json.bak`).
+
+2. If confirmed, write the default settings (this is `DEFAULT_SETTINGS` from `src/config.ts`):
    ```json
    {
      "model": "",
@@ -214,6 +246,38 @@ Reset all settings to defaults.
        "model": "",
        "api": ""
      },
+     "agentic": {
+       "enabled": false,
+       "defaultMode": "implementation",
+       "modes": [
+         {
+           "name": "planning",
+           "model": "opus",
+           "keywords": [
+             "plan", "design", "architect", "strategy", "approach",
+             "research", "investigate", "analyze", "explore", "understand",
+             "think", "consider", "evaluate", "assess", "review",
+             "system design", "trade-off", "decision", "choose", "compare",
+             "brainstorm", "ideate", "concept", "proposal"
+           ],
+           "phrases": [
+             "how to implement", "how should i", "what's the best way to",
+             "should i", "which approach", "help me decide", "help me understand"
+           ]
+         },
+         {
+           "name": "implementation",
+           "model": "sonnet",
+           "keywords": [
+             "implement", "code", "write", "create", "build", "add",
+             "fix", "debug", "refactor", "update", "modify", "change",
+             "deploy", "run", "execute", "install", "configure",
+             "test", "commit", "push", "merge", "release",
+             "generate", "scaffold", "setup", "initialize"
+           ]
+         }
+       ]
+     },
      "timezone": "UTC",
      "timezoneOffsetMinutes": 0,
      "heartbeat": {
@@ -221,11 +285,44 @@ Reset all settings to defaults.
        "interval": 15,
        "prompt": "",
        "excludeWindows": [],
-       "forwardToTelegram": true
+       "forwardWhenSilent": false,
+       "silentTargets": []
      },
      "telegram": {
        "token": "",
-       "allowedUserIds": []
+       "allowedUserIds": [],
+       "pairing": {
+         "enabled": false,
+         "code": "",
+         "welcomeMessage": "Hi! 我是受保護的 bot，請輸入配對碼以開始使用。",
+         "successMessage": "✅ 配對成功，歡迎加入！現在可以開始對話了。"
+       }
+     },
+     "discord": {
+       "token": "",
+       "allowedUserIds": [],
+       "listenChannels": []
+     },
+     "slack": {
+       "botToken": "",
+       "appToken": "",
+       "allowedUserIds": [],
+       "listenChannels": []
+     },
+     "line": {
+       "channelAccessToken": "",
+       "channelSecret": "",
+       "allowedUserIds": [],
+       "pairing": {
+         "enabled": false,
+         "code": "",
+         "welcomeMessage": "Hi! 我是受保護的 bot，請輸入配對碼以開始使用。",
+         "successMessage": "✅ 配對成功，歡迎加入！現在可以開始對話了。"
+       },
+       "requireMention": true,
+       "groups": {},
+       "webhookPort": 3100,
+       "webhookPath": "/webhook"
      },
      "security": {
        "level": "moderate",
@@ -236,10 +333,26 @@ Reset all settings to defaults.
        "enabled": false,
        "host": "127.0.0.1",
        "port": 4632
+     },
+     "stt": {
+       "baseUrl": "",
+       "model": ""
+     },
+     "whisper": {
+       "engine": "auto",
+       "model": "large-v3-turbo",
+       "language": ""
+     },
+     "agentBus": {
+       "enabled": false,
+       "name": ""
+     },
+     "notify": {
+       "mode": "explicit"
      }
    }
    ```
-3. Confirm the reset. Note: this does not delete cron jobs — use `/heartbeat:jobs delete` for that.
+3. Confirm the reset. Note: this does not delete cron jobs — use `/claudeclaw:jobs delete` for that.
 
 ---
 
@@ -264,7 +377,8 @@ Location: `.claude/claudeclaw/settings.json`
     "excludeWindows": [
       { "days": [0, 6], "start": "23:00", "end": "07:00" }
     ],
-    "forwardToTelegram": true
+    "forwardWhenSilent": true,
+    "silentTargets": ["telegram:123456789"]
   },
   "telegram": {
     "token": "123456:ABC-DEF...",
@@ -298,7 +412,8 @@ Location: `.claude/claudeclaw/settings.json`
 | `heartbeat.excludeWindows[].days` | number[] | Days of week (0=Sun..6=Sat); omit for all days |
 | `heartbeat.excludeWindows[].start` | string | Window start time in `HH:MM` 24h format       |
 | `heartbeat.excludeWindows[].end`   | string | Window end time in `HH:MM` 24h format         |
-| `heartbeat.forwardToTelegram`      | boolean | Forward heartbeat output to Telegram (`false` suppresses `HEARTBEAT_OK`) |
+| `heartbeat.forwardWhenSilent`      | boolean | Ping even when a heartbeat run found nothing (default `false`; old name `forwardToTelegram` still read) |
+| `heartbeat.silentTargets`          | string[] | Who receives that ping. Empty (default) = nobody. `"all"`, a platform name, `"<platform>:<id>"`, or a contacts-book name |
 | `telegram.token`           | string     | Bot token from @BotFather                      |
 | `telegram.allowedUserIds`  | number[]   | Telegram user IDs allowed to interact          |
 | `security.level`           | string     | `locked` \| `strict` \| `moderate` \| `unrestricted` |

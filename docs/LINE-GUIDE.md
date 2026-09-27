@@ -16,6 +16,7 @@
 7. [群組行為與 Mention 政策](#7-群組行為與-mention-政策)
 8. [使用者授權與 Pairing 配對](#8-使用者授權與-pairing-配對)
 9. [語音訊息處理](#9-語音訊息處理)
+9.5. [對話速度與自動壓縮](#95-對話速度與自動壓縮)
 10. [安全性層級](#10-安全性層級)
 11. [常用操作](#11-常用操作)
 12. [疑難排解](#12-疑難排解)
@@ -119,8 +120,15 @@ ngrok http 18789
     "requireMention": true,           // 群組中是否要 @mention bot 才回應（預設 true）
     "groups": {                        // 個別群組覆寫設定（key = group ID）
       "Cabc123...": {
-        "requireMention": false        // 此群組免 @mention
+        "requireMention": false,       // 此群組免 @mention
+        "speechPolicy": "restricted"   // 有外部人的群：只被動回應、不主動、不回報（見 7.35）
       }
+    },
+
+    // === 對話記錄（見 7.4）===
+    "chatLog": {
+      "enabled": false,               // 全部訊息寫入磁碟（預設關閉）
+      "injectRecent": 15              // 每次喚醒注入的則數，其餘留在檔案
     },
 
     // === Webhook 設定 ===
@@ -137,13 +145,13 @@ ngrok http 18789
 | `channelAccessToken` | string | ✅ | — | 從 LINE Developers Console 取得 |
 | `channelSecret` | string | ✅ | — | 用於驗證 webhook 請求的簽章 |
 | `allowedUserIds` | string[] | ❌ | `[]` | 空 = 全部人都能用。LINE user ID 格式：`U` + 32 個 hex 字元 |
-| `pairing.enabled` | boolean | ❌ | `false` | 只有 `allowedUserIds` 非空時才有意義 |
+| `pairing.enabled` | boolean | ❌ | `false` | `enabled` + `code` 都設好時，任何不在 `allowedUserIds` 的人都會走配對流程 — **包含 `allowedUserIds` 為空的情況** |
 | `pairing.code` | string | ❌ | `""` | 初始化時由 AI 自動產生 10 字元隨機碼。可自行修改 |
 | `pairing.welcomeMessage` | string | ❌ | 有預設 | 陌生人 DM bot 時看到的提示訊息 |
 | `pairing.successMessage` | string | ❌ | 有預設 | 配對成功後的回覆 |
 | `requireMention` | boolean | ❌ | `true` | 群組中是否要求 @mention bot 名稱才回應 |
 | `groups` | object | ❌ | `{}` | 個別群組的設定覆寫。key 是 group ID（`C` 開頭）或 room ID（`R` 開頭） |
-| `webhookPort` | number | ❌ | `18789` | 本機 webhook server 的 port。**多 Agent 時每個要不同** |
+| `webhookPort` | number | ❌ | `3100` | 本機 webhook server 的 port。**多 Agent 時每個要不同**。⚠️ 不要設成 `18789` — 那是 proxy 自己的對外 port，Agent 佔用會讓 proxy 判定 CRITICAL 衝突而拒絕啟動 |
 | `webhookPath` | string | ❌ | `/webhook` | Webhook URL 的 path 部分。建議用 `/line/<agent名稱>` |
 
 ### 3.3 修改設定
@@ -287,7 +295,7 @@ LINE: enabled (via proxy)
 
 - LINE 不支援 markdown，Agent 的回覆必須是**純文字**
 - 超過 4500 字元自動分段（LINE 單則上限 5000 字）
-- 優先使用 Reply API（免費），超時（30 秒）自動 fallback 到 Push API
+- 優先使用 Reply API（免費）。Reply 呼叫**只要拋錯**就 fallback 到 Push API（沒有 timeout 機制）。分段超過 5 則時直接跳過 Reply，整批走 Push（LINE 一次 reply 最多 5 則）
 
 ### 6.3 Loading 動畫
 
@@ -317,11 +325,19 @@ DM 不受 mention 政策影響。只要通過使用者授權（allowedUserIds / 
   │   2. 沒有？ → 用全域 requireMention（預設 true）
   │
   ├── requireMention = true？
-  │   ├── 訊息中有 @<bot display name>？ → 回應
-  │   └── 沒有？ → 忽略
+  │   ├── 文字訊息且含 @<bot display name>？ → 回應
+  │   └── 其餘一律忽略（含圖片 / 影片 / 語音 / 檔案 / 貼圖 / 位置）
   │
   └── requireMention = false？ → 回應所有訊息
 ```
+
+> **非文字訊息在 `requireMention: true` 的群組不會喚醒 Agent。**
+> LINE 的 mention 只存在於文字訊息的內文，圖片與檔案**本質上無法帶 @** ——
+> 若放行，等於在「要 @ 才回應」的群組裡被任何一張照片喚醒，而且沒有任何
+> 指示可依循。要 Agent 看某個附件，**傳完後再 @ 它一句**。
+>
+> 附件不會因此遺失：開了 `chatLog`（見 7.4）時，封存發生在權限判斷之前，
+> 檔案照樣下載、記錄，Agent 之後往回翻就能取用。
 
 ### 7.3 設定範例
 
@@ -345,7 +361,113 @@ DM 不受 mention 政策影響。只要通過使用者授權（allowedUserIds / 
 }
 ```
 
-### 7.4 如何取得 Group ID
+### 7.35 受限群組發言（speechPolicy）
+
+有外部人在場的群組（銀行、廠商往來群）可以設 `speechPolicy: "restricted"`：
+
+```jsonc
+"groups": {
+  "C<銀行群 id>": {
+    "requireMention": true,
+    "passiveListen": true,
+    "speechPolicy": "restricted"
+  }
+}
+```
+
+行為：agent 被 @ 時仍會回應內部人，但收到一段強化守則 ——
+**只回應直接呼叫它的那句、盡量簡短、不主動發言、不在群裡回報任務/系統狀態
+（做了什麼改私訊管理者）**。對外部人來說 agent 幾乎隱形。
+
+| | `requireMention` | `speechPolicy: restricted` |
+|---|---|---|
+| 管的是 | 要不要**醒**（被 @ 才醒） | 醒來後**說什麼**（只回、不主動、不回報） |
+| 層級 | 路由層，機械強制 | prompt 層，指令約束 |
+
+兩個搭配用：requireMention 擋掉沒 @ 的喚醒，speechPolicy 約束被 @ 之後的分寸。
+
+> 為什麼發言分寸只能用 prompt、不能機械強制：LINE agent 只在被喚醒時產生輸出，
+> 不會憑空發言。「醒來後講多少」是模型行為，路由層沒有東西可攔 —— 唯一能做的是
+> 把守則注入 prompt。它不保證 100% 遵守（沒有 prompt 指令做得到），但這是對的層級，
+> 且集中成設定值後跨 agent 一致，不必每隻手寫。
+
+---
+
+### 7.36 安全預設：defaultSpeechPolicy
+
+要讓 agent「被拉進任何新群都先當外部群」，設 agent 層的預設：
+
+```jsonc
+"line": {
+  "defaultSpeechPolicy": "restricted",   // 沒明確設定的群一律 restricted
+  "groups": {
+    "C<任務群 id>": { "speechPolicy": "normal" }   // 只有明標的內部群放寬
+  }
+}
+```
+
+解析順序：**per-group 的 `speechPolicy` 優先，沒設才落到 `defaultSpeechPolicy`**，
+再沒有才是全域預設 `"normal"`。
+
+用途：安全預設。agent 被邀進沒設定過的新群 → 自動 restricted（只被動回應、不主動、
+不回報），直到管理者確認「這是內部/任務群」再明標 `"normal"` 放寬。避免 agent 一進
+陌生群就自在講話。
+
+- `defaultSpeechPolicy` 預設 `"normal"` → **不設就跟以前完全一樣**，現有 agent 零影響
+- 只影響「沒在 `groups` 裡明列」的群；明列的照該群自己的 `speechPolicy`
+- 私訊不受影響（restricted 只作用於群組）
+
+---
+
+### 7.4 對話記錄（chatLog）
+
+`requireMention: true` 讓 bot 安靜，但也讓它看不到沒 @ 它的那些訊息 —— 被 @ 時
+往往缺前因後果。`chatLog` 解決這件事：**所有進來的訊息（含未配對者、未 @ 的、
+DM）以及 bot 自己的回覆，都寫進磁碟**，喚醒時只注入最近 N 則，其餘留在檔案裡讓
+agent 自己決定要不要往回讀。
+
+```jsonc
+"line": {
+  "chatLog": {
+    "enabled": false,      // 預設關閉；開啟即開始持久化對話內容
+    "injectRecent": 15     // 每次注入的則數；更早的不進 prompt，只給路徑
+  }
+}
+```
+
+**檔案結構**（`<專案>/.claude/claudeclaw/chatlog/`）：
+
+```
+chatlog/
+├── index.json                  # 對話 ID → 名稱 / 類型 / 最後活動時間
+├── group-C0123…/2026-07.jsonl  # 一個對話一個資料夾，按月切檔
+└── user-U0abc…/2026-07.jsonl
+```
+
+每則一行 JSON：時間、訊息 ID、`role`（`user` / `bot`）、發話者 ID 與顯示名、
+訊息類型、內容，附件另加 `mediaPath`。配對碼會被替換成 `[pairing code]`，不落地。
+
+**各類型怎麼存**：
+
+| 類型 | 記錄內容 |
+|---|---|
+| 文字 | 原文 |
+| 圖片 / 影片 / 語音 / 檔案 | 下載到 `inbox/line/<messageId>.<ext>`，`mediaPath` 指向它 |
+| 貼圖 | 文字描述：`[sticker: 關鍵字 — package <id>/<id>]`（LINE 不提供貼圖內容下載，關鍵字與 id 是唯一可留的記錄） |
+| 位置 | `[location: 名稱 地址 (緯度, 經度)]` |
+
+附件在**授權檢查之前**就下載，未配對者傳的檔案同樣會落地。下載結果按 message id
+記憶化，所以封存與交給 agent 的那份是同一次請求、同一個檔案。
+
+注意事項：
+
+- **沒有上限、不會自動裁切**，文字與附件都是。文字一則約 100 bytes，附件則取決於
+  內容 —— 磁碟成長主要來自附件，保留多久由運維決定
+- 開啟後 `passiveListen` 的記憶體緩衝不再用於 prompt（chatLog 是它的超集）
+- 這是對話內容與附件的永久記錄，是否適合取決於使用場景與當地法規 —— 預設關閉不是
+  隨口設的
+
+### 7.5 如何取得 Group ID
 
 群組訊息進來時，daemon log 會印出 group ID：
 ```
@@ -374,9 +496,11 @@ DM 不受 mention 政策影響。只要通過使用者授權（allowedUserIds / 
 
 只有列出的 user ID 能使用 bot。其他人的訊息完全被忽略。
 
-### 8.3 Pairing 配對（白名單 + 自助加入）
+### 8.3 Pairing 配對（自助加入白名單）
 
-當 `allowedUserIds` 非空且 `pairing.enabled = true` 時，陌生人可以透過密碼自助加入白名單。
+只要 `pairing.enabled = true` 且 `pairing.code` 非空，**任何不在 `allowedUserIds` 裡的人**都會走配對流程 — `allowedUserIds` 是不是空陣列都一樣。這讓「純配對」模式可行：白名單留空，operator 不必手動查 LINE User ID。
+
+⚠️ 也因此，8.1 的開放模式和 pairing 不能並存：在原本 `allowedUserIds: []` 全開放的 bot 上打開 pairing，等於把先前所有能用的人全部擋在門外，他們必須先輸入配對碼才能再度使用。
 
 **流程：**
 1. 陌生人 DM bot → 收到 `welcomeMessage`（提示輸入配對碼）
@@ -410,16 +534,18 @@ DM 不受 mention 政策影響。只要通過使用者授權（allowedUserIds / 
   → LINE server 推送 webhook（audio type）
   → Daemon 下載音檔（m4a 格式）到 inbox/line/
   → ffmpeg 轉換 m4a → wav（16kHz mono PCM）
-  → Whisper.cpp 語音辨識 → 文字
+  → Whisper 語音辨識 → 文字
   → 文字作為 prompt 送給 Claude
   → Claude 回覆
 ```
 
+引擎選擇由 `whisper.engine` 決定，預設 `"auto"`：有設 `stt.baseUrl` → 外部 API；否則在 macOS arm64 → MLX（預設模型 `large-v3-turbo`）；其他平台才 fallback 到 whisper.cpp。細節見 [WHISPER-GUIDE.md](WHISPER-GUIDE.md)。
+
 ### 9.2 需求
 
 - **ffmpeg**：用於轉換 LINE 的 m4a 格式。macOS: `brew install ffmpeg`
-- **Whisper 模型**：首次使用時自動下載（base.en, ~75MB）
-- Whisper binary 也會自動下載，不需要手動安裝
+- **MLX 引擎（macOS arm64 預設）**：模型 `large-v3-turbo`，首次使用時自動下載
+- **whisper.cpp（非 mac arm64 的 fallback）**：模型 `base.en`（~75MB），binary 與模型都會自動下載，不需要手動安裝
 
 ### 9.3 外部 STT API（可選）
 
@@ -438,6 +564,59 @@ DM 不受 mention 政策影響。只要通過使用者授權（allowedUserIds / 
 
 ---
 
+## 9.5 對話速度與自動壓縮
+
+Agent 每次回覆都會重新載入該對話累積的完整歷史 —— 對話越長，每則回覆越慢。
+
+底層 Claude Code 確實會自動壓縮，但**門檻是 context 逼近模型上限**（約 20 萬 token）。
+那是為了「不溢出」設計的，不是為了「保持快速」；在觸發之前，context 只增不減。
+ClaudeClaw 原本另有兩道：turn ≥ 25 發一次提醒（不動手）、單次執行 timeout 才主動壓縮。
+日常對話兩者都碰不到。
+
+`autoCompactTurns` 補上按對話長度觸發的那一道：
+
+```jsonc
+{
+  "autoCompactTurns": 20,        // 累積幾 turn 後排入壓縮；0 = 關閉（預設）
+  "autoCompactIdleMs": 300000    // 對話安靜多久才真的壓；預設 5 分鐘
+}
+```
+
+**兩段式：達標只是排程，安靜了才執行。**
+
+```
+第 20 turn 回完 → 標記「待壓縮」，不動作
+                → daemon 每分鐘掃一次
+                → 這個對話安靜超過 5 分鐘了嗎？
+                     沒有 → 繼續等（還在談）
+                     有   → 這時才壓
+```
+
+為什麼不達標就壓：回覆雖然已送出，壓縮仍佔著該 thread 的佇列，**下一則訊息會排在它後面**——
+成本只是從「這一則」移到「下一則」。而一來一往的節奏裡，每次回完佇列都是空的、
+看起來都像有空檔，其實使用者只是在打字。**唯一能分辨「談完了」與「還在打字」的是時間。**
+
+- 壓縮發生在使用者離開後 → 不拖慢任何一則回覆，也不會壓到進行中的討論
+- 壓縮走的是同一條 thread 佇列 → 不可能跟 `--resume` 撞在一起；期間有訊息進來，
+  壓縮排在它後面
+- 失敗不清標記 → 下一輪掃描重試
+- 每個 thread（各群組、各 DM）獨立計數與判定
+- 壓縮保留摘要，不是清空：agent 記得談過什麼，只是不再逐字重讀
+
+`autoCompactIdleMs` 選值：設太短（1 分鐘）會在對話空檔中間壓；設太長（30 分鐘）
+則整天連續使用的 agent 可能一直等不到窗口。5 分鐘對一般聊天節奏夠用。
+
+與 `/claudeclaw:clear` 的差別：`clear` 是**丟棄**整個 session 從零開始；
+`autoCompactTurns` 是**濃縮**後繼續。前者手動、後者自動。
+
+> `autoCompactTurns` 選值：對話節奏快、每則都短 → 可調高（30-40）；每則都長或常
+> 附檔案 → 調低（10-15）。壓縮本身是一次完整的 Claude 執行（要讀完 context 寫摘要），
+> 設太低會頻繁付這個成本。
+>
+> turn 的定義：**一次喚醒算一 turn**，不論該次內部做了多少工具呼叫。失敗的執行不計。
+
+---
+
 ## 10. 安全性層級
 
 `security.level` 控制 Agent 在處理 LINE 訊息時可以使用的工具：
@@ -449,12 +628,14 @@ DM 不受 mention 政策影響。只要通過使用者授權（allowedUserIds / 
 | `moderate`（預設） | ✅ | ✅ | ✅ | ✅ | 限專案目錄 |
 | `unrestricted` | ✅ | ✅ | ✅ | ✅ | **無限制** |
 
+⚠️ `allowedTools` / `disallowedTools` 是**覆寫**，不是疊加。`level: "locked"` 配上 `allowedTools: ["Bash"]`，結果是只剩 Bash — locked 原本給的 Read / Grep / Glob 全部被拿掉。
+
 設定方式：
 ```jsonc
 "security": {
   "level": "moderate",
-  "allowedTools": [],        // 額外允許的工具（在 strict/locked 上加開）
-  "disallowedTools": []      // 額外禁止的工具
+  "allowedTools": [],        // 非空時「取代」整份允許清單，不是加開
+  "disallowedTools": []      // 非空時「取代」整份禁止清單
 }
 ```
 
@@ -552,8 +733,8 @@ Hot-reload 生效。已配對的使用者不受影響（他們已在 allowedUser
 
 ### Pairing 不生效
 
-- 確認 `allowedUserIds` 不是空陣列（空陣列 = 全開放，不需要配對）
-- 確認 `pairing.enabled = true` 且 `pairing.code` 不是空字串
+- 確認 `pairing.enabled = true` 且 `pairing.code` 不是空字串（兩者缺一就整個略過配對流程，退回單純的 `allowedUserIds` 判斷）
+- `allowedUserIds` 是不是空陣列不影響配對是否觸發；已經在 `allowedUserIds` 裡的人不會被要求配對
 - Pairing 只在 DM 觸發，群組中不會觸發
 - 密碼必須完全一致（區分大小寫）
 

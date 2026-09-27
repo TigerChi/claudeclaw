@@ -35,7 +35,7 @@ Reserved words (never valid as recipient names or aliases): `reply`,
 | **Agent bus** | `[notify:]` blocks are always delivered. Remaining plain text follows `notify.mode` (below). |
 | **Cron job** | If the output contains any `[notify:]`, ONLY those targets receive messages — the job's `channels` / `slackTarget` broadcast is skipped for that run. Without `[notify:]`, legacy behavior is unchanged. |
 | **Heartbeat** | Same rule as cron. `HEARTBEAT_OK` squelching is unchanged. |
-| Interactive platform sessions | Not yet wired — replies already go back to the originating chat. |
+| **Interactive platform sessions** | Wired on Slack only: a Slack reply containing `[notify:]` is routed through the dispatcher, the blocks are stripped, and the remaining text posts to the originating conversation as usual. Telegram, LINE, and Discord replies are not yet routed through it — their `[notify:]` blocks stay in the reply text. |
 
 ## `notify.mode` setting (per agent, `settings.json`)
 

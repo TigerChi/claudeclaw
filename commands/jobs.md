@@ -75,11 +75,11 @@ Manually trigger a cron job immediately (useful for testing).
 
 1. Read `.claude/claudeclaw/jobs/<job-name>.md`. If it doesn't exist, list available jobs.
 2. Show the job's prompt and ask for confirmation: "Run job '<name>' now?" (header: "Run", options: "Yes", "No")
-3. If confirmed, run the prompt by executing:
+3. If confirmed, execute the job's prompt directly:
    ```bash
-   bun run ${CLAUDE_PLUGIN_ROOT}/src/index.ts run <job-name>
+   claude -p "<prompt>" --output-format text
    ```
-   If the `run` sub-command is not implemented in the CLI, execute the prompt directly using `claude -p "<prompt>" --output-format text` instead.
+   **Do not** try `bun run ${CLAUDE_PLUGIN_ROOT}/src/index.ts run <job-name>` — there is no `run` sub-command. Unknown arguments fall through to the default branch, which silently starts a daemon.
 4. Show the output to the user.
 
 ---
