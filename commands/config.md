@@ -413,7 +413,7 @@ Location: `.claude/claudeclaw/settings.json`
 | `heartbeat.excludeWindows[].start` | string | Window start time in `HH:MM` 24h format       |
 | `heartbeat.excludeWindows[].end`   | string | Window end time in `HH:MM` 24h format         |
 | `heartbeat.forwardWhenSilent`      | boolean | Ping even when a heartbeat run found nothing (default `false`; old name `forwardToTelegram` still read) |
-| `heartbeat.silentTargets`          | string[] | Who receives that ping. Empty (default) = nobody. `"all"`, a platform name, `"<platform>:<id>"`, or a contacts-book name |
+| `heartbeat.silentTargets`          | string[] | Who receives that ping. Empty (default) = nobody. `"all"`, a platform name (`telegram`/`discord`/`slack`), `"<platform>:<id>"`, or a contacts-book name. LINE has no broadcast: bare `"line"` and `"all"` do NOT reach LINE — use an explicit `"line:<id>"` target instead |
 | `telegram.token`           | string     | Bot token from @BotFather                      |
 | `telegram.allowedUserIds`  | number[]   | Telegram user IDs allowed to interact          |
 | `security.level`           | string     | `locked` \| `strict` \| `moderate` \| `unrestricted` |

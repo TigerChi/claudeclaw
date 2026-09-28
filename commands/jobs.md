@@ -31,8 +31,9 @@ Create a new cron job interactively.
    - "What prompt should Claude execute?" (header: "Prompt", options: suggest 2-3 prompts relevant to the project context)
 
 3. Optionally ask which channel(s) the job should notify:
-   - "Where should results be sent?" (header: "Channels", options: "All enabled (default)", "telegram", "slack", "line", "discord", "Multiple — let me specify")
-   - For "Multiple", accept a comma-separated list (e.g. `line,slack`).
+   - "Where should results be sent?" (header: "Channels", options: "All enabled (default)", "telegram", "slack", "discord", "Multiple — let me specify")
+   - For "Multiple", accept a comma-separated list (e.g. `slack,telegram`).
+   - LINE is not a broadcast channel — for LINE delivery, have the job emit a `[notify:line:<id>]` directive instead (see channels note below).
 
 4. Create the job file at `.claude/claudeclaw/jobs/<name>.md` with this exact format:
    ```markdown
@@ -92,12 +93,14 @@ Jobs live in `.claude/claudeclaw/jobs/` as markdown files:
 ---
 schedule: "0 9 * * *"
 recurring: true
-channels: line,slack
+channels: slack
 ---
 Your prompt here. Claude will run this at the scheduled time.
 ```
 
-**`channels`**: comma-separated list of `telegram`, `discord`, `slack`, `line`. Omit (or `all`) to broadcast to every enabled channel — the legacy default. Use this to keep noisy jobs out of channels they don't belong in.
+**`channels`**: comma-separated list of `telegram`, `discord`, `slack`. Omit (or `all`) to broadcast to every enabled channel — the legacy default. Use this to keep noisy jobs out of channels they don't belong in.
+
+> **LINE is not a broadcast channel.** LINE has no `channels`/broadcast delivery — a job cannot fan a run out to LINE users. To send job output to LINE, emit a `[notify:line:<id>]…[/notify]` directive from the job's output (see targeted delivery below).
 
 **Targeted delivery**: if the job's *output* contains `[notify:<target>]message[/notify]` directives, ONLY those targets receive messages for that run — the `channels`/`slackTarget` broadcast is skipped. Targets resolve against the shared contacts book; see `docs/NOTIFY.md`. Use this when a job should message one person or one group instead of broadcasting.
 

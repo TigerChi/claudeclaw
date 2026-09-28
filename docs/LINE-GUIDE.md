@@ -483,6 +483,24 @@ chatlog/
 
 設了 `stt.baseUrl` 即用外部 API 取代本機 Whisper，支援 m4a 直送、免 ffmpeg。
 
+### 9.4 未喚醒語音的背景轉錄
+
+§9.1 是「語音**喚醒** Agent」的同步路徑：轉完文字直接進當次 prompt。但在 `requireMention` 群組裡，語音帶不了 @mention、不會喚醒 Agent（§7.2）。這類語音改走**背景非同步轉錄**：
+
+```
+未喚醒的語音 → 下載 m4a（gating：該對話 chatLog 開才做）
+            → 旁聽緩衝先記佔位  [語音轉文字 轉錄中…] (檔案: …)
+            → 背景啟動 Whisper（不阻塞 handleMessageEvent）
+            → 完成：append 一筆 chatLog transcript entry（refId 連回原語音）
+```
+
+- **登記表**：以 message id 為 key，狀態 `pending | done | failed`，喚醒路徑與背景路徑共用同一份工作，不重複轉錄。
+- **要用才等**：Agent 之後被喚醒、組 prompt 時，若這次 drain 出來的旁聽視窗內剛好有語音仍 `pending` → 最多等 `TRANSCRIBE_WAIT_MS`（15 秒）；逾時就先放「轉錄中」佔位（逐字稿仍會補進 chatLog）。視窗內沒有 pending 語音 → 完全不等。
+- **標記**：逐字稿一律前綴 `[語音轉文字]`，並以獨立的 `kind:"transcript"` entry 存放（append-only，不改寫原始語音 entry）。目的是讓 reader / LLM 知道這是機器轉錄、可能有誤，可再校正。
+- 被喚醒的正常語音路徑（§9.1）**同樣**會把逐字稿補寫進 chatLog，兩條路徑一致。
+
+> 圖片 / 影片 / 檔案的未喚醒捕捉見 §6.1 註記（同 gating，但不轉錄，只落地 + 在旁聽緩衝記檔名）。
+
 ---
 
 ## 10. 對話速度與自動壓縮
