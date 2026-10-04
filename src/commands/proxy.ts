@@ -4,12 +4,13 @@
  * Shared proxy server that auto-discovers all Claude Code agents,
  * reads their LINE settings, and routes webhooks by path to each agent's internal port.
  *
- * Discovery: reads ~/.claude/projects/ session data to find agent working directories.
- * No manual agent registration needed.
+ * Discovery: reads the global daemon registry (~/.claude/claudeclaw/daemons/),
+ * which each daemon writes on start. No manual agent registration needed.
  */
 
 import { join, basename } from "node:path";
-import { readFileSync, existsSync, readdirSync, statSync, unlinkSync } from "node:fs";
+import { readFileSync, existsSync, unlinkSync } from "node:fs";
+import { listRegisteredDaemons } from "../daemon-registry";
 
 // --- Types ---
 
@@ -71,64 +72,14 @@ let healthTimer: ReturnType<typeof setInterval> | null = null;
 // --- Auto-discovery ---
 
 /**
- * Discover all Claude Code agent directories by reading session data
- * from ~/.claude/projects/. Each project's jsonl files contain "cwd" fields
- * with the real working directory path.
+ * Agent working directories, from the global daemon registry. Each entry is a
+ * ~100-byte file, so this is cheap to poll. (Previously this re-read every
+ * project's newest session transcript in full on each reload, which bloated
+ * the process to multiple GB.)
  */
-function discoverAgentDirectories(): string[] {
-  const projectsRoot = join(HOME, ".claude", "projects");
-  if (!existsSync(projectsRoot)) return [];
-
-  const found = new Set<string>();
-
-  try {
-    const projectDirs = readdirSync(projectsRoot, { withFileTypes: true });
-
-    for (const projEntry of projectDirs) {
-      if (!projEntry.isDirectory()) continue;
-      const projPath = join(projectsRoot, projEntry.name);
-
-      try {
-        const files = readdirSync(projPath)
-          .filter((f) => f.endsWith(".jsonl"))
-          .map((f) => ({
-            name: f,
-            mtime: statSync(join(projPath, f)).mtimeMs,
-          }))
-          .sort((a, b) => b.mtime - a.mtime);
-
-        if (files.length === 0) continue;
-
-        const content = readFileSync(join(projPath, files[0].name), "utf8");
-        const cwds = new Set<string>();
-
-        for (const line of content.split("\n")) {
-          if (!line.trim()) continue;
-          const match = line.match(/"cwd":"([^"]+)"/);
-          if (match) cwds.add(match[1]);
-        }
-
-        for (const cwd of cwds) {
-          if (
-            cwd.includes("plugins/cache") ||
-            cwd.includes("plugins/marketplaces") ||
-            cwd.includes(".claude/")
-          ) continue;
-
-          const settingsPath = join(cwd, ".claude", "claudeclaw", "settings.json");
-          if (existsSync(settingsPath)) {
-            found.add(cwd);
-          }
-        }
-      } catch {
-        // skip unreadable project directories
-      }
-    }
-  } catch {
-    // projects root unreadable
-  }
-
-  return [...found];
+async function discoverAgentDirectories(): Promise<string[]> {
+  const entries = await listRegisteredDaemons();
+  return entries.map((e) => e.path);
 }
 
 function readAgentLineConfig(agentDir: string) {
@@ -148,8 +99,8 @@ function readAgentLineConfig(agentDir: string) {
   }
 }
 
-function discoverAgents(): DiscoveredAgent[] {
-  const dirs = discoverAgentDirectories();
+async function discoverAgents(): Promise<DiscoveredAgent[]> {
+  const dirs = await discoverAgentDirectories();
   const result: DiscoveredAgent[] = [];
 
   for (const dir of dirs) {
@@ -347,9 +298,9 @@ function startProxyServer(port: number, bind: string): void {
 
 // --- Reload ---
 
-function reload(externalPort: number): void {
+async function reload(externalPort: number): Promise<void> {
   const prev = new Set(agents.filter((a) => a.hasLineToken).map((a) => `${a.webhookPath}→${a.internalPort}`));
-  agents = discoverAgents();
+  agents = await discoverAgents();
   const curr = new Set(agents.filter((a) => a.hasLineToken).map((a) => `${a.webhookPath}→${a.internalPort}`));
 
   const added = [...curr].filter((p) => !prev.has(p));
@@ -412,7 +363,7 @@ export async function proxyStatus(): Promise<void> {
   } else {
     console.log("LINE Proxy is NOT running");
   }
-  agents = discoverAgents();
+  agents = await discoverAgents();
   await updateAllHealth();
   printStatus(config.port, config.bind);
   console.log(`  Config: ${existsSync(CONFIG_PATH) ? CONFIG_PATH : "(using defaults, create proxy-config.json to customize)"}`);
@@ -450,7 +401,7 @@ export async function proxyStart(args: string[] = []): Promise<void> {
     return;
   }
 
-  agents = discoverAgents();
+  agents = await discoverAgents();
 
   const warnings = detectConflicts(agents, port);
   if (warnings.length > 0) {
@@ -469,7 +420,7 @@ export async function proxyStart(args: string[] = []): Promise<void> {
   await updateAllHealth();
   printStatus(port, bind);
 
-  reloadTimer = setInterval(() => reload(port), RELOAD_INTERVAL_MS);
+  reloadTimer = setInterval(() => void reload(port), RELOAD_INTERVAL_MS);
   healthTimer = setInterval(() => updateAllHealth(), HEALTH_CHECK_INTERVAL_MS);
 
   const shutdown = () => {
