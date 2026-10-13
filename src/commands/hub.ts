@@ -4,6 +4,7 @@ import { homedir } from "os";
 import { fileURLToPath } from "url";
 import { createInterface } from "readline";
 import { startHubServer } from "../hub/server";
+import { startSlackWatchdog } from "../hub/watchdog";
 import { isProxyRunning, readProxyPid } from "./proxy";
 import {
   HUB_LOG_FILE,
@@ -259,7 +260,10 @@ async function cmdStart(args: string[]) {
   const handle = startHubServer({ host: finalHost, port: finalPort });
   await writeHubPid(process.pid, handle.port);
 
+  const stopWatchdog = startSlackWatchdog();
+
   const shutdown = async () => {
+    stopWatchdog();
     handle.stop();
     await cleanupHubPid();
     process.exit(0);

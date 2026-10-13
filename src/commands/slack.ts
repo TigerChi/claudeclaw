@@ -1,4 +1,4 @@
-import { ensureProjectClaudeMd, runUserMessage, streamUserMessage, compactCurrentSession, cancelThread } from "../runner";
+import { ensureProjectClaudeMd, runUserMessage, streamUserMessage, compactCurrentSession, cancelThread, inflightCount } from "../runner";
 import { isCancelCommand, CANCEL_CONFIRM_MESSAGE, CANCEL_NOTHING_MESSAGE } from "../cancel";
 import { getSettings, loadSettings } from "../config";
 import { recordSeen, harvestAgentName, getNotifyDispatcher } from "../contacts";
@@ -7,7 +7,7 @@ import { listThreadSessions, peekThreadSession } from "../sessionManager";
 import { transcribeAudioToText } from "../whisper";
 import { resolveSkillPrompt } from "../skills";
 import { sendToAgent, listAgents as listBusAgents } from "../agent-bus";
-import { mkdir } from "node:fs/promises";
+import { appendFile, mkdir } from "node:fs/promises";
 import { extname, join } from "node:path";
 import { existsSync } from "node:fs";
 
@@ -174,6 +174,8 @@ let proactiveTimer: ReturnType<typeof setTimeout> | null = null;
 // Health tracking
 let lastEventAt = 0;
 let connectionCount = 0;
+/** Last WebSocket pong (or server ping) — proves the socket itself is alive. */
+let lastPongAt = 0;
 
 // --- Listener health / alerting (issue #4, 2026-08-10) ---
 //
@@ -242,6 +244,11 @@ async function writeHealth(detail?: string): Promise<void> {
       since: healthSince,
       lastConnectedAt,
       lastEventAt,
+      lastPongAt,
+      // Tells the hub watchdog this daemon refreshes the file every ping tick,
+      // so a stale updatedAt means the daemon is wedged (older builds don't).
+      pingEnabled: true,
+      busy: inflightCount() > 0,
       connectionCount,
       disconnectsInWindow: recentDisconnects.length,
       detail: detail ?? null,
@@ -250,12 +257,35 @@ async function writeHealth(detail?: string): Promise<void> {
   } catch { /* health reporting must never break the socket loop */ }
 }
 
+const RECOVERY_LOG = join(process.cwd(), ".claude", "claudeclaw", "slack-recovery.jsonl");
+
+/** Append a self-recovery event (ping timeout etc.) for later review. */
+export async function logRecoveryEvent(event: Record<string, unknown>): Promise<void> {
+  try {
+    await appendFile(RECOVERY_LOG, JSON.stringify({ at: new Date().toISOString(), ...event }) + "\n");
+  } catch { /* never break the socket loop over logging */ }
+}
+
+/**
+ * Refresh the health file every 30s whatever the socket is doing (connected,
+ * backing off, waiting out too_many_websockets), so the hub can tell a live
+ * daemon from a wedged one by updatedAt alone.
+ */
+let healthHeartbeat: ReturnType<typeof setInterval> | null = null;
+let healthDetail: string | undefined;
+
 function setHealth(state: SlackHealthState, detail?: string): void {
   if (healthState !== state) {
     healthState = state;
     healthSince = Date.now();
   }
+  healthDetail = detail;
   void writeHealth(detail);
+  if (state === "stopped") {
+    if (healthHeartbeat) { clearInterval(healthHeartbeat); healthHeartbeat = null; }
+  } else if (!healthHeartbeat) {
+    healthHeartbeat = setInterval(() => void writeHealth(healthDetail), PING_INTERVAL_MS);
+  }
 }
 
 /**
@@ -1944,6 +1974,17 @@ const PROACTIVE_RECONNECT_MS = 29 * 60 * 1000; // 29 min — before Slack's 30-m
 const SOCKET_HARD_DEADLINE_MS = PROACTIVE_RECONNECT_MS + 2 * 60_000; // 31 min
 const WATCHDOG_CLOSE_CODE = 4999;
 
+/**
+ * Liveness ping. A half-open socket (NAT drop, laptop sleep, Slack-side reset
+ * with no FIN) shows no error and no close — before this, only the 31-min hard
+ * deadline caught it, and every message in between was lost. We ping every
+ * 30s; any pong, server ping, or payload counts as proof of life. Nothing for
+ * 75s (two missed pings plus slack) → abandon the socket and reconnect.
+ */
+const PING_INTERVAL_MS = 30_000;
+const PING_DEAD_AFTER_MS = 75_000;
+const PING_CLOSE_CODE = 4998;
+
 /** Fetch a fresh Socket Mode WebSocket URL from Slack. */
 async function fetchSocketUrl(appToken: string): Promise<string> {
   const res = await fetch(`${SLACK_API}/apps.connections.open`, {
@@ -1990,6 +2031,8 @@ function openSocket(url: string, appToken: string, signal: AbortSignal): Promise
     const self = ws;
     let resolved = false;
     let hardDeadlineTimer: ReturnType<typeof setTimeout> | null = null;
+    let pingTimer: ReturnType<typeof setInterval> | null = null;
+    let lastAliveAt = openedAt;
 
     const resolveOnce = (value: { event: "close" | "error"; code?: number; reason?: string; error?: unknown; openedAt?: number }) => {
       if (resolved) return;
@@ -1997,6 +2040,7 @@ function openSocket(url: string, appToken: string, signal: AbortSignal): Promise
       // Clean up proactive timer
       if (proactiveTimer) { clearTimeout(proactiveTimer); proactiveTimer = null; }
       if (hardDeadlineTimer) { clearTimeout(hardDeadlineTimer); hardDeadlineTimer = null; }
+      if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
       signal.removeEventListener("abort", onAbort);
       resolve(value);
     };
@@ -2019,16 +2063,48 @@ function openSocket(url: string, appToken: string, signal: AbortSignal): Promise
       resolveOnce({ event: "close", code: WATCHDOG_CLOSE_CODE, reason: "watchdog-timeout", openedAt });
     }, SOCKET_HARD_DEADLINE_MS);
 
+    const markAlive = () => {
+      lastAliveAt = Date.now();
+      lastPongAt = lastAliveAt;
+    };
+    self.addEventListener("pong", markAlive);
+    self.addEventListener("ping", markAlive);
+
     ws.onopen = () => {
       connectionCount++;
       lastEventAt = Date.now();
       lastConnectedAt = lastEventAt;
+      lastAliveAt = lastEventAt;
       setHealth("connected");
       debugLog(`WebSocket opened (connection #${connectionCount})`);
+
+      pingTimer = setInterval(() => {
+        if (resolved || signal.aborted) return;
+        const silentMs = Date.now() - lastAliveAt;
+        if (silentMs > PING_DEAD_AFTER_MS) {
+          const silentSec = Math.round(silentMs / 1000);
+          console.error(`[Slack] Ping: no pong for ${silentSec}s — socket is dead, reconnecting`);
+          void logRecoveryEvent({
+            type: "ping-timeout",
+            silentSec,
+            socketAgeSec: Math.round((Date.now() - openedAt) / 1000),
+            busy: inflightCount() > 0,
+          });
+          self.onclose = null;
+          self.onerror = null;
+          self.onmessage = null;
+          try { self.close(PING_CLOSE_CODE, "ping-timeout"); } catch { /* best-effort */ }
+          if (ws === self) ws = null;
+          resolveOnce({ event: "close", code: PING_CLOSE_CODE, reason: "ping-timeout", openedAt });
+          return;
+        }
+        try { (self as any).ping(); } catch { /* next tick decides */ }
+      }, PING_INTERVAL_MS);
     };
 
     ws.onmessage = (event) => {
       lastEventAt = Date.now();
+      lastAliveAt = lastEventAt;
       const raw = String(event.data);
       const currentWs = ws;
       const sendAck = (envelopeId: string, payload?: unknown) => {
@@ -2162,6 +2238,9 @@ async function socketLoop(appToken: string, signal: AbortSignal): Promise<Socket
       if (isTooManyWs) {
         const delayMs = 5 * 60_000 + Math.round(Math.random() * 60_000); // 5–6 min
         console.log(`[Slack] too_many_websockets — Slack server still has a stale slot, waiting ${Math.round(delayMs / 1000)}s before retry (no attempt counter)`);
+        // The hub watchdog must not restart us for this — a restart only adds
+        // another socket while Slack still holds the stale one.
+        setHealth("reconnecting", "too_many_websockets");
         // Wait for previous ws to fully close before next attempt
         await waitForWsClosed();
         try { await sleepWithAbort(delayMs, signal); } catch { break; }

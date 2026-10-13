@@ -131,6 +131,11 @@ export function cancelThread(threadId?: string): boolean {
   return true;
 }
 
+/** Number of Claude runs currently in-flight across all keys. */
+export function inflightCount(): number {
+  return inflightAborts.size;
+}
+
 /** Whether a Claude run is currently in-flight for the given key. */
 export function isInflight(threadId?: string): boolean {
   return inflightAborts.has(threadId ?? "global");
