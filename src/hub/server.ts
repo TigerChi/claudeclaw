@@ -24,6 +24,7 @@ export interface HubServerHandle {
 
 const PROXY_PREFIX = "/api/agents/";
 const PROXY_INFIX = "/proxy/";
+const PROXY_TIMEOUT_MS = 5000;
 
 type BunServerHandle = ReturnType<typeof Bun.serve>;
 
@@ -114,10 +115,20 @@ async function proxyToAgent(
     init.duplex = "half";
   }
 
+  // Bounded so a wedged daemon can't hang the dashboard (and the browser's
+  // 5s poll) forever. Plenty for the JSON endpoints the hub page reads.
+  init.signal = AbortSignal.timeout(PROXY_TIMEOUT_MS);
+
   let upstream: Response;
   try {
     upstream = await fetch(targetUrl, init);
   } catch (err) {
+    if ((err as Error)?.name === "TimeoutError") {
+      return new Response(
+        JSON.stringify({ error: `agent daemon did not respond within ${PROXY_TIMEOUT_MS / 1000}s` }),
+        { status: 504, headers: { "Content-Type": "application/json; charset=utf-8" } },
+      );
+    }
     return serverError(`proxy failed: ${String(err)}`);
   }
 

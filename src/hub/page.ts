@@ -219,6 +219,7 @@ export function hubPage(): string {
         method: opts.method || "GET",
         headers: Object.assign({}, authHeaders(), opts.headers || {}),
         body: opts.body,
+        signal: opts.timeoutMs ? AbortSignal.timeout(opts.timeoutMs) : undefined,
       });
       if (res.status === 401) {
         state.token = "";
@@ -255,17 +256,29 @@ export function hubPage(): string {
         render();
         return;
       }
+      // Toolbar (Restart/Stop) must never wait on the daemon: paint it from
+      // the hub's own record first, then fill in daemon details if it answers.
+      if (!state.detail || !state.detail.agent || state.detail.agent.id !== agent.id) {
+        state.detail = { agent, state: null, jobs: null, loading: true };
+        render();
+      }
+      let next;
       try {
         const [stateRes, jobsRes] = await Promise.all([
-          api("/api/agents/" + agent.id + "/proxy/api/state"),
-          api("/api/agents/" + agent.id + "/proxy/api/jobs"),
+          api("/api/agents/" + agent.id + "/proxy/api/state", { timeoutMs: 6000 }),
+          api("/api/agents/" + agent.id + "/proxy/api/jobs", { timeoutMs: 6000 }),
         ]);
         const stateData = stateRes.ok ? await stateRes.json() : null;
         const jobsData = jobsRes.ok ? await jobsRes.json() : null;
-        state.detail = { agent, state: stateData, jobs: jobsData };
+        next = { agent, state: stateData, jobs: jobsData,
+          error: stateRes.ok ? null : "Daemon did not respond (HTTP " + stateRes.status + ")" };
       } catch (e) {
-        state.detail = { agent, state: null, jobs: null, error: String(e) };
+        next = { agent, state: null, jobs: null,
+          error: e && e.name === "TimeoutError" ? "Daemon did not respond in time" : String(e) };
       }
+      // The user may have clicked another agent while this was in flight.
+      if (state.selectedId !== agent.id) return;
+      state.detail = next;
       render();
     }
 
@@ -592,6 +605,11 @@ export function hubPage(): string {
           detail += '<div class="panel"><h3>Cron Jobs (' + jobs.jobs.length + ')</h3>' + jobRows + '</div>';
         }
 
+        if (agent.alive && state.detail.loading) {
+          detail += '<div class="panel"><h3>Notice</h3><div class="row"><div class="value">Loading daemon status…</div></div></div>';
+        } else if (agent.alive && state.detail.error) {
+          detail += '<div class="panel"><h3>Notice</h3><div class="row"><div class="value">⚠️ ' + escapeAttr(state.detail.error) + ' — the process exists but is not answering. Click Restart to recover it.</div></div></div>';
+        }
         if (!agent.alive) {
           detail += '<div class="panel"><h3>Notice</h3><div class="row"><div class="value">Daemon is stopped. Click Start to spawn it detached.</div></div></div>';
         }
