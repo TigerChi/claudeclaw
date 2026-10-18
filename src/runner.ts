@@ -989,7 +989,9 @@ async function streamClaude(
     }
   };
 
-  try {
+  /** One pass over the SDK stream. Factored out so a stale --resume can be
+   *  replayed on a fresh session (see the catch below). */
+  const consumeConversation = async (): Promise<void> => {
     const conversation = sdkQuery({ prompt, options: sdkOptions as any });
 
     for await (const message of conversation) {
@@ -1048,6 +1050,10 @@ async function streamClaude(
         maybeUnblock();
       }
     }
+  };
+
+  try {
+    await consumeConversation();
   } catch (err) {
     // The SDK reports any abort as "aborted by user" — distinguish our own timeout.
     if (timedOut) {
@@ -1056,7 +1062,27 @@ async function streamClaude(
           `Raise "sessionTimeoutMs" in settings.json, or split the task into smaller requests.`,
       );
     }
-    throw err;
+
+    // --- Stale session recovery (mirrors execClaudeImpl) ---
+    // Claude Code drops a conversation once its transcript is pruned (default
+    // cleanupPeriodDays: 30) or deleted. Resuming it then fails every time and
+    // sessions.json keeps pointing at the dead id, so the thread stays bricked
+    // for good. Forget it and replay this turn on a fresh session.
+    const errText = err instanceof Error ? err.message : String(err);
+    if (existing && isStaleSessionError(errText) && !abortController.signal.aborted) {
+      console.warn(
+        `[${new Date().toLocaleTimeString()}] Session ${existing.sessionId.slice(0, 8)} no longer exists; starting a new one.`,
+      );
+      if (threadId) await removeThreadSession(threadId);
+      else await resetSession();
+
+      delete sdkOptions.resume;
+      sessionCaptured = false;
+      accumulatedText = "";
+      await consumeConversation();
+    } else {
+      throw err;
+    }
   } finally {
     if (timeoutId) clearTimeout(timeoutId);
     clearInflight(cancelKey, abortController);
