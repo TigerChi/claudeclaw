@@ -2,6 +2,7 @@ import { ensureProjectClaudeMd, run, runUserMessage, compactCurrentSession, canc
 import { isCancelCommand, CANCEL_CONFIRM_MESSAGE, CANCEL_NOTHING_MESSAGE } from "../cancel";
 import { getSettings, loadSettings } from "../config";
 import { recordSeen, harvestAgentName } from "../contacts";
+import { guardOutgoing, EGRESS_BLOCKED_REPLY } from "../egressGuard";
 import { resetSession, peekSession } from "../sessions";
 import { listThreadSessions, removeThreadSession, peekThreadSession } from "../sessionManager";
 import { readFile } from "node:fs/promises";
@@ -712,7 +713,19 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
           console.error(`[Discord] Failed to send reaction for ${label}: ${err instanceof Error ? err.message : err}`);
         });
       }
-      await sendMessage(config.token, channelId, cleanedText || "(empty response)");
+      if (
+        await guardOutgoing({
+          platform: "discord",
+          text: cleanedText,
+          adminUserId: config.adminUserId,
+          dmAdmin: (id, body) => sendMessageToUser(config.token, id, body),
+          context: channelId,
+        })
+      ) {
+        await sendMessage(config.token, channelId, EGRESS_BLOCKED_REPLY);
+      } else {
+        await sendMessage(config.token, channelId, cleanedText || "(empty response)");
+      }
     }
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);

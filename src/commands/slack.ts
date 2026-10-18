@@ -2,6 +2,7 @@ import { ensureProjectClaudeMd, runUserMessage, streamUserMessage, dispatchAgent
 import { isCancelCommand, CANCEL_CONFIRM_MESSAGE, CANCEL_NOTHING_MESSAGE } from "../cancel";
 import { getSettings, loadSettings } from "../config";
 import { recordSeen, harvestAgentName, getNotifyDispatcher } from "../contacts";
+import { guardOutgoing, EGRESS_BLOCKED_REPLY } from "../egressGuard";
 import { resetSession, peekSession } from "../sessions";
 import { listThreadSessions, peekThreadSession } from "../sessionManager";
 import { transcribeAudioToText } from "../whisper";
@@ -1564,7 +1565,21 @@ async function handleMessage(event: SlackMessage): Promise<void> {
       // Finalize response — guarantee delivery (chunked fallback if the live edit
       // fails or the body is too long), or replace with Block Kit.
       if (finalText) {
-        if (buttons || select) {
+        if (
+          await guardOutgoing({
+            platform: "slack",
+            text: finalText,
+            adminUserId: config.adminUserId,
+            dmAdmin: (id, body) => sendMessageToUser(config.botToken, id, body),
+            context: channelId,
+          })
+        ) {
+          // Residual internal directive — withhold the whole reply (incl. any
+          // buttons) and show only the harmless notice.
+          if (streamMsgTs) await deleteMessage(config.botToken, channelId, streamMsgTs);
+          const sentTs = await sendMessage(config.botToken, channelId, EGRESS_BLOCKED_REPLY, replyThreadTs);
+          if (sentTs) lastBotMessageTs.set(msgKey, sentTs);
+        } else if (buttons || select) {
           // Block Kit needs a fresh message; remove streaming message
           if (streamMsgTs) await deleteMessage(config.botToken, channelId, streamMsgTs);
           const sentTs = await sendBlockKitMessage(config.botToken, channelId, finalText, buttons, select, replyThreadTs);
@@ -1747,7 +1762,19 @@ async function handleBlockAction(payload: any): Promise<void> {
 
     if (finalText) {
       const msgKey = botMessageKey(channelId, replyThreadTs);
-      if (buttons || select) {
+      if (
+        await guardOutgoing({
+          platform: "slack",
+          text: finalText,
+          adminUserId: config.adminUserId,
+          dmAdmin: (id, body) => sendMessageToUser(config.botToken, id, body),
+          context: channelId,
+        })
+      ) {
+        if (streamMsgTs) await deleteMessage(config.botToken, channelId, streamMsgTs);
+        const sentTs = await sendMessage(config.botToken, channelId, EGRESS_BLOCKED_REPLY, replyThreadTs);
+        if (sentTs) lastBotMessageTs.set(msgKey, sentTs);
+      } else if (buttons || select) {
         if (streamMsgTs) await deleteMessage(config.botToken, channelId, streamMsgTs);
         const sentTs = await sendBlockKitMessage(config.botToken, channelId, finalText, buttons, select, replyThreadTs);
         if (sentTs) lastBotMessageTs.set(msgKey, sentTs);

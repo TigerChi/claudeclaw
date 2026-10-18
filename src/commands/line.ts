@@ -2,6 +2,7 @@ import { ensureProjectClaudeMd, runUserMessage, cancelThread } from "../runner";
 import { isCancelCommand, CANCEL_CONFIRM_MESSAGE, CANCEL_NOTHING_MESSAGE } from "../cancel";
 import { addLineAllowedUser, getSettings, loadSettings } from "../config";
 import { recordSeen, harvestAgentName, recordDeadLetter } from "../contacts";
+import { guardOutgoing, EGRESS_BLOCKED_REPLY } from "../egressGuard";
 import {
   appendChatLog,
   conversationDirPath,
@@ -1159,10 +1160,22 @@ async function handleMessageEvent(event: LineMessageEvent): Promise<void> {
         event.replyToken,
       );
     } else if (result.stdout) {
-      await sendText(chatId, result.stdout, event.replyToken);
-      // Log what we said too, so reading the transcript back shows a dialogue
-      // rather than a one-sided list of what everyone else said.
-      await logOutbound(event.source, result.stdout);
+      if (
+        await guardOutgoing({
+          platform: "line",
+          text: result.stdout,
+          adminUserId: config.adminUserId,
+          dmAdmin: (id, body) => sendMessageToUser(id, body),
+          context: chatId,
+        })
+      ) {
+        await sendText(chatId, EGRESS_BLOCKED_REPLY, event.replyToken);
+      } else {
+        await sendText(chatId, result.stdout, event.replyToken);
+        // Log what we said too, so reading the transcript back shows a dialogue
+        // rather than a one-sided list of what everyone else said.
+        await logOutbound(event.source, result.stdout);
+      }
     }
   } catch (err) {
     stopLoadingAnimation(chatId);
@@ -1197,7 +1210,19 @@ async function handlePostbackEvent(event: LinePostbackEvent): Promise<void> {
   stopLoadingAnimation(chatId);
 
   if (result.exitCode === 0 && result.stdout) {
-    await sendText(chatId, result.stdout, event.replyToken);
+    if (
+      await guardOutgoing({
+        platform: "line",
+        text: result.stdout,
+        adminUserId: config.adminUserId,
+        dmAdmin: (id, body) => sendMessageToUser(id, body),
+        context: chatId,
+      })
+    ) {
+      await sendText(chatId, EGRESS_BLOCKED_REPLY, event.replyToken);
+    } else {
+      await sendText(chatId, result.stdout, event.replyToken);
+    }
   } else if (result.exitCode !== 0) {
     await sendText(chatId, `Error: ${result.stderr || "Unknown"}`, event.replyToken);
   }
