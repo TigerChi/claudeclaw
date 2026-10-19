@@ -5,7 +5,15 @@ import { spawnSync } from "bun";
 
 const ENV_FILENAMES = ["_claude/agent.env"];
 
-const LEAKY_GLOBAL_KEYS = ["OP_SERVICE_ACCOUNT_TOKEN"];
+/**
+ * Keys only the daemon process itself may hold. They are never inherited from a
+ * parent env, and never handed to a spawned Claude child — the agent (or a chat
+ * message that talks it into running `env`) has no business seeing them. The
+ * hub → daemon spawn still layers the agent's own value back in from agent.env.
+ */
+export const DAEMON_ONLY_KEYS = ["CLAUDECLAW_INBOUND_TOKEN"];
+
+const LEAKY_GLOBAL_KEYS = ["OP_SERVICE_ACCOUNT_TOKEN", ...DAEMON_ONLY_KEYS];
 
 /**
  * Directories that should always be on PATH for daemon-spawned children.
@@ -53,8 +61,18 @@ function findEnvFile(projectPath: string): string | null {
  *
  * Returns an empty object if no file exists or evaluation fails — callers
  * should treat absence as "no per-agent overrides".
+ *
+ * This is the env layered onto spawned Claude children, so DAEMON_ONLY_KEYS are
+ * dropped. Code running inside the daemon reads them via `loadAgentEnvRaw`.
  */
 export function loadAgentEnv(projectPath: string): Record<string, string> {
+  const env = loadAgentEnvRaw(projectPath);
+  for (const k of DAEMON_ONLY_KEYS) delete env[k];
+  return env;
+}
+
+/** `loadAgentEnv` including DAEMON_ONLY_KEYS — for the daemon itself only. */
+export function loadAgentEnvRaw(projectPath: string): Record<string, string> {
   const envFile = findEnvFile(projectPath);
   if (!envFile) return {};
 
@@ -123,7 +141,7 @@ export function buildAgentSpawnEnv(
 ): Record<string, string> {
   const merged: Record<string, string> = {
     ...withoutLeakyGlobals(parentEnv),
-    ...loadAgentEnv(projectPath),
+    ...loadAgentEnvRaw(projectPath),
     ...extras,
   };
   merged.PATH = ensurePathEntries(merged.PATH);

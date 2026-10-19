@@ -87,6 +87,7 @@ const DEFAULT_SETTINGS: Settings = {
     webhookPort: 3100,
     webhookPath: "/webhook",
   },
+  inbound: parseInbound(undefined),
   security: { level: "moderate", allowedTools: [], disallowedTools: [] },
   web: { enabled: false, host: "127.0.0.1", port: 4632 },
   stt: { baseUrl: "", model: "" },
@@ -280,6 +281,55 @@ export interface LineConfig {
   webhookPath: string;
 }
 
+/** How Agents Gateway chats map onto ClaudeClaw sessions:
+ *    "chat"   — every LINE chat gets its own session (`agw:<chatId>`; default).
+ *    "shared" — all of this agent's Gateway chats share one session (`agw:shared`),
+ *               so it remembers across groups. Never the agent's main session. */
+export type AgwSessionMode = "chat" | "shared";
+
+export interface AgentsGatewayInboundConfig {
+  /** Accept `POST /inbound/agents-gateway` (default true while `inbound` is on). */
+  enabled: boolean;
+  session: AgwSessionMode;
+  /** Per-chat overrides keyed by Gateway chat id. */
+  chats: Record<string, { session?: AgwSessionMode }>;
+  /** System events (join/leave/memberJoined/…): "ack" = record, answer nothing,
+   *  do not wake the agent (default); "agent" = hand them to the agent. */
+  systemEvents: "ack" | "agent";
+  /** Deliveries that cannot be replied to (reason=listen, chat.reply=false):
+   *  "log" = archive and show as context on the next woken turn (default);
+   *  "agent" = wake the agent anyway (it cannot speak there). */
+  listen: "log" | "agent";
+  chatLog: { enabled: boolean };
+}
+
+/** Local inbound endpoint: other programs on this machine (e.g. the Agents
+ *  Gateway bridge's `http` adapter) hand messages to this agent over
+ *  http://127.0.0.1:<port>/inbound/<source>. Requires CLAUDECLAW_INBOUND_TOKEN
+ *  (agent.env → _claude/.auth/inbound/token); callers send it as
+ *  `X-Bridge-Token` or `Authorization: Bearer`. */
+export interface InboundConfig {
+  enabled: boolean;
+  /** Fixed per agent — callers are configured with it, so it never auto-shifts. */
+  port: number;
+  /** Named callers, each with its own token file
+   *  `_claude/.auth/inbound/<name>.token` and the sources it may call
+   *  (omitted = all). The legacy CLAUDECLAW_INBOUND_TOKEN, when set, is an
+   *  extra caller "default" allowed every source. */
+  callers: Record<string, { sources?: string[] }>;
+  agentsGateway: AgentsGatewayInboundConfig;
+  message: MessageInboundConfig;
+}
+
+/** The generic `message` source: any local program posts
+ *  {id, conversation, sender, text, …} and gets the agent's reply back. */
+export interface MessageInboundConfig {
+  enabled: boolean;
+  /** "conversation" — one session per caller + conversation id (default);
+   *  "shared" — one session for every conversation of every caller. */
+  session: "conversation" | "shared";
+}
+
 export type SecurityLevel =
   | "locked"
   | "strict"
@@ -304,6 +354,7 @@ export interface Settings {
   discord: DiscordConfig;
   slack: SlackConfig;
   line: LineConfig;
+  inbound: InboundConfig;
   security: SecurityConfig;
   web: WebConfig;
   stt: SttConfig;
@@ -423,6 +474,47 @@ function parseWhisperConfig(raw: any): WhisperConfig {
     engine,
     model: typeof raw?.model === "string" && raw.model.trim() ? raw.model.trim() : "large-v3-turbo",
     language: typeof raw?.language === "string" ? raw.language.trim() : "",
+  };
+}
+
+// A function declaration (hoisted) because DEFAULT_SETTINGS at the top of the
+// file uses it; keep it free of module-level consts for the same reason.
+function parseInbound(raw: any): InboundConfig {
+  const session = (v: unknown): AgwSessionMode | undefined =>
+    v === "shared" ? "shared" : v === "chat" ? "chat" : undefined;
+  const agw = raw?.agentsGateway;
+  const chats: Record<string, { session?: AgwSessionMode }> = {};
+  if (agw?.chats && typeof agw.chats === "object" && !Array.isArray(agw.chats)) {
+    for (const [id, c] of Object.entries(agw.chats)) {
+      if (c && typeof c === "object") chats[id] = { session: session((c as Record<string, unknown>).session) };
+    }
+  }
+  const port = Number(raw?.port);
+  const callers: Record<string, { sources?: string[] }> = {};
+  if (raw?.callers && typeof raw.callers === "object" && !Array.isArray(raw.callers)) {
+    for (const [name, c] of Object.entries(raw.callers)) {
+      if (!/^[a-z0-9][a-z0-9-]{0,31}$/.test(name)) continue;
+      const src = (c as Record<string, unknown> | null)?.sources;
+      callers[name] = Array.isArray(src) ? { sources: src.filter((s): s is string => typeof s === "string") } : {};
+    }
+  }
+  const msg = raw?.message;
+  return {
+    enabled: raw?.enabled === true,
+    port: Number.isInteger(port) && port > 0 && port < 65536 ? port : 4710,
+    callers,
+    message: {
+      enabled: msg?.enabled !== false,
+      session: msg?.session === "shared" ? "shared" : "conversation",
+    },
+    agentsGateway: {
+      enabled: agw?.enabled !== false,
+      session: session(agw?.session) ?? "chat",
+      chats,
+      systemEvents: agw?.systemEvents === "agent" ? "agent" : "ack",
+      listen: agw?.listen === "agent" ? "agent" : "log",
+      chatLog: { enabled: typeof agw?.chatLog?.enabled === "boolean" ? agw.chatLog.enabled : true },
+    },
   };
 }
 
@@ -603,6 +695,7 @@ function parseSettings(raw: Record<string, any>): Settings {
         ? (raw.line.webhookPath.trim().startsWith("/") ? raw.line.webhookPath.trim() : `/${raw.line.webhookPath.trim()}`)
         : "/webhook",
     },
+    inbound: parseInbound(raw.inbound),
     security: {
       level,
       allowedTools: Array.isArray(raw.security?.allowedTools)

@@ -395,11 +395,13 @@ export async function start(args: string[] = []) {
   let discordStopGateway: (() => void) | null = null;
   let slackStop: (() => void | Promise<void>) | null = null;
   let lineStop: (() => void) | null = null;
+  let inboundStop: (() => void) | null = null;
 
   async function shutdown() {
     if (discordStopGateway) discordStopGateway();
     if (slackStop) await slackStop();
     if (lineStop) lineStop();
+    if (inboundStop) inboundStop();
     if (web) web.stop();
     // Agent Bus cleanup
     stopBusSocket();
@@ -540,6 +542,35 @@ export async function start(args: string[] = []) {
 
   await initLine(currentSettings.line.channelAccessToken);
   if (!lineAccessToken) console.log("  LINE: not configured");
+
+  // --- Local inbound endpoint (e.g. Agents Gateway bridge) ---
+  // Restarted when it is switched, its port moves, or its callers change
+  // (caller tokens are read at start).
+  let inboundRunning = "";
+  let inboundTried = "";
+
+  async function initInbound(cfg: Settings["inbound"]) {
+    const want = cfg.enabled ? `${cfg.port}:${JSON.stringify(cfg.callers)}` : "";
+    if (want === inboundRunning) return;
+    // A failed start (no token, port taken) is retried only after the settings change.
+    if (!inboundRunning && want === inboundTried) return;
+    inboundTried = want;
+    const { startInbound, stopInbound } = await import("../inbound/server");
+    if (inboundRunning) {
+      stopInbound();
+      inboundStop = null;
+      inboundRunning = "";
+      if (!want) console.log(`[${ts()}] Inbound: disabled`);
+    }
+    if (want && startInbound()) {
+      inboundStop = stopInbound;
+      inboundRunning = want;
+      console.log(`[${ts()}] Inbound: enabled on 127.0.0.1:${cfg.port}`);
+    }
+  }
+
+  await initInbound(currentSettings.inbound);
+  if (!inboundRunning) console.log("  Inbound: not configured");
 
   function isAddrInUse(err: unknown): boolean {
     if (!err || typeof err !== "object") return false;
@@ -1128,6 +1159,9 @@ export async function start(args: string[] = []) {
 
       // LINE changes
       await initLine(newSettings.line.channelAccessToken);
+
+      // Inbound endpoint changes (on/off, port, callers)
+      await initInbound(newSettings.inbound);
 
       // Agent Bus: check file inbox for offline messages
       if (currentSettings.agentBus.enabled && currentSettings.agentBus.name) {
