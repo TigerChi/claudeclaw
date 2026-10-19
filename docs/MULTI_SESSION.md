@@ -19,6 +19,10 @@ All four messaging platforms — LINE, Telegram, Slack, Discord — give each co
 | Discord | DM | `<channelId>` (DM channel id) | `src/commands/discord.ts` |
 | Discord | Known thread | `<channelId>` (thread channel id) | `src/commands/discord.ts` |
 | Discord | Guild top-level channel | *(none — global session)* | `src/commands/discord.ts` |
+| Agents Gateway | Group / room / DM (`session: "chat"`) | `line:group:<groupId>` / `line:room:<roomId>` / `line:dm:<userId>` — the native LINE keys, so a move to the Gateway keeps each chat's session | `src/inbound/agents-gateway.ts` |
+| Agents Gateway | Every chat of the agent (`session: "shared"`) | `agw:shared` | `src/inbound/agents-gateway.ts` |
+| Inbound `message` | Caller + conversation | `inbound:<caller>:<conversationId>` | `src/inbound/message.ts` |
+| Inbound `message` | Everything (`session: "shared"`) | `inbound:shared` | `src/inbound/message.ts` |
 
 **Consequence:** deleting `session.json` does **not** reset any of these conversations — it only affects heartbeat/cron and untracked Discord guild channels. Per-conversation state lives in `sessions.json`.
 

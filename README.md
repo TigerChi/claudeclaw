@@ -80,8 +80,12 @@ The setup wizard walks you through model, heartbeat, Telegram, Discord, and secu
 - **Slack:** DMs and channel mentions over Socket Mode. Supports thread sessions, file upload/download, Block Kit buttons, and message edit/delete.
 - **LINE:** DMs and group chats via Messaging API. Supports text/image/video/audio/file/sticker/location messages, group @mention gating, and per-stranger pairing-code self-enrollment.
 - **Time Awareness:** Message time prefixes help the agent understand delays and daily patterns.
+- **Agents Gateway (LINE):** Reach LINE groups and DMs through [Agents Gateway](https://agents-gateway.cloud) — outbound-only (no webhook URL, no tunnel), one LINE bot shared by several agents, routing and full history kept by the Gateway. The Gateway's bridge hands each delivery to the agent through the local inbound endpoint.
+- **Local inbound endpoint:** Other programs on the same machine hand a message to an agent at `http://127.0.0.1:<port>/inbound/message` and get the reply in the response — per-caller tokens restricted to the sources they may call, idempotent by message id.
 
 See [docs/LINE-GUIDE.md](docs/LINE-GUIDE.md) for the LINE setup walkthrough (channel access token, webhook URL, ngrok, multi-agent proxy, pairing code).
+
+See [docs/AGENTS-GATEWAY-GUIDE.md](docs/AGENTS-GATEWAY-GUIDE.md) for connecting an agent through Agents Gateway (bridge install, session modes, reading LINE history over MCP, moving from the native LINE channel), and [docs/INBOUND.md](docs/INBOUND.md) for the local inbound endpoint itself (HTTP contract, the generic `message` source, writing a new source).
 
 For the side-by-side access-control comparison across all four messaging platforms (allowlist, pairing, mention/reply triggers, listen channels, plus the roadmap for unifying them), see [docs/Channel_Guide.md](docs/Channel_Guide.md).
 

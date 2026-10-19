@@ -24,6 +24,8 @@ ClaudeClaw integrates four messaging platforms — **LINE, Telegram, Slack, Disc
 | **Time-window / quiet hours** | ✗ | ✗ | ✗ | ✗ |
 | **Per-user rate limit** | ✗ | ✗ | ✗ | ✗ |
 
+> **Agents Gateway** ([AGENTS-GATEWAY-GUIDE.md](AGENTS-GATEWAY-GUIDE.md)) is not a column here on purpose: for LINE chats reached through the Gateway, who may wake the agent — allowlist, mention-only, reply mode, listening — is configured in the Gateway, not in ClaudeClaw. ClaudeClaw only authenticates the local bridge that delivers the messages ([INBOUND.md §7](INBOUND.md#7-安全模型)).
+
 ---
 
 ## How "User Access" Works on Each Platform
