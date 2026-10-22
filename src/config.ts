@@ -300,6 +300,8 @@ export interface AgentsGatewayInboundConfig {
    *  "log" = archive and show as context on the next woken turn (default);
    *  "agent" = wake the agent anyway (it cannot speak there). */
   listen: "log" | "agent";
+  /** Local copy in chatlog/ (default off — the Gateway keeps the full history,
+   *  and a local copy of every chat is one more place another chat can read). */
   chatLog: { enabled: boolean };
 }
 
@@ -513,7 +515,7 @@ function parseInbound(raw: any): InboundConfig {
       chats,
       systemEvents: agw?.systemEvents === "agent" ? "agent" : "ack",
       listen: agw?.listen === "agent" ? "agent" : "log",
-      chatLog: { enabled: typeof agw?.chatLog?.enabled === "boolean" ? agw.chatLog.enabled : true },
+      chatLog: { enabled: agw?.chatLog?.enabled === true }, // off by default: the Gateway keeps the full history
     },
   };
 }

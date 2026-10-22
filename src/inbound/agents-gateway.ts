@@ -36,7 +36,10 @@ import type { InboundContext, InboundReply, InboundSource } from "./server";
 const STATE_DIR = join(process.cwd(), ".claude", "claudeclaw", "inbound");
 const STATE_FILE = join(STATE_DIR, "agents-gateway.json");
 const MEDIA_DIR = join(STATE_DIR, "media");
-const DIRECTIVES_PATH = join(import.meta.dir, "..", "..", "prompts", "agents-gateway", "DIRECTIVES.md");
+const PROMPTS = join(import.meta.dir, "..", "..", "prompts", "agents-gateway");
+const DIRECTIVES_PATH = join(PROMPTS, "DIRECTIVES.md");
+/** Added only to the shared session (session: "shared"). */
+const SHARED_DIRECTIVES_PATH = join(PROMPTS, "DIRECTIVES-SHARED.md");
 
 /** The bridge gives up after this many failed attempts (bridge loop.ts ADAPTER_MAX_ATTEMPTS). */
 const BRIDGE_MAX_ATTEMPTS = 3;
@@ -145,6 +148,8 @@ interface ChatRecord {
 interface SessionRecord {
   sessionId?: string;
   turn?: number;
+  /** Hash of the directives this session was last given (resent when they change). */
+  directivesHash?: string;
   /** chatId → hash of that chat's Gateway instructions last given in this session. */
   chats?: Record<string, string>;
 }
@@ -194,7 +199,7 @@ function saveJournal(): Promise<void> {
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-let directives: string | null = null;
+const directiveCache = new Map<string, string>();
 /** deliveryId → the run producing its reply text. */
 const inflight = new Map<string, Promise<string>>();
 
@@ -225,14 +230,24 @@ function threadFor(chat: Chat): string {
   return `agw:${chat.id}`;
 }
 
-async function loadDirectives(): Promise<string> {
-  if (directives !== null) return directives;
-  try {
-    directives = existsSync(DIRECTIVES_PATH) ? (await Bun.file(DIRECTIVES_PATH).text()).trim() : "";
-  } catch {
-    directives = "";
+/** The directives for a session: base, plus the shared-session part for `agw:shared`. Cached (restart to reload). */
+async function loadDirectives(threadId: string): Promise<string> {
+  const files = threadId === SHARED_THREAD ? [DIRECTIVES_PATH, SHARED_DIRECTIVES_PATH] : [DIRECTIVES_PATH];
+  const parts: string[] = [];
+  for (const f of files) {
+    if (!directiveCache.has(f)) {
+      let text = "";
+      try {
+        text = existsSync(f) ? (await Bun.file(f).text()).trim() : "";
+      } catch {
+        // missing or unreadable: send nothing for it
+      }
+      directiveCache.set(f, text);
+    }
+    const t = directiveCache.get(f)!;
+    if (t) parts.push(t);
   }
-  return directives;
+  return parts.join("\n\n");
 }
 
 /** HH:MM in the agent's configured timezone. */
@@ -331,7 +346,7 @@ async function downloadMedia(media: Media): Promise<string | null> {
  * session is new, was replaced or compacted, or has not yet seen this chat's
  * current instructions — not on every turn.
  */
-async function instructionBlock(b: Bundle, threadId: string, j: Journal): Promise<{ text: string; hash: string } | null> {
+async function instructionBlock(b: Bundle, threadId: string, j: Journal): Promise<{ text: string; hash: string; directivesHash: string } | null> {
   const chat = b.chat!;
   const stacked = (b.prompts?.stacked ?? "").trim();
   const meta = [
@@ -347,26 +362,29 @@ async function instructionBlock(b: Bundle, threadId: string, j: Journal): Promis
   const session = await peekThreadSession(threadId);
   const sessionFresh =
     !session || !rec || rec.sessionId !== session.sessionId || (session.turnCount ?? 0) < (rec.turn ?? 0); // counter reset ⇒ compacted
-  if (!sessionFresh && rec?.chats?.[chat.id] === hash) return null;
 
   const parts: string[] = [];
-  if (sessionFresh) {
-    const d = await loadDirectives();
-    if (d) parts.push(d);
-  }
+  const d = await loadDirectives(threadId);
+  const directivesHash = createHash("sha256").update(d).digest("hex").slice(0, 16);
+  const directivesChanged = sessionFresh || rec?.directivesHash !== directivesHash;
+  if (!directivesChanged && rec?.chats?.[chat.id] === hash) return null;
+  if (directivesChanged && d) parts.push(d);
   parts.push(block);
-  return { text: parts.join("\n\n"), hash };
+  return { text: parts.join("\n\n"), hash, directivesHash };
 }
 
 /** After a successful turn: remember what this session has been given. */
-async function recordInstructions(threadId: string, chatId: string, hash: string | null, j: Journal): Promise<void> {
+async function recordInstructions(threadId: string, chatId: string, inst: { hash: string; directivesHash: string } | null, j: Journal): Promise<void> {
   const session = await peekThreadSession(threadId);
   if (!session) return;
   const prev = j.sessions[threadId];
   const same = prev && prev.sessionId === session.sessionId;
   const rec: SessionRecord = same ? prev : { sessionId: session.sessionId, chats: {} };
   rec.turn = session.turnCount ?? 0;
-  if (hash) rec.chats = { ...(same ? rec.chats : {}), [chatId]: hash };
+  if (inst) {
+    rec.chats = { ...(same ? rec.chats : {}), [chatId]: inst.hash };
+    rec.directivesHash = inst.directivesHash;
+  }
   j.sessions[threadId] = rec;
 }
 
@@ -375,7 +393,7 @@ async function buildPrompt(
   threadId: string,
   j: Journal,
   local: { mediaPath: string | null; transcript: string | null },
-): Promise<{ prompt: string; hash: string | null }> {
+): Promise<{ prompt: string; inst: { hash: string; directivesHash: string } | null }> {
   const chat = b.chat!;
   const m = b.message!;
   const rec = (j.chats[chat.id] ??= {});
@@ -451,7 +469,7 @@ async function buildPrompt(
   if (b.test) parts.push("[Test delivery from the Gateway — your reply is checked but not sent to LINE.]");
   if (!canSpeak(b)) parts.push("[You cannot speak in this chat — reply is disabled here. Output NO_SEND.]");
 
-  return { prompt: parts.join("\n"), hash: inst?.hash ?? null };
+  return { prompt: parts.join("\n"), inst: inst ? { hash: inst.hash, directivesHash: inst.directivesHash } : null };
 }
 
 // ─── Handling ───────────────────────────────────────────────────────────────
@@ -506,7 +524,7 @@ async function processDelivery(b: Bundle, j: Journal): Promise<string> {
   }
   await logInboundOnce(b, j, transcript ? `${describeMessage(m)} [語音轉文字] ${transcript}` : describeMessage(m), mediaPath ?? undefined);
 
-  const { prompt, hash } = await buildPrompt(b, threadId, j, { mediaPath, transcript });
+  const { prompt, inst } = await buildPrompt(b, threadId, j, { mediaPath, transcript });
   // Users do paste keys into chats (e.g. handing one to their agent); keep them out of daemon.log.
   const preview = maskSecrets(userText || describeMessage(m)).slice(0, 60);
   log(`${tag}: from ${who(m.sender)} "${preview}"${threadId === SHARED_THREAD ? " [shared]" : ""}`);
@@ -520,7 +538,7 @@ async function processDelivery(b: Bundle, j: Journal): Promise<string> {
   if (result.exitCode !== 0) throw new RunFailure(result.stderr || result.stdout || `exit ${result.exitCode}`);
 
   // The session now holds the instructions and everything up to the trigger.
-  await recordInstructions(threadId, chat.id, hash, j);
+  await recordInstructions(threadId, chat.id, inst, j);
   const rec = (j.chats[chat.id] ??= {});
   rec.lastShownTs = m.ts;
   rec.overheard = [];
