@@ -253,7 +253,7 @@ async function run(req: MessageRequest, caller: string, j: Journal): Promise<Inb
   if (session) j.sessions[threadId] = { sessionId: session.sessionId, turn: session.turnCount ?? 0 };
 
   const out = result.stdout.trim();
-  const screened = out ? await screenReply({ source: "inbound-message", target: `${caller}/${req.conversation.id}`, text: out }) : { text: "", withheld: false };
+  const screened = out ? await screenReply({ source: "inbound-message", target: `${caller}/${req.conversation.id}`, text: out, direct: true }) : { text: "", withheld: false };
   j.answers[key] = { text: screened.text, at: new Date().toISOString() };
   await saveJournal();
   log(`${key}: reply ${screened.text.length} chars${screened.withheld ? " (withheld)" : ""}${result.silenced ? " (NO_SEND)" : ""}`);

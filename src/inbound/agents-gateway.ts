@@ -553,7 +553,7 @@ async function processDelivery(b: Bundle, j: Journal): Promise<string> {
     log(`${tag}: chat is read-only; dropped ${out.length} chars`);
     return "";
   }
-  const { text } = await screenReply({ source: "agents-gateway", target: chat.id, text: out });
+  const { text } = await screenReply({ source: "agents-gateway", target: chat.id, text: out, direct: chat.type === "user" });
   await logEntry(b, "bot", text);
   log(`${tag}: reply ${text.length} chars`);
   return text;

@@ -2,7 +2,7 @@ import { ensureProjectClaudeMd, run, runUserMessage, compactCurrentSession, canc
 import { CANCEL_CONFIRM_MESSAGE, CANCEL_NOTHING_MESSAGE } from "../cancel";
 import { addTelegramAllowedUser, getSettings, loadSettings } from "../config";
 import { recordSeen, harvestAgentName } from "../contacts";
-import { guardOutgoing, EGRESS_BLOCKED_REPLY } from "../egressGuard";
+import { guardOutgoing, egressBlockedReply } from "../egressGuard";
 import { resetSession, peekSession } from "../sessions";
 import { readFile, mkdir, appendFile, stat } from "node:fs/promises";
 import { existsSync } from "node:fs";
@@ -1034,7 +1034,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
             context: String(chatId),
           })
         ) {
-          await sendMessage(config.token, chatId, EGRESS_BLOCKED_REPLY, threadId);
+          await sendMessage(config.token, chatId, egressBlockedReply(isPrivate), threadId);
         } else {
           await sendMessage(config.token, chatId, cleanedText, threadId);
         }

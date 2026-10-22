@@ -2,7 +2,7 @@ import { ensureProjectClaudeMd, runUserMessage, cancelThread } from "../runner";
 import { isCancelCommand, CANCEL_CONFIRM_MESSAGE, CANCEL_NOTHING_MESSAGE } from "../cancel";
 import { addLineAllowedUser, getSettings, loadSettings } from "../config";
 import { recordSeen, harvestAgentName, recordDeadLetter } from "../contacts";
-import { guardOutgoing, EGRESS_BLOCKED_REPLY } from "../egressGuard";
+import { guardOutgoing, egressBlockedReply } from "../egressGuard";
 import {
   appendChatLog,
   conversationDirPath,
@@ -1169,7 +1169,7 @@ async function handleMessageEvent(event: LineMessageEvent): Promise<void> {
           context: chatId,
         })
       ) {
-        await sendText(chatId, EGRESS_BLOCKED_REPLY, event.replyToken);
+        await sendText(chatId, egressBlockedReply(!isGroup), event.replyToken);
       } else {
         await sendText(chatId, result.stdout, event.replyToken);
         // Log what we said too, so reading the transcript back shows a dialogue
@@ -1219,7 +1219,7 @@ async function handlePostbackEvent(event: LinePostbackEvent): Promise<void> {
         context: chatId,
       })
     ) {
-      await sendText(chatId, EGRESS_BLOCKED_REPLY, event.replyToken);
+      await sendText(chatId, egressBlockedReply(event.source.type === "user"), event.replyToken);
     } else {
       await sendText(chatId, result.stdout, event.replyToken);
     }

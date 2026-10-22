@@ -6,7 +6,7 @@
  */
 
 import { recordDeadLetter } from "../contacts";
-import { EGRESS_BLOCKED_REPLY, guardOutgoing } from "../egressGuard";
+import { egressBlockedReply, guardOutgoing } from "../egressGuard";
 import { inboundTokenValues } from "./server";
 
 /** Agents Gateway keys: `lgw_<type>_<base62>`. */
@@ -29,6 +29,8 @@ export async function screenReply(opts: {
   /** Conversation the reply is for, for logs and dead-letter. */
   target: string;
   text: string;
+  /** A one-to-one conversation (DM, or a program calling in): changes the notice. */
+  direct: boolean;
 }): Promise<{ text: string; withheld: boolean }> {
   if (containsSecret(opts.text)) {
     console.error(`[inbound] BLOCKED ${opts.source} reply for ${opts.target}: contains a key — withheld`);
@@ -39,12 +41,12 @@ export async function screenReply(opts: {
       error: "reply contained a key; withheld",
       preview: maskSecrets(opts.text).slice(0, 200),
     });
-    return { text: EGRESS_BLOCKED_REPLY, withheld: true };
+    return { text: egressBlockedReply(opts.direct), withheld: true };
   }
   // No dmAdmin: inbound sources have no channel to an admin, so a block is
   // logged and dead-lettered by the guard.
   if (await guardOutgoing({ platform: opts.source, text: opts.text, context: opts.target })) {
-    return { text: EGRESS_BLOCKED_REPLY, withheld: true };
+    return { text: egressBlockedReply(opts.direct), withheld: true };
   }
   return { text: opts.text, withheld: false };
 }
