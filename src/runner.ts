@@ -25,6 +25,7 @@ import { getSettings, type ModelConfig, type SecurityConfig, type AgentBusConfig
 import { buildClockPromptPrefix } from "./timezone";
 import { selectModel } from "./model-router";
 import { listAgents, extractAgentDirectives, sendToAgent } from "./agent-bus";
+import { getNotifyDispatcher, hideNotifyBlocks } from "./contacts";
 import { loadAgentEnv, withDaemonSafeEnv } from "./agent-env";
 import { query as sdkQuery } from "@anthropic-ai/claude-agent-sdk";
 import { execSync } from "child_process";
@@ -96,6 +97,8 @@ export interface RunResult {
   exitCode: number;
   /** True when the reply was a silence keyword and stdout was blanked. */
   silenced?: boolean;
+  /** True when the output carried [notify:] blocks (delivered and stripped by run()). */
+  notified?: boolean;
 }
 
 const RATE_LIMIT_PATTERN = /you.ve hit your limit|out of extra usage/i;
@@ -870,14 +873,46 @@ export function dispatchAgentDirectives(text: string, replyToMsgId?: string): st
   return cleaned;
 }
 
+/** Posted to the conversation when a reply was nothing but [notify:] blocks. */
+export const NOTIFY_SENT_REPLY = "✓ 已送出通知";
+
+/**
+ * The notify hub: deliver every [notify:] block in `text` (each one on its
+ * own — see extractNotifyDirectives) and return what is left for the
+ * conversation that triggered the run. Every output path goes through here:
+ * run() for all non-streaming runs (platform replies, inbound sources, cron,
+ * heartbeat, agent-bus), streamUserMessage() for streaming ones. `source` is
+ * the tag appended to delivered messages (platform, job name, sender agent).
+ *
+ * The dispatcher is registered by the daemon (it owns the platform senders);
+ * without one (e.g. a one-off CLI run) the text is returned unchanged.
+ */
+export async function dispatchNotifyDirectives(source: string, text: string): Promise<{ text: string; notified: boolean }> {
+  const dispatch = getNotifyDispatcher();
+  if (!dispatch || !text || !/\[notify:/i.test(text)) return { text, notified: false };
+  try {
+    const { cleaned, hadNotify } = await dispatch(source, text);
+    return { text: hadNotify ? cleaned : text, notified: hadNotify };
+  } catch (err) {
+    console.error(`[${new Date().toLocaleTimeString()}] notify dispatch failed (${source}):`, err);
+    return { text, notified: false };
+  }
+}
+
 export async function run(
   name: string,
   prompt: string,
   threadId?: string,
   replyToMsgId?: string,
+  /** Tag for delivered [notify:] messages (defaults to `name`). */
+  notifySource?: string,
 ): Promise<RunResult> {
   const result = await enqueue(() => execClaude(name, prompt, threadId), threadId);
   result.stdout = dispatchAgentDirectives(result.stdout, replyToMsgId);
+  // Before the squelch, so a notify block next to NO_SEND is still delivered.
+  const n = await dispatchNotifyDirectives(notifySource ?? name, result.stdout);
+  result.stdout = n.text;
+  if (n.notified) result.notified = true;
   return squelchSilenceKeyword(result, name);
 }
 
@@ -1092,6 +1127,11 @@ async function streamClaude(
   console.log(`[${new Date().toLocaleTimeString()}] Done: ${name}`);
 }
 
+/**
+ * Streaming counterpart of runUserMessage. Chunks reach `onChunk` with
+ * [notify:] blocks hidden (an open block is held back until it closes); the
+ * final text goes through the notify hub before `onResult` sees it.
+ */
 export async function streamUserMessage(
   name: string,
   prompt: string,
@@ -1099,8 +1139,29 @@ export async function streamUserMessage(
   onUnblock: () => void,
   threadId?: string,
   onResult?: (text: string) => void,
-): Promise<void> {
-  return enqueue(() => streamClaude(name, prefixUserMessageWithClock(prompt), onChunk, onUnblock, threadId, onResult), threadId);
+): Promise<{ notified: boolean }> {
+  return enqueue(async () => {
+    let final: string | null = null;
+    let lastChunk = "";
+    await streamClaude(
+      name,
+      prefixUserMessageWithClock(prompt),
+      (text) => {
+        lastChunk = text;
+        const shown = hideNotifyBlocks(text);
+        if (shown) onChunk(shown); // nothing to preview while only a notify block has arrived
+      },
+      onUnblock,
+      threadId,
+      (text) => { final = text; },
+    );
+    // No result event: the last streamed text is the reply.
+    const reply = final ?? lastChunk;
+    if (!reply) return { notified: false };
+    const n = await dispatchNotifyDirectives(name, reply);
+    onResult?.(n.text);
+    return { notified: n.notified };
+  }, threadId);
 }
 
 function prefixUserMessageWithClock(prompt: string): string {
@@ -1151,8 +1212,13 @@ function squelchSilenceKeyword(result: RunResult, name: string): RunResult {
 }
 
 export async function runUserMessage(name: string, prompt: string, threadId?: string): Promise<RunResult> {
-  // run() applies the silence-keyword squelch for every path, this one included.
-  return run(name, prefixUserMessageWithClock(prompt), threadId);
+  // run() delivers [notify:] blocks and applies the silence-keyword squelch.
+  const result = await run(name, prefixUserMessageWithClock(prompt), threadId);
+  // Someone is waiting for an answer: say the notification went out.
+  if (result.notified && !result.silenced && result.exitCode === 0 && !result.stdout.trim()) {
+    result.stdout = NOTIFY_SENT_REPLY;
+  }
+  return result;
 }
 
 /**

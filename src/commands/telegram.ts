@@ -2,7 +2,6 @@ import { ensureProjectClaudeMd, run, runUserMessage, compactCurrentSession, canc
 import { CANCEL_CONFIRM_MESSAGE, CANCEL_NOTHING_MESSAGE } from "../cancel";
 import { addTelegramAllowedUser, getSettings, loadSettings } from "../config";
 import { recordSeen, harvestAgentName } from "../contacts";
-import { guardOutgoing, egressBlockedReply } from "../egressGuard";
 import { resetSession, peekSession } from "../sessions";
 import { readFile, mkdir, appendFile, stat } from "node:fs/promises";
 import { existsSync } from "node:fs";
@@ -1025,19 +1024,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
         }).catch(() => {});
       }
       if (cleanedText) {
-        if (
-          await guardOutgoing({
-            platform: "telegram",
-            text: cleanedText,
-            adminUserId: config.adminUserId,
-            dmAdmin: (id, body) => sendMessage(config.token, Number(id), body),
-            context: String(chatId),
-          })
-        ) {
-          await sendMessage(config.token, chatId, egressBlockedReply(isPrivate), threadId);
-        } else {
-          await sendMessage(config.token, chatId, cleanedText, threadId);
-        }
+        await sendMessage(config.token, chatId, cleanedText, threadId);
       }
       for (const fp of filePaths) {
         try {

@@ -1,8 +1,7 @@
-import { ensureProjectClaudeMd, runUserMessage, streamUserMessage, dispatchAgentDirectives, compactCurrentSession, cancelThread } from "../runner";
+import { ensureProjectClaudeMd, runUserMessage, streamUserMessage, dispatchAgentDirectives, compactCurrentSession, cancelThread, NOTIFY_SENT_REPLY } from "../runner";
 import { isCancelCommand, CANCEL_CONFIRM_MESSAGE, CANCEL_NOTHING_MESSAGE } from "../cancel";
 import { getSettings, loadSettings } from "../config";
-import { recordSeen, harvestAgentName, getNotifyDispatcher } from "../contacts";
-import { guardOutgoing, egressBlockedReply } from "../egressGuard";
+import { recordSeen, harvestAgentName } from "../contacts";
 import { resetSession, peekSession } from "../sessions";
 import { listThreadSessions, peekThreadSession } from "../sessionManager";
 import { transcribeAudioToText } from "../whisper";
@@ -1394,9 +1393,10 @@ async function handleMessage(event: SlackMessage): Promise<void> {
     let streamText = "";
     let lastStreamUpdate = 0;
     let finalResultText: string | null = null;
+    let notified = false;
 
     try {
-      await streamUserMessage(
+      ({ notified } = await streamUserMessage(
         "slack",
         prefixedPrompt,
         (text: string) => {
@@ -1418,7 +1418,7 @@ async function handleMessage(event: SlackMessage): Promise<void> {
         () => { /* onUnblock */ },
         sessionThreadId,
         (text: string) => { finalResultText = text; },
-      );
+      ));
     } catch (err) {
       clearInterval(statusRefreshInterval);
       await removeReaction(config.botToken, channelId, event.ts, "hourglass_flowing_sand");
@@ -1442,8 +1442,10 @@ async function handleMessage(event: SlackMessage): Promise<void> {
 
     // Slack streams via streamUserMessage, which bypasses run() — dispatch
     // [send-agent:] here so inter-agent messages aren't dropped (and don't
-    // leak to the user as raw markup).
-    const responseText = dispatchAgentDirectives(finalResultText ?? streamText);
+    // leak to the user as raw markup). [notify:] blocks were already delivered
+    // by streamUserMessage's notify hub; a reply that was only notify blocks
+    // gets the short confirmation.
+    const responseText = dispatchAgentDirectives(finalResultText ?? streamText) || (notified ? NOTIFY_SENT_REPLY : "");
 
     if (!responseText) {
       // Empty response
@@ -1457,21 +1459,8 @@ async function handleMessage(event: SlackMessage): Promise<void> {
         if (sentTs) lastBotMessageTs.set(botMessageKey(channelId, replyThreadTs), sentTs);
       }
     } else {
-      // Deliver [notify:] directives first (dispatcher registered by the daemon;
-      // strips the blocks so the remaining text posts to this conversation as usual)
-      let afterNotify = responseText;
-      const notifyDispatch = getNotifyDispatcher();
-      if (notifyDispatch && /\[notify:/i.test(responseText)) {
-        try {
-          const { cleaned, hadNotify } = await notifyDispatch("slack", responseText);
-          if (hadNotify) afterNotify = cleaned.trim() || "✓ 已送出通知";
-        } catch (err) {
-          debugLog(`notify dispatch failed: ${err instanceof Error ? err.message : err}`);
-        }
-      }
-
       // Extract all directives
-      const { cleanedText: afterReact, reactionEmoji } = extractReactionDirective(afterNotify);
+      const { cleanedText: afterReact, reactionEmoji } = extractReactionDirective(responseText);
       const { cleanedText: afterEdit, editContent, deleteCount, deleteMatches } = extractEditDirective(afterReact);
       const { cleanedText: afterUpload, uploads } = extractUploadDirectives(afterEdit);
       const { cleanedText: afterChannelRead, channelReads } = extractChannelReadDirectives(afterUpload);
@@ -1565,21 +1554,7 @@ async function handleMessage(event: SlackMessage): Promise<void> {
       // Finalize response — guarantee delivery (chunked fallback if the live edit
       // fails or the body is too long), or replace with Block Kit.
       if (finalText) {
-        if (
-          await guardOutgoing({
-            platform: "slack",
-            text: finalText,
-            adminUserId: config.adminUserId,
-            dmAdmin: (id, body) => sendMessageToUser(config.botToken, id, body),
-            context: channelId,
-          })
-        ) {
-          // Residual internal directive — withhold the whole reply (incl. any
-          // buttons) and show only the harmless notice.
-          if (streamMsgTs) await deleteMessage(config.botToken, channelId, streamMsgTs);
-          const sentTs = await sendMessage(config.botToken, channelId, egressBlockedReply(isDirectMessage), replyThreadTs);
-          if (sentTs) lastBotMessageTs.set(msgKey, sentTs);
-        } else if (buttons || select) {
+        if (buttons || select) {
           // Block Kit needs a fresh message; remove streaming message
           if (streamMsgTs) await deleteMessage(config.botToken, channelId, streamMsgTs);
           const sentTs = await sendBlockKitMessage(config.botToken, channelId, finalText, buttons, select, replyThreadTs);
@@ -1715,9 +1690,10 @@ async function handleBlockAction(payload: any): Promise<void> {
   let streamText = "";
   let lastStreamUpdate = 0;
   let finalResultText: string | null = null;
+  let notified = false;
 
   try {
-    await streamUserMessage(
+    ({ notified } = await streamUserMessage(
       "slack",
       prompt,
       (text: string) => {
@@ -1737,7 +1713,7 @@ async function handleBlockAction(payload: any): Promise<void> {
       () => {},
       sessionThreadId,
       (text: string) => { finalResultText = text; },
-    );
+    ));
   } catch (err) {
     if (statusRefreshInterval) clearInterval(statusRefreshInterval);
     if (messageTs) await removeReaction(config.botToken, channelId, messageTs, "hourglass_flowing_sand");
@@ -1755,27 +1731,15 @@ async function handleBlockAction(payload: any): Promise<void> {
   if (streamMsgPromise) streamMsgTs = await streamMsgPromise;
   if (statusRefreshInterval) clearInterval(statusRefreshInterval);
 
-  const responseText = dispatchAgentDirectives(finalResultText ?? streamText);
+  // [notify:] blocks were delivered by streamUserMessage's notify hub.
+  const responseText = dispatchAgentDirectives(finalResultText ?? streamText) || (notified ? NOTIFY_SENT_REPLY : "");
   if (responseText) {
     const { cleanedText } = extractReactionDirective(responseText);
     const { cleanedText: finalText, buttons, select } = extractBlockKitDirectives(cleanedText);
 
     if (finalText) {
       const msgKey = botMessageKey(channelId, replyThreadTs);
-      if (
-        await guardOutgoing({
-          platform: "slack",
-          text: finalText,
-          adminUserId: config.adminUserId,
-          dmAdmin: (id, body) => sendMessageToUser(config.botToken, id, body),
-          context: channelId,
-        })
-      ) {
-        if (streamMsgTs) await deleteMessage(config.botToken, channelId, streamMsgTs);
-        // Slack DM channel ids start with "D".
-        const sentTs = await sendMessage(config.botToken, channelId, egressBlockedReply(channelId.startsWith("D")), replyThreadTs);
-        if (sentTs) lastBotMessageTs.set(msgKey, sentTs);
-      } else if (buttons || select) {
+      if (buttons || select) {
         if (streamMsgTs) await deleteMessage(config.botToken, channelId, streamMsgTs);
         const sentTs = await sendBlockKitMessage(config.botToken, channelId, finalText, buttons, select, replyThreadTs);
         if (sentTs) lastBotMessageTs.set(msgKey, sentTs);

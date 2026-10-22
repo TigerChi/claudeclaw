@@ -36,10 +36,7 @@ import type { InboundContext, InboundReply, InboundSource } from "./server";
 const STATE_DIR = join(process.cwd(), ".claude", "claudeclaw", "inbound");
 const STATE_FILE = join(STATE_DIR, "agents-gateway.json");
 const MEDIA_DIR = join(STATE_DIR, "media");
-const PROMPTS = join(import.meta.dir, "..", "..", "prompts", "agents-gateway");
-const DIRECTIVES_PATH = join(PROMPTS, "DIRECTIVES.md");
-/** Added only to the shared session (session: "shared"). */
-const SHARED_DIRECTIVES_PATH = join(PROMPTS, "DIRECTIVES-SHARED.md");
+const DIRECTIVES_PATH = join(import.meta.dir, "..", "..", "prompts", "agents-gateway", "DIRECTIVES.md");
 
 /** The bridge gives up after this many failed attempts (bridge loop.ts ADAPTER_MAX_ATTEMPTS). */
 const BRIDGE_MAX_ATTEMPTS = 3;
@@ -199,7 +196,7 @@ function saveJournal(): Promise<void> {
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-const directiveCache = new Map<string, string>();
+let directives: string | null = null;
 /** deliveryId → the run producing its reply text. */
 const inflight = new Map<string, Promise<string>>();
 
@@ -230,24 +227,15 @@ function threadFor(chat: Chat): string {
   return `agw:${chat.id}`;
 }
 
-/** The directives for a session: base, plus the shared-session part for `agw:shared`. Cached (restart to reload). */
-async function loadDirectives(threadId: string): Promise<string> {
-  const files = threadId === SHARED_THREAD ? [DIRECTIVES_PATH, SHARED_DIRECTIVES_PATH] : [DIRECTIVES_PATH];
-  const parts: string[] = [];
-  for (const f of files) {
-    if (!directiveCache.has(f)) {
-      let text = "";
-      try {
-        text = existsSync(f) ? (await Bun.file(f).text()).trim() : "";
-      } catch {
-        // missing or unreadable: send nothing for it
-      }
-      directiveCache.set(f, text);
-    }
-    const t = directiveCache.get(f)!;
-    if (t) parts.push(t);
+/** Cached for the process (restart the daemon to reload). */
+async function loadDirectives(): Promise<string> {
+  if (directives !== null) return directives;
+  try {
+    directives = existsSync(DIRECTIVES_PATH) ? (await Bun.file(DIRECTIVES_PATH).text()).trim() : "";
+  } catch {
+    directives = "";
   }
-  return parts.join("\n\n");
+  return directives;
 }
 
 /** HH:MM in the agent's configured timezone. */
@@ -364,11 +352,15 @@ async function instructionBlock(b: Bundle, threadId: string, j: Journal): Promis
     !session || !rec || rec.sessionId !== session.sessionId || (session.turnCount ?? 0) < (rec.turn ?? 0); // counter reset ⇒ compacted
 
   const parts: string[] = [];
-  const d = await loadDirectives(threadId);
+  const d = await loadDirectives();
   const directivesHash = createHash("sha256").update(d).digest("hex").slice(0, 16);
   const directivesChanged = sessionFresh || rec?.directivesHash !== directivesHash;
   if (!directivesChanged && rec?.chats?.[chat.id] === hash) return null;
-  if (directivesChanged && d) parts.push(d);
+  if (directivesChanged && d) {
+    // An existing session still holds the earlier text; say which one counts.
+    if (!sessionFresh) parts.push("[Updated directives: they replace any earlier version in this conversation.]");
+    parts.push(d);
+  }
   parts.push(block);
   return { text: parts.join("\n\n"), hash, directivesHash };
 }
@@ -553,7 +545,7 @@ async function processDelivery(b: Bundle, j: Journal): Promise<string> {
     log(`${tag}: chat is read-only; dropped ${out.length} chars`);
     return "";
   }
-  const { text } = await screenReply({ source: "agents-gateway", target: chat.id, text: out, direct: chat.type === "user" });
+  const { text } = await screenReply({ source: "agents-gateway", target: chat.id, text: out });
   await logEntry(b, "bot", text);
   log(`${tag}: reply ${text.length} chars`);
   return text;

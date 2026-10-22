@@ -816,7 +816,9 @@ export async function start(args: string[] = []) {
         continue;
       }
       if (resolved.kind === "reply") {
-        const error = `[notify:reply] is not available in ${source} runs (no originating platform message)`;
+        // In a conversation the reply text itself goes back; bus/cron/heartbeat
+        // have no originating message to reply to.
+        const error = `[notify:reply] is not supported (${source}): write the reply as plain text`;
         console.error(`[${ts()}] notify(${source}): ${error}`);
         await recordDeadLetter({ at: new Date().toISOString(), source, target: dir.target, error, preview });
         continue;
@@ -902,8 +904,8 @@ export async function start(args: string[] = []) {
     );
   }
 
-  // Let platform reply pipelines (slack/telegram/...) honor [notify:] too —
-  // they run inside their own modules and can't reach this closure directly.
+  // Register as the notify hub's dispatcher (runner.ts dispatchNotifyDirectives):
+  // every run's output passes through it, whichever platform or job produced it.
   setNotifyDispatcher(dispatchNotifies);
 
   // --- Heartbeat scheduling ---
@@ -951,13 +953,10 @@ export async function start(args: string[] = []) {
         })
         .then(async (r) => {
           if (!r) return;
-          if (r.exitCode === 0 && r.stdout?.trim()) {
-            const { cleaned, hadNotify } = await dispatchNotifies("heartbeat", r.stdout);
-            r.stdout = cleaned;
-            // Output containing [notify:] is delivered ONLY via those targets —
-            // the remainder is not broadcast.
-            if (hadNotify) return;
-          }
+          // run() already delivered any [notify:] blocks. Output containing
+          // them is delivered ONLY via those targets — the remainder is not
+          // broadcast.
+          if (r.exitCode === 0 && r.notified) return;
           // A silenced run means the check found nothing worth saying. Most
           // owners want nothing at all; `forwardWhenSilent` is for the ones who
           // want proof it ran, and `silentTargets` says who gets it (empty =
@@ -1037,15 +1036,13 @@ export async function start(args: string[] = []) {
    *   "explicit" — kept private; only [notify:] output reaches users
    */
   async function forwardBusResult(
-    r: { exitCode: number; stdout: string; stderr: string },
+    r: { exitCode: number; stdout: string; stderr: string; notified?: boolean },
     from: string,
   ): Promise<void> {
-    if (r.exitCode !== 0 || !r.stdout?.trim()) return;
+    // run() already delivered any [notify:] blocks (tagged with the sender).
+    if (r.exitCode !== 0 || r.notified || !r.stdout?.trim()) return;
     // Label shows WHO the incoming bus message came from, e.g. [dev]
     const label = from;
-    const { cleaned, hadNotify } = await dispatchNotifies(label, r.stdout);
-    r.stdout = cleaned;
-    if (hadNotify || !cleaned.trim()) return;
     if (currentSettings.notify.mode === "explicit") {
       console.log(`[${ts()}] Agent Bus: reply kept private (notify mode: explicit, no [notify:] directive)`);
       return;
@@ -1069,7 +1066,7 @@ export async function start(args: string[] = []) {
       if (await tryRouteAsPendingReply(busName, msg)) return;
 
       const prompt = buildAgentMessagePrompt([msg]);
-      const r = await run("agent-bus", prompt, undefined, msg.id);
+      const r = await run("agent-bus", prompt, undefined, msg.id, msg.from);
       await forwardBusResult(r, msg.from);
     });
 
@@ -1178,7 +1175,7 @@ export async function start(args: string[] = []) {
           if (await tryRouteAsPendingReply(busName, msg)) continue;
 
           const prompt = buildAgentMessagePrompt([msg]);
-          const r = await run("agent-bus", prompt, undefined, msg.id);
+          const r = await run("agent-bus", prompt, undefined, msg.id, msg.from);
           await forwardBusResult(r, msg.from);
         }
       }
@@ -1222,15 +1219,11 @@ export async function start(args: string[] = []) {
         resolvePrompt(job.prompt)
           .then((prompt) => run(job.name, prompt))
           .then(async (r) => {
-            // [notify:] directives are honored regardless of the job's notify
-            // setting — an explicit target in the output is an explicit intent.
-            if (r.exitCode === 0 && r.stdout.trim()) {
-              const { cleaned, hadNotify } = await dispatchNotifies(job.name, r.stdout);
-              r.stdout = cleaned;
-              // Output containing [notify:] is delivered ONLY via those
-              // targets — skip the channels/slackTarget broadcast entirely.
-              if (hadNotify) return;
-            }
+            // run() already delivered any [notify:] blocks, regardless of the
+            // job's notify setting — an explicit target is an explicit intent.
+            // Output containing them is delivered ONLY via those targets —
+            // skip the channels/slackTarget broadcast entirely.
+            if (r.exitCode === 0 && r.notified) return;
             if (job.notify === false) return;
             if (job.notify === "error" && r.exitCode === 0) return;
             // Empty stdout on success = the job chose to stay silent (e.g. a

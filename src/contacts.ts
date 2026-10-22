@@ -197,22 +197,67 @@ export interface NotifyDirective {
   payload: string;
 }
 
-const NOTIFY_RE = /\[notify:([^\]\r\n]+)\]([\s\S]*?)\[\/notify\]/gi;
+const NOTIFY_TAG_RE = /\[notify:([^\]\r\n]+)\]|\[\/notify\]/gi;
 
-/** Extract [notify:target]...[/notify] blocks. Unclosed [notify:] tags are left in place. */
+/**
+ * Extract [notify:target]...[/notify] blocks.
+ *
+ * Every block is delivered on its own: several targets are side-by-side
+ * blocks, and a block written inside another is pulled out as its own
+ * delivery — the outer payload never carries the inner one's text or tags.
+ * Text outside all blocks is what stays for the current conversation.
+ * Unclosed [notify:] tags and stray [/notify] tags are left in place (so
+ * prose that mentions the syntax is not swallowed).
+ */
 export function extractNotifyDirectives(text: string): {
   cleaned: string;
   directives: NotifyDirective[];
 } {
-  const directives: NotifyDirective[] = [];
-  const cleaned = text
-    .replace(NOTIFY_RE, (_m, target: string, payload: string) => {
-      const p = payload.trim();
-      if (p) directives.push({ target: target.trim(), payload: p });
-      return "";
-    })
-    .trim();
-  return { cleaned, directives };
+  type Open = { target: string; tag: string; at: number; parts: string[] };
+  const found: (NotifyDirective & { at: number })[] = [];
+  const stack: Open[] = [];
+  const outside: string[] = [];
+  const emit = (s: string) => (stack.length ? stack[stack.length - 1]!.parts : outside).push(s);
+
+  let last = 0;
+  for (const m of text.matchAll(NOTIFY_TAG_RE)) {
+    emit(text.slice(last, m.index));
+    last = m.index! + m[0].length;
+    if (m[1] !== undefined) {
+      stack.push({ target: m[1].trim(), tag: m[0], at: m.index!, parts: [] });
+    } else if (stack.length) {
+      const b = stack.pop()!;
+      const payload = b.parts.join("").trim();
+      if (payload) found.push({ target: b.target, payload, at: b.at });
+    } else {
+      emit(m[0]);
+    }
+  }
+  emit(text.slice(last));
+  // Unclosed blocks go back as plain text, innermost into its parent.
+  while (stack.length) {
+    const b = stack.pop()!;
+    emit(b.tag + b.parts.join(""));
+  }
+
+  found.sort((a, b) => a.at - b.at);
+  return {
+    cleaned: outside.join("").replace(/\n{3,}/g, "\n\n").trim(),
+    directives: found.map(({ target, payload }) => ({ target, payload })),
+  };
+}
+
+/**
+ * `text` as it may be shown while a reply is still streaming: complete
+ * [notify:] blocks removed, and everything from a still-open [notify: tag
+ * onward held back until its block closes.
+ */
+export function hideNotifyBlocks(text: string): string {
+  const { cleaned } = extractNotifyDirectives(text);
+  const open = cleaned.search(/\[notify:/i);
+  const shown = open === -1 ? cleaned : cleaned.slice(0, open);
+  // A tag still arriving ("[noti…") at the very end.
+  return shown.replace(/\[(?:n(?:o(?:t(?:i(?:f(?:y)?)?)?)?)?)?$/i, "").trimEnd();
 }
 
 // ── Target resolution ───────────────────────────────────────────────────────

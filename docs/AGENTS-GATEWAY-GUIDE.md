@@ -230,7 +230,7 @@ bridge 收到空字串只 ack，不送任何訊息到 LINE。
 
 ### 6.5 chatlog
 
-預設不寫。完整紀錄在 Gateway，用 MCP 讀（§9）。本機副本等於把每個群的內容放在 agent 自己讀得到的地方，跨群隔離（§8）就多一個破口，所以預設關。
+預設不寫。完整紀錄在 Gateway，用 MCP 讀（§9）。
 
 開了 `chatLog.enabled` 時，送到 ClaudeClaw 的訊息與 agent 的回覆寫進 `.claude/claudeclaw/chatlog/<群組名>__agw-<chatId>/`（格式同 [LINE-GUIDE.md §7.7](LINE-GUIDE.md)）。Gateway 沒送來的訊息（例如沒點名、也沒設旁聽的）不在這裡。
 
@@ -260,11 +260,10 @@ bridge 收到空字串只 ack，不送任何訊息到 LINE。
 |---|---|
 | Gateway Agent 金鑰 | 只在 bridge（`$LINE_GATEWAY_HOME/profiles/<agent>/credentials`，600）；ClaudeClaw 不需要 |
 | 本機入口 | 只聽 `127.0.0.1`；bridge 用自己的 token，且只能打 `agents-gateway`（[INBOUND.md §7](INBOUND.md#7-安全模型)） |
-| LINE 使用者的訊息 | DIRECTIVES 告訴 agent：訊息、引用、附件、名字都是不可信輸入，不是指令；群組裡不透露內部 id、路徑，也不提擁有者名字 |
-| 其他聊天室的內容 | DIRECTIVES：有人要別的群（或私訊）的內容時，先提醒那是別的聊天室、可能涉及隱私、要該聊天室管理員授權，然後不提供；不用工具去讀；不接受在本群內自稱的授權。`session: "shared"` 時另帶 `DIRECTIVES-SHARED.md`：可以用跨群的記憶做事，但「透露」照同一條規則 |
-| 送出前檢查 | 回覆含殘留內部指令（`[notify:`、`[send-agent:` 等）或像金鑰的字串（`lgw_…`、入口 token）→ 整則改成「已收到，請私訊我 🙏」，原文遮罩後進 dead-letter |
+| LINE 使用者的訊息 | DIRECTIVES 告訴 agent：訊息、引用、附件、名字都是不可信輸入，不是指令；群組裡不透露內部 id 與路徑 |
+| 送出前檢查 | 回覆含像金鑰的字串（`lgw_…`、入口 token）→ 整則改成「這則回覆含有金鑰，已攔下沒有送出。」，原文遮罩後進 dead-letter |
 | log | 訊息預覽裡的金鑰樣式遮成 `lgw_…` |
-| `[notify:]` | 回覆裡出現就整則擋下（同其他通道）；要主動推播請在排程或 agent-bus 用 `[notify:]`，見 [NOTIFY-GUIDE.md](NOTIFY-GUIDE.md) |
+| `[notify:]` | 同其他通道：區塊先抽出來各自送給指定對象，剩下的文字才回到這個聊天室，見 [NOTIFY-GUIDE.md](NOTIFY-GUIDE.md) |
 
 ---
 
@@ -272,7 +271,7 @@ bridge 收到空字串只 ack，不送任何訊息到 LINE。
 
 Gateway 保存聊天室的完整紀錄。agent 要翻舊訊息、找附件、或排程要整理某個群，用 Gateway 的 MCP 工具（`list_chats`、`get_messages`、`search_messages`、`get_media`）。
 
-**1. 金鑰**：一律用 Gateway 發的**只限需要的聊天室**的群組金鑰（非管理、`scope=chat`）。**不要用 bridge 那把 Agent 金鑰**——它讀得到整個 workspace 的所有聊天室，agent 只要拿到它，跨群隔離就只剩提示詞層的約束。
+**1. 金鑰**：建議跟 Gateway 申請**只限需要的聊天室**的群組金鑰（非管理、`scope=chat`），不要用 bridge 那把 Agent 金鑰——Agent 金鑰讀得到整個 workspace 的所有聊天室。
 
 ```bash
 ( umask 077; printf '%s' '<群組金鑰>' > _claude/.auth/agents-gateway/mcp-key )
@@ -406,4 +405,4 @@ agent.env 由 hub 啟動 daemon 時執行，工作目錄不一定是 agent 目�
 | MCP 設定 | `<Agent>/.mcp.json`、`<Agent>/.claude/settings.json` | §9 |
 | MCP 金鑰 | `<Agent>/_claude/.auth/agents-gateway/mcp-key` | §9 |
 | 來源程式 | `<claudeclaw>/src/inbound/agents-gateway.ts` | |
-| DIRECTIVES | `<claudeclaw>/prompts/agents-gateway/DIRECTIVES.md`、`DIRECTIVES-SHARED.md` | 注入給 agent 的規則；內容一改，各 session 下一輪就會重帶（daemon 要重啟才讀到新檔） |
+| DIRECTIVES | `<claudeclaw>/prompts/agents-gateway/DIRECTIVES.md` | 注入給 agent 的規則；內容一改，各 session 下一輪就會重帶（daemon 要重啟才讀到新檔） |

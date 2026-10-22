@@ -1,13 +1,16 @@
 /**
  * Last gate before an inbound source hands the agent's reply back to its
- * caller: residual internal directives (egressGuard) and anything that looks
- * like a key. A hit withholds the whole reply; the caller gets the harmless
- * notice instead and the original goes to the dead-letter log (keys masked).
+ * caller: anything that looks like a key. A hit withholds the whole reply;
+ * the caller gets a short notice instead and the original goes to the
+ * dead-letter log (keys masked). [notify:] blocks never get here — run()
+ * delivers and strips them.
  */
 
 import { recordDeadLetter } from "../contacts";
-import { egressBlockedReply, guardOutgoing } from "../egressGuard";
 import { inboundTokenValues } from "./server";
+
+/** Sent in place of a reply that contained a key. */
+export const KEY_WITHHELD_REPLY = "這則回覆含有金鑰，已攔下沒有送出。";
 
 /** Agents Gateway keys: `lgw_<type>_<base62>`. */
 export const KEY_PATTERN = /\blgw_[a-z]+_[A-Za-z0-9]{8,}/g;
@@ -29,8 +32,6 @@ export async function screenReply(opts: {
   /** Conversation the reply is for, for logs and dead-letter. */
   target: string;
   text: string;
-  /** A one-to-one conversation (DM, or a program calling in): changes the notice. */
-  direct: boolean;
 }): Promise<{ text: string; withheld: boolean }> {
   if (containsSecret(opts.text)) {
     console.error(`[inbound] BLOCKED ${opts.source} reply for ${opts.target}: contains a key — withheld`);
@@ -41,12 +42,7 @@ export async function screenReply(opts: {
       error: "reply contained a key; withheld",
       preview: maskSecrets(opts.text).slice(0, 200),
     });
-    return { text: egressBlockedReply(opts.direct), withheld: true };
-  }
-  // No dmAdmin: inbound sources have no channel to an admin, so a block is
-  // logged and dead-lettered by the guard.
-  if (await guardOutgoing({ platform: opts.source, text: opts.text, context: opts.target })) {
-    return { text: egressBlockedReply(opts.direct), withheld: true };
+    return { text: KEY_WITHHELD_REPLY, withheld: true };
   }
   return { text: opts.text, withheld: false };
 }

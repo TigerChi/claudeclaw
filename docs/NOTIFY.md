@@ -35,7 +35,25 @@ Reserved words (never valid as recipient names or aliases): `reply`,
 | **Agent bus** | `[notify:]` blocks are always delivered. Remaining plain text follows `notify.mode` (below). |
 | **Cron job** | If the output contains any `[notify:]`, ONLY those targets receive messages — the job's `channels` / `slackTarget` broadcast is skipped for that run. Without `[notify:]`, legacy behavior is unchanged. |
 | **Heartbeat** | Same rule as cron. `HEARTBEAT_OK` squelching is unchanged. |
-| **Interactive platform sessions** | Wired on Slack only: a Slack reply containing `[notify:]` is routed through the dispatcher, the blocks are stripped, and the remaining text posts to the originating conversation as usual. Telegram, LINE, and Discord replies are not yet routed through it — their `[notify:]` blocks stay in the reply text. |
+| **Interactive platform sessions** | LINE, Slack, Telegram, Discord and the inbound sources (Agents Gateway, message): the blocks are delivered and stripped, and the remaining text goes to the originating conversation as usual. A reply that was only notify blocks posts `✓ 已送出通知`. While a reply streams (Slack), notify blocks are hidden from the live preview. |
+
+### One hub
+
+Every output passes through one place — `dispatchNotifyDirectives()` in
+`src/runner.ts`, called by `run()` (every non-streaming run: platform replies,
+inbound sources, cron, heartbeat, agent bus) and by `streamUserMessage()`
+(streaming replies). Platform code never parses `[notify:]` itself, so a new
+reply path cannot forget it. The daemon registers the actual sender
+(`dispatchNotifies` in `start.ts`) via `setNotifyDispatcher()`.
+
+### Blocks are parallel
+
+Each block is one delivery. Several targets are side-by-side blocks. A block
+written inside another is pulled out as its own delivery: the outer payload
+keeps only its own text, never the inner block's text or tags. Text outside
+all blocks is the reply to the current conversation. An unclosed
+`[notify:…]` or a stray `[/notify]` is left as plain text, so prose that
+mentions the syntax is not swallowed.
 
 ## `notify.mode` setting (per agent, `settings.json`)
 

@@ -149,18 +149,12 @@ export interface TelegramConfig {
   allowedUserIds: number[];
   /** Pairing flow for unknown private-chat users — code-only, no need to look up Telegram numeric IDs by hand. */
   pairing: TelegramPairingConfig;
-  /** Numeric chat id of this agent's admin. The egress guard DMs here when it
-   *  blocks an outbound message carrying residual internal directives. */
-  adminUserId?: number;
 }
 
 export interface DiscordConfig {
   token: string;
   allowedUserIds: string[]; // Discord snowflake IDs exceed Number.MAX_SAFE_INTEGER
   listenChannels: string[]; // Channel IDs where bot responds to all messages (no mention needed)
-  /** User id of this agent's admin. The egress guard DMs here when it blocks an
-   *  outbound message carrying residual internal directives. */
-  adminUserId?: string;
 }
 
 export interface SlackConfig {
@@ -173,9 +167,6 @@ export interface SlackConfig {
   allowedUserIds: string[];
   /** Channel IDs where the bot responds to every message without needing a mention */
   listenChannels: string[];
-  /** User id of this agent's admin. The egress guard DMs here when it blocks an
-   *  outbound message carrying residual internal directives. */
-  adminUserId?: string;
   /** Session granularity for channel (non-DM) messages:
    *    "thread"  — every Slack thread gets its own Claude session (max isolation; default).
    *    "channel" — all threads in a channel share one session (fewer sessions, shared context).
@@ -252,9 +243,6 @@ export interface LineConfig {
   /** LINE user IDs (U + 32 hex chars) allowed to interact with the bot.
    *  Empty array means all users are allowed. */
   allowedUserIds: string[];
-  /** User id of this agent's admin. The egress guard DMs here when it blocks an
-   *  outbound message carrying residual internal directives. */
-  adminUserId?: string;
   /** Pairing flow for unknown DM users (only used when `allowedUserIds` is non-empty). */
   pairing: LinePairingConfig;
   /** Whether the bot requires @mention to respond in groups/rooms (default: true).
@@ -300,8 +288,7 @@ export interface AgentsGatewayInboundConfig {
    *  "log" = archive and show as context on the next woken turn (default);
    *  "agent" = wake the agent anyway (it cannot speak there). */
   listen: "log" | "agent";
-  /** Local copy in chatlog/ (default off — the Gateway keeps the full history,
-   *  and a local copy of every chat is one more place another chat can read). */
+  /** Local copy in chatlog/ (default off — the Gateway keeps the full history). */
   chatLog: { enabled: boolean };
 }
 
@@ -601,7 +588,6 @@ function parseSettings(raw: Record<string, any>): Settings {
     telegram: {
       token: raw.telegram?.token ?? "",
       allowedUserIds: raw.telegram?.allowedUserIds ?? [],
-      adminUserId: typeof raw.telegram?.adminUserId === "number" ? raw.telegram.adminUserId : undefined,
       pairing: {
         enabled: Boolean(raw.telegram?.pairing?.enabled),
         code: typeof raw.telegram?.pairing?.code === "string" ? raw.telegram.pairing.code : "",
@@ -623,7 +609,6 @@ function parseSettings(raw: Record<string, any>): Settings {
       listenChannels: Array.isArray(raw.discord?.listenChannels)
         ? raw.discord.listenChannels.map(String)
         : [],
-      adminUserId: typeof raw.discord?.adminUserId === "string" ? raw.discord.adminUserId : undefined,
     },
     slack: {
       botToken: typeof raw.slack?.botToken === "string" ? raw.slack.botToken.trim() : "",
@@ -634,7 +619,6 @@ function parseSettings(raw: Record<string, any>): Settings {
       listenChannels: Array.isArray(raw.slack?.listenChannels)
         ? raw.slack.listenChannels.map(String)
         : [],
-      adminUserId: typeof raw.slack?.adminUserId === "string" ? raw.slack.adminUserId : undefined,
       sessionGranularity:
         raw.slack?.sessionGranularity === "channel" || raw.slack?.sessionGranularity === "thread"
           ? raw.slack.sessionGranularity
@@ -654,7 +638,6 @@ function parseSettings(raw: Record<string, any>): Settings {
       allowedUserIds: Array.isArray(raw.line?.allowedUserIds)
         ? raw.line.allowedUserIds.map(String)
         : [],
-      adminUserId: typeof raw.line?.adminUserId === "string" ? raw.line.adminUserId : undefined,
       pairing: {
         enabled: typeof raw.line?.pairing?.enabled === "boolean" ? raw.line.pairing.enabled : false,
         code: typeof raw.line?.pairing?.code === "string" ? raw.line.pairing.code.trim() : "",

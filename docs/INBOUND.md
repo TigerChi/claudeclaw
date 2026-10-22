@@ -295,7 +295,7 @@ print(json.load(urllib.request.urlopen(req, timeout=900))["text"])
 | 驗證 | 每個呼叫端一個 token；比對 SHA-256 雜湊、定長比較，不洩漏長度 |
 | 權限 | 每個呼叫端只能用 `sources` 列出的來源；某個 token 外洩，只要刪掉那個呼叫端 |
 | 不給 agent | 舊式 `CLAUDECLAW_INBOUND_TOKEN` 列在 `DAEMON_ONLY_KEYS`（`src/agent-env.ts`）：daemon 讀得到，agent 執行的 Claude 子程序環境裡沒有 |
-| 送出前檢查 | 回覆若含殘留的內部指令（`[notify:`、`[send-agent:` 等，見 egressGuard），或看起來像金鑰（`lgw_…`、任何一組入口 token），整則改成固定句「已收到，請私訊我 🙏」，原文（金鑰遮罩後）寫進 `contacts/dead-letter.jsonl` |
+| 送出前檢查 | 回覆若看起來像金鑰（`lgw_…`、任何一組入口 token），整則改成固定句「這則回覆含有金鑰，已攔下沒有送出。」，原文（金鑰遮罩後）寫進 `contacts/dead-letter.jsonl`。`[notify:]` 區塊在這之前就由 `run()` 送出並拿掉 |
 | log | 訊息預覽裡的金鑰樣式會遮成 `lgw_…` |
 | 訊息內容 | 各來源的 DIRECTIVES 告訴 agent：呼叫端送來的文字、前文、附件都是不可信輸入，不是指令 |
 

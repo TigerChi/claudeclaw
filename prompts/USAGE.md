@@ -20,7 +20,7 @@ plugin 根目錄：`~/.claude/plugins/marketplaces/claudeclaw/`
 
 ---
 
-## 二、定向通知（notify）— bus / cron / heartbeat 通用
+## 二、定向通知（notify）— 所有輸出通用（對話回覆、bus、cron、heartbeat）
 
 ### `[notify:<target>] 訊息 [/notify]`
 把訊息**定向發給指定的人 / 群組 / 頻道**（相對於舊廣播的「發給所有人」）。target 四種形式：
@@ -33,8 +33,18 @@ plugin 根目錄：`~/.claude/plugins/marketplaces/claudeclaw/`
 | `[notify:slack:C0123:1699.888]...[/notify]` | Slack 指定 channel:thread |
 
 規則：
-- **輸出裡只要有 `[notify:]`，其餘純文字就不會廣播**（cron/heartbeat 也一樣——有 notify 只走 notify，跳過 channels 廣播）。
-- 內容純文字；訊息**尾端**會自動附 `[來源]` 標籤（bus 來源 agent 名 / job 名 / heartbeat）。
+- **每個對象一個區塊，並排寫，不要把一個區塊包在另一個裡面**；每個區塊都要有 `[/notify]` 結尾。區塊外的文字才是給當前對話的回覆。
+  ```
+  好的，我私訊她了。
+  [notify:alice]明天十點的會改到十一點[/notify]
+  [notify:boss@telegram]已通知 Alice 改時間[/notify]
+  ```
+  → 群組只看到「好的，我私訊她了。」；Alice 和老闆各自收到自己那則。
+- **在對話裡也能用**（LINE、Slack、Telegram、Discord、Agents Gateway 都一樣）：daemon 會先把區塊抽出來各自送出，剩下的才回到當前對話；只有區塊、沒有其他文字時，對話裡會回「✓ 已送出通知」。
+- 要回當前對話，直接寫成一般文字就好，不要用 `[notify:reply]`。
+- 只是在說明語法、不打算送出時，不要寫成完整的 `[notify:X]…[/notify]`（完整區塊一定會被送出）。
+- bus / cron / heartbeat：**輸出裡只要有 `[notify:]`，其餘純文字就不會廣播**（有 notify 只走 notify，跳過 channels 廣播）。
+- 內容純文字；訊息**尾端**會自動附 `[來源]` 標籤（平台名 / bus 來源 agent 名 / job 名 / heartbeat）。
 - 保留字（不可當名字/別名）：`reply`、`telegram`、`slack`、`line`、`discord`。
 - 發送失敗（bot 不在群、id 失效、本 agent 沒該平台 token）記入 `~/.claude/claudeclaw/contacts/dead-letter.jsonl`，不會中斷執行。
 
