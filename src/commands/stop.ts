@@ -93,6 +93,19 @@ export interface StopByPathResult {
  * delivered (or pid file removed). Used by `stopAll` and the hub control plane.
  * Does NOT exit the process. Waits up to `waitMs` for the process to actually die.
  */
+async function waitForExit(pid: number, waitMs: number): Promise<boolean> {
+  const deadline = Date.now() + waitMs;
+  while (Date.now() < deadline) {
+    try {
+      process.kill(pid, 0);
+    } catch {
+      return true;
+    }
+    await Bun.sleep(100);
+  }
+  return false;
+}
+
 export async function stopByPath(projectPath: string, waitMs = 4000): Promise<StopByPathResult> {
   const pidFile = join(projectPath, ".claude", "claudeclaw", "daemon.pid");
 
@@ -122,15 +135,12 @@ export async function stopByPath(projectPath: string, waitMs = 4000): Promise<St
     return { ok: false, pid, reason: "kill-failed" };
   }
 
-  // Wait for actual exit
-  const deadline = Date.now() + waitMs;
-  while (Date.now() < deadline) {
-    try {
-      process.kill(pid, 0);
-      await Bun.sleep(100);
-    } catch {
-      break;
-    }
+  // Wait for actual exit. A daemon whose event loop is wedged never runs its
+  // SIGTERM handler, so escalate to SIGKILL — otherwise a restart spawns a
+  // second daemon next to the zombie and both fight over the Slack socket.
+  if (!(await waitForExit(pid, waitMs))) {
+    try { process.kill(pid, "SIGKILL"); } catch {}
+    if (!(await waitForExit(pid, 2000))) return { ok: false, pid, reason: "kill-failed" };
   }
   try { await unlink(pidFile); } catch {}
   return { ok: true, pid };

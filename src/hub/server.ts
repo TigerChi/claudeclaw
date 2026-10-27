@@ -4,6 +4,7 @@ import {
   listAgents,
   findAgentById,
   findAgentByPath,
+  setAgentSessionTimeout,
   type AgentRecord,
 } from "./registry";
 import { spawnDetachedDaemon, waitForExit } from "./spawn";
@@ -23,6 +24,7 @@ export interface HubServerHandle {
 
 const PROXY_PREFIX = "/api/agents/";
 const PROXY_INFIX = "/proxy/";
+const PROXY_TIMEOUT_MS = 5000;
 
 type BunServerHandle = ReturnType<typeof Bun.serve>;
 
@@ -113,10 +115,20 @@ async function proxyToAgent(
     init.duplex = "half";
   }
 
+  // Bounded so a wedged daemon can't hang the dashboard (and the browser's
+  // 5s poll) forever. Plenty for the JSON endpoints the hub page reads.
+  init.signal = AbortSignal.timeout(PROXY_TIMEOUT_MS);
+
   let upstream: Response;
   try {
     upstream = await fetch(targetUrl, init);
   } catch (err) {
+    if ((err as Error)?.name === "TimeoutError") {
+      return new Response(
+        JSON.stringify({ error: `agent daemon did not respond within ${PROXY_TIMEOUT_MS / 1000}s` }),
+        { status: 504, headers: { "Content-Type": "application/json; charset=utf-8" } },
+      );
+    }
     return serverError(`proxy failed: ${String(err)}`);
   }
 
@@ -212,6 +224,30 @@ export function startHubServer(opts: HubServerOptions): HubServerHandle {
 
         // action endpoints
         const segments = tail.split("/").filter(Boolean);
+        if (segments.length === 2 && segments[1] === "settings" && req.method === "POST") {
+          // POST /api/agents/:id/settings { sessionTimeoutMs: number | null }
+          // number = per-agent override in ms (60s–24h); null clears back to default.
+          const agent = await findAgentById(segments[0]);
+          if (!agent) return notFound("agent not found");
+          let body: any;
+          try {
+            body = await req.json();
+          } catch {
+            return badRequest("invalid JSON body");
+          }
+          if (!("sessionTimeoutMs" in body)) return badRequest("sessionTimeoutMs required");
+          const v = body.sessionTimeoutMs;
+          let value: number | null;
+          if (v == null) value = null;
+          else if (Number.isFinite(v) && v >= 60_000 && v <= 86_400_000) value = Math.round(v);
+          else return badRequest("sessionTimeoutMs must be null or 60000–86400000 (1 min – 24 h)");
+          try {
+            await setAgentSessionTimeout(agent.path, value);
+            return json({ ok: true, sessionTimeoutMs: value });
+          } catch (err) {
+            return serverError(`settings write failed: ${String(err)}`);
+          }
+        }
         if (segments.length === 2 && req.method === "POST") {
           const [id, action] = segments;
           return handleAgentAction(id, action);
