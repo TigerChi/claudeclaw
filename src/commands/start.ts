@@ -34,6 +34,12 @@ import {
   type NotifyDelivery,
 } from "../contacts";
 
+/** True when output is the "nothing to report" sentinel (at start or end). */
+function isHeartbeatOk(text: string): boolean {
+  const t = text.trim();
+  return t.startsWith("HEARTBEAT_OK") || t.endsWith("HEARTBEAT_OK");
+}
+
 const CLAUDE_DIR = join(process.cwd(), ".claude");
 const HEARTBEAT_DIR = join(CLAUDE_DIR, "claudeclaw");
 const STATUSLINE_FILE = join(CLAUDE_DIR, "statusline.cjs");
@@ -887,7 +893,7 @@ export async function start(args: string[] = []) {
             // the remainder is not broadcast.
             if (hadNotify) return;
           }
-          const shouldForward = currentSettings.heartbeat.forwardToTelegram || !r.stdout.trim().startsWith("HEARTBEAT_OK");
+          const shouldForward = currentSettings.heartbeat.forwardToTelegram || !isHeartbeatOk(r.stdout);
           if (shouldForward) {
             forwardToTelegram("", r);
             forwardToDiscord("", r);
@@ -1158,6 +1164,9 @@ export async function start(args: string[] = []) {
             // Empty stdout on success = the job chose to stay silent (e.g. a
             // threshold monitor under its alert level). Don't forward "(empty)".
             if (r.exitCode === 0 && !r.stdout.trim()) return;
+            // Same silence rule as heartbeat: a job that answers HEARTBEAT_OK
+            // has nothing to report, so don't broadcast it.
+            if (r.exitCode === 0 && isHeartbeatOk(r.stdout)) return;
             const wantAll = job.channels.length === 0;
             const want = (c: string) => wantAll || job.channels.includes(c as never);
             if (want("telegram")) forwardToTelegram(job.name, r);
