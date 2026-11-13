@@ -663,15 +663,123 @@ interface BlockKitSelect {
   options: { label: string; value: string }[];
 }
 
+interface TableData {
+  rows: string[][];
+  // Which columns wrap long text (column_settings[].is_wrapped). "all" wraps
+  // every column; a number[] is a set of 1-based column indices. null = none.
+  wrap?: "all" | number[] | null;
+}
+
+// Block Kit table block limits (docs.slack.dev/reference/block-kit/blocks/table-block).
+const MAX_TABLE_ROWS = 100;
+const MAX_TABLE_COLS = 20;
+
+/**
+ * Pull an optional leading options line off a table body. Supports:
+ *   wrap            → wrap all columns
+ *   wrap=all        → wrap all columns
+ *   wrap=1,3        → wrap 1-based columns 1 and 3
+ * Returns the parsed wrap spec plus the remaining body (the actual rows). The
+ * options line must contain no pipe so it can never be mistaken for a data row.
+ */
+function parseTableOptions(raw: string): { wrap: "all" | number[] | null; body: string } {
+  const lines = String(raw).split(/\r?\n/);
+  let idx = 0;
+  while (idx < lines.length && lines[idx].trim() === "") idx++;
+  const first = (lines[idx] ?? "").trim();
+  if (first && !first.includes("|")) {
+    const m = first.match(/^wrap(?:=(all|[\d,\s]+))?$/i);
+    if (m) {
+      const arg = (m[1] ?? "all").trim().toLowerCase();
+      const body = lines.slice(idx + 1).join("\n");
+      if (arg === "all" || arg === "") return { wrap: "all", body };
+      const cols = arg.split(",").map((n) => parseInt(n.trim(), 10)).filter((n) => Number.isFinite(n) && n > 0);
+      return { wrap: cols.length > 0 ? cols : "all", body };
+    }
+  }
+  return { wrap: null, body: String(raw) };
+}
+
+/**
+ * Parse a markdown pipe-table body into rows of trimmed cells. Accepts
+ * standard markdown tables (leading/trailing pipes optional) and silently
+ * drops the `|---|---|` separator row so pasting a normal table just works.
+ */
+function parsePipeTable(raw: string): string[][] {
+  const rows: string[][] = [];
+  for (const line of String(raw).split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    // Skip markdown separator rows like |---|:--:|---|
+    if (/^\|?[\s:|-]*-[\s:|-]*\|?$/.test(trimmed) && !/[^\s:|-]/.test(trimmed)) continue;
+    let cells = trimmed.split("|").map((c) => c.trim());
+    if (cells.length && cells[0] === "") cells.shift();
+    if (cells.length && cells[cells.length - 1] === "") cells.pop();
+    if (cells.length === 0) continue;
+    rows.push(cells.slice(0, MAX_TABLE_COLS));
+    if (rows.length >= MAX_TABLE_ROWS) break;
+  }
+  return rows;
+}
+
+/** Build a native Block Kit `table` block from parsed rows (raw_text cells). */
+function buildTableBlock(rows: string[][], wrap?: "all" | number[] | null): Record<string, unknown> {
+  const cols = Math.min(MAX_TABLE_COLS, Math.max(1, ...rows.map((r) => r.length)));
+  const block: Record<string, unknown> = {
+    type: "table",
+    rows: rows.map((r) => {
+      const cells = r.slice(0, cols);
+      while (cells.length < cols) cells.push("");
+      return cells.map((c) => ({ type: "raw_text", text: c }));
+    }),
+  };
+  if (wrap) {
+    const wrapAll = wrap === "all";
+    const wrapSet = wrapAll ? null : new Set(wrap);
+    block.column_settings = Array.from({ length: cols }, (_, i) => ({
+      is_wrapped: wrapAll || !!wrapSet?.has(i + 1),
+    }));
+  }
+  return block;
+}
+
+/**
+ * Render rows as an ASCII-aligned table inside a fenced code block. Used as a
+ * fallback when posting the native table block fails (markdownToSlackMrkdwn
+ * preserves code fences, so columns stay aligned in Slack's monospace).
+ */
+function renderTableAscii(rows: string[][]): string {
+  if (rows.length === 0) return "";
+  const cols = Math.max(1, ...rows.map((r) => r.length));
+  const widths: number[] = [];
+  for (let c = 0; c < cols; c++) {
+    widths[c] = Math.max(1, ...rows.map((r) => (r[c] ?? "").length));
+  }
+  const fmtRow = (r: string[]) =>
+    "| " + Array.from({ length: cols }, (_, c) => (r[c] ?? "").padEnd(widths[c])).join(" | ") + " |";
+  const sep = "|" + widths.map((w) => "-".repeat(w + 2)).join("|") + "|";
+  const out = [fmtRow(rows[0]), sep, ...rows.slice(1).map(fmtRow)];
+  return "```\n" + out.join("\n") + "\n```";
+}
+
 function extractBlockKitDirectives(text: string): {
   cleanedText: string;
   buttons: BlockKitButton[] | null;
   select: BlockKitSelect | null;
+  tables: TableData[] | null;
 } {
   let buttons: BlockKitButton[] | null = null;
   let select: BlockKitSelect | null = null;
+  const tables: TableData[] = [];
 
   let cleaned = text
+    // Parse [[slack_table: <markdown pipe rows> ]] (multi-line) — before collapse
+    .replace(/\[\[slack_table:\s*([\s\S]+?)\]\]/gi, (_match, raw) => {
+      const { wrap, body } = parseTableOptions(raw);
+      const rows = parsePipeTable(body);
+      if (rows.length > 0) tables.push({ rows, wrap });
+      return "";
+    })
     // Parse [[slack_buttons: Label1:value1, Label2:value2]]
     .replace(/\[\[slack_buttons:\s*(.+?)\]\]/gi, (_match, raw) => {
       buttons = String(raw).split(",").map((pair) => {
@@ -702,7 +810,12 @@ function extractBlockKitDirectives(text: string): {
     .replace(/\n{3,}/g, "\n\n")
     .trim();
 
-  return { cleanedText: cleaned, buttons: buttons && buttons.length > 0 ? buttons : null, select };
+  return {
+    cleanedText: cleaned,
+    buttons: buttons && buttons.length > 0 ? buttons : null,
+    select,
+    tables: tables.length > 0 ? tables : null,
+  };
 }
 
 async function sendBlockKitMessage(
@@ -711,17 +824,9 @@ async function sendBlockKitMessage(
   text: string,
   buttons: BlockKitButton[] | null,
   select: BlockKitSelect | null,
+  tables: TableData[] | null,
   threadTs?: string,
 ): Promise<string | null> {
-  const blocks: Record<string, unknown>[] = [];
-
-  if (text) {
-    blocks.push({
-      type: "section",
-      text: { type: "mrkdwn", text: markdownToSlackMrkdwn(text) },
-    });
-  }
-
   const actionElements: Record<string, unknown>[] = [];
 
   if (buttons) {
@@ -749,24 +854,48 @@ async function sendBlockKitMessage(
     });
   }
 
-  if (actionElements.length > 0) {
-    blocks.push({
-      type: "actions",
-      elements: actionElements,
-    });
-  }
-
-  const params: Record<string, unknown> = {
-    channel: channelId,
-    text: text || "Interactive message",
-    blocks,
+  // Build the blocks array. With nativeTables=false, tables are rendered as
+  // ASCII code blocks folded into the section text — the fallback path when
+  // Slack rejects the native `table` block.
+  const buildBlocks = (nativeTables: boolean): Record<string, unknown>[] => {
+    const blocks: Record<string, unknown>[] = [];
+    let bodyText = text;
+    if (!nativeTables && tables && tables.length > 0) {
+      const ascii = tables.map((t) => renderTableAscii(t.rows)).filter(Boolean).join("\n\n");
+      bodyText = [text, ascii].filter(Boolean).join("\n\n");
+    }
+    if (bodyText) {
+      blocks.push({ type: "section", text: { type: "mrkdwn", text: markdownToSlackMrkdwn(bodyText) } });
+    }
+    if (nativeTables && tables) {
+      for (const t of tables) blocks.push(buildTableBlock(t.rows, t.wrap));
+    }
+    if (actionElements.length > 0) {
+      blocks.push({ type: "actions", elements: actionElements });
+    }
+    return blocks;
   };
-  if (threadTs) params.thread_ts = threadTs;
 
-  const data = await slackApi<{ ts: string }>(token, "chat.postMessage", params).catch((err) => {
-    debugLog(`sendBlockKitMessage failed: ${err instanceof Error ? err.message : err}`);
-    return null;
-  });
+  const post = (blocks: Record<string, unknown>[]) => {
+    const params: Record<string, unknown> = {
+      channel: channelId,
+      text: text || "Interactive message",
+      blocks,
+    };
+    if (threadTs) params.thread_ts = threadTs;
+    return slackApi<{ ts: string }>(token, "chat.postMessage", params).catch((err) => {
+      debugLog(`sendBlockKitMessage failed: ${err instanceof Error ? err.message : err}`);
+      return null;
+    });
+  };
+
+  let data = await post(buildBlocks(true));
+  // Native table block can be rejected (unsupported surface / app). Retry once
+  // with an ASCII-code-block rendering so the user still sees the table.
+  if (!data && tables && tables.length > 0) {
+    debugLog("sendBlockKitMessage: retrying with ASCII table fallback");
+    data = await post(buildBlocks(false));
+  }
   return data?.ts ?? null;
 }
 
@@ -1113,7 +1242,8 @@ function sanitizeUserInput(text: string): string {
     .replace(/\[upload_file:[^\]]*\]/gi, "[upload removed]")
     .replace(/\[read_channel:[^\]]*\]/gi, "[read removed]")
     .replace(/\[\[slack_buttons:[^\]]*\]\]/gi, "[buttons removed]")
-    .replace(/\[\[slack_select:[^\]]*\]\]/gi, "[select removed]");
+    .replace(/\[\[slack_select:[^\]]*\]\]/gi, "[select removed]")
+    .replace(/\[\[slack_table:[\s\S]*?\]\]/gi, "[table removed]");
 }
 
 // --- Trigger check ---
@@ -1494,7 +1624,7 @@ async function handleMessage(event: SlackMessage): Promise<void> {
       const { cleanedText: afterEdit, editContent, deleteCount, deleteMatches } = extractEditDirective(afterReact);
       const { cleanedText: afterUpload, uploads } = extractUploadDirectives(afterEdit);
       const { cleanedText: afterChannelRead, channelReads } = extractChannelReadDirectives(afterUpload);
-      const { cleanedText: finalText, buttons, select } = extractBlockKitDirectives(afterChannelRead);
+      const { cleanedText: finalText, buttons, select, tables } = extractBlockKitDirectives(afterChannelRead);
 
       if (reactionEmoji) {
         await sendReaction(config.botToken, channelId, event.ts, reactionEmoji);
@@ -1583,11 +1713,11 @@ async function handleMessage(event: SlackMessage): Promise<void> {
 
       // Finalize response — guarantee delivery (chunked fallback if the live edit
       // fails or the body is too long), or replace with Block Kit.
-      if (finalText) {
-        if (buttons || select) {
+      if (finalText || tables) {
+        if (buttons || select || tables) {
           // Block Kit needs a fresh message; remove streaming message
           if (streamMsgTs) await deleteMessage(config.botToken, channelId, streamMsgTs);
-          const sentTs = await sendBlockKitMessage(config.botToken, channelId, finalText, buttons, select, replyThreadTs);
+          const sentTs = await sendBlockKitMessage(config.botToken, channelId, finalText, buttons, select, tables, replyThreadTs);
           if (sentTs) lastBotMessageTs.set(msgKey, sentTs);
         } else {
           const sentTs = await finalizeStreamedReply(config.botToken, channelId, streamMsgTs, finalText, replyThreadTs);
@@ -1765,13 +1895,13 @@ async function handleBlockAction(payload: any): Promise<void> {
   const responseText = dispatchAgentDirectives(finalResultText ?? streamText) || (notified ? NOTIFY_SENT_REPLY : "");
   if (responseText) {
     const { cleanedText } = extractReactionDirective(responseText);
-    const { cleanedText: finalText, buttons, select } = extractBlockKitDirectives(cleanedText);
+    const { cleanedText: finalText, buttons, select, tables } = extractBlockKitDirectives(cleanedText);
 
-    if (finalText) {
+    if (finalText || tables) {
       const msgKey = botMessageKey(channelId, replyThreadTs);
-      if (buttons || select) {
+      if (buttons || select || tables) {
         if (streamMsgTs) await deleteMessage(config.botToken, channelId, streamMsgTs);
-        const sentTs = await sendBlockKitMessage(config.botToken, channelId, finalText, buttons, select, replyThreadTs);
+        const sentTs = await sendBlockKitMessage(config.botToken, channelId, finalText, buttons, select, tables, replyThreadTs);
         if (sentTs) lastBotMessageTs.set(msgKey, sentTs);
       } else {
         const sentTs = await finalizeStreamedReply(config.botToken, channelId, streamMsgTs, finalText, replyThreadTs);
